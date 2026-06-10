@@ -1,0 +1,4 @@
+name = "logfmt"
+structural = [" ", "=", "\n"]
+quote = "\""
+escape = "backslash"
