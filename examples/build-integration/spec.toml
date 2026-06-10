@@ -2,3 +2,8 @@ name = "csv"
 structural = [",", "\n"]
 quote = "\""
 escape = "doubled"
+
+[[columns]]
+index = 1
+type = "i64"
+name = "age"

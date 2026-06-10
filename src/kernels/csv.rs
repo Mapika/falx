@@ -293,8 +293,9 @@ impl<'p> Record<'p> {
         self.seps.len() + 1
     }
 
-    /// Raw span of field `i`: quotes and escapes intact.
-    pub fn field_raw(&self, i: usize) -> Option<&'p [u8]> {
+    /// Byte-offset span `(from, to)` of field `i`, quotes and escapes
+    /// intact; offsets index the buffer the tape was built over.
+    pub fn field_span(&self, i: usize) -> Option<(u32, u32)> {
         if i > self.seps.len() {
             return None;
         }
@@ -308,7 +309,13 @@ impl<'p> Record<'p> {
         } else {
             self.seps[i] as usize
         };
-        Some(&self.data[from..to])
+        Some((from as u32, to as u32))
+    }
+
+    /// Raw span of field `i`: quotes and escapes intact.
+    pub fn field_raw(&self, i: usize) -> Option<&'p [u8]> {
+        self.field_span(i)
+            .map(|(from, to)| &self.data[from as usize..to as usize])
     }
 
     /// Field `i` with surrounding quotes stripped and escapes resolved;

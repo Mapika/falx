@@ -1,0 +1,17 @@
+# worldcitiespop-shaped CSV (Country,City,AccentCity,Region,Population,
+# Latitude,Longitude), projecting the two coordinate columns as f64:
+# matches the checked-in `csv_geo` kernel.
+name = "csv_geo"
+structural = [",", "\n"]
+quote = "\""
+escape = "doubled"
+
+[[columns]]
+index = 5
+type = "f64"
+name = "latitude"
+
+[[columns]]
+index = 6
+type = "f64"
+name = "longitude"

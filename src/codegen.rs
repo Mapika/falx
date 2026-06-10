@@ -33,6 +33,86 @@ impl std::error::Error for CodegenError {}
 /// (future) shuffle-based classifier.
 const MAX_CLASS_BYTES: usize = 8;
 
+/// The cell type of a projected column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnType {
+    /// Parsed exactly like `str::parse::<i64>`; SWAR fast path.
+    I64,
+    /// Parsed exactly like `str::parse::<f64>`; Clinger fast path with a
+    /// `str::parse` fallback for the hard cases.
+    F64,
+    /// Zero-copy `(start, end)` byte spans into the input, quotes and
+    /// escapes intact.
+    Bytes,
+}
+
+/// One requested typed column: project field `index` of every record.
+#[derive(Clone, Debug)]
+pub struct Column {
+    /// Zero-based field index within a record.
+    pub index: usize,
+    /// Generated struct field name; defaults to `c{index}`.
+    pub name: Option<String>,
+    pub ty: ColumnType,
+}
+
+impl Column {
+    fn field_name(&self) -> String {
+        match &self.name {
+            Some(name) => name.clone(),
+            None => format!("c{}", self.index),
+        }
+    }
+
+    fn rust_type(&self) -> &'static str {
+        match self.ty {
+            ColumnType::I64 => "i64",
+            ColumnType::F64 => "f64",
+            ColumnType::Bytes => "(u32, u32)",
+        }
+    }
+
+    fn zero(&self) -> &'static str {
+        match self.ty {
+            ColumnType::I64 => "0",
+            ColumnType::F64 => "0.0",
+            ColumnType::Bytes => "(0, 0)",
+        }
+    }
+}
+
+/// Field names the generated `Columns` struct reserves for itself.
+const RESERVED_FIELDS: &[&str] = &["data", "rows"];
+
+fn validate_columns(columns: &[Column]) -> Result<(), CodegenError> {
+    let mut seen = std::collections::HashSet::new();
+    for column in columns {
+        let name = column.field_name();
+        let mut chars = name.chars();
+        let head_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        if !head_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(CodegenError(format!(
+                "column name '{name}' is not a valid identifier"
+            )));
+        }
+        if RESERVED_FIELDS.contains(&name.as_str()) {
+            return Err(CodegenError(format!(
+                "column name '{name}' is reserved by the generated struct"
+            )));
+        }
+        // Each column claims `name` and `name_valid`; collisions between
+        // any of them make the generated struct uncompilable.
+        if !seen.insert(name.clone()) || !seen.insert(format!("{name}_valid")) {
+            return Err(CodegenError(format!(
+                "column name '{name}' collides with another column"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Which kernel a step body is being emitted for.
 #[derive(Clone, Copy, PartialEq)]
 enum Flavor {
@@ -42,7 +122,7 @@ enum Flavor {
 
 /// Emit a generated source file exposing only the structural indexer.
 pub fn emit(graph: &Graph, format_name: &str) -> Result<String, CodegenError> {
-    emit_with(graph, format_name, None)
+    emit_with(graph, format_name, None, &[])
 }
 
 /// Emit a full generated parser for a delimited dialect: the structural
@@ -53,14 +133,32 @@ pub fn emit_parser(
     dialect: &crate::formats::Dialect,
     format_name: &str,
 ) -> Result<String, CodegenError> {
+    emit_parser_with_columns(dialect, format_name, &[])
+}
+
+/// Like [`emit_parser`], additionally emitting a typed columnar projection
+/// API (`parse_columns`, and `parse_columns_par` where the dialect supports
+/// parallel indexing) for the declared `columns`.
+pub fn emit_parser_with_columns(
+    dialect: &crate::formats::Dialect,
+    format_name: &str,
+    columns: &[Column],
+) -> Result<String, CodegenError> {
+    validate_columns(columns)?;
     let parts = crate::formats::delimited_parts(dialect);
-    emit_with(&parts.graph, format_name, Some((dialect, parts.terminators)))
+    emit_with(
+        &parts.graph,
+        format_name,
+        Some((dialect, parts.terminators)),
+        columns,
+    )
 }
 
 fn emit_with(
     graph: &Graph,
     format_name: &str,
     parser: Option<(&crate::formats::Dialect, crate::ir::NodeId)>,
+    columns: &[Column],
 ) -> Result<String, CodegenError> {
     let dialect = parser.map(|(d, _)| d);
     let output = graph.output();
@@ -526,6 +624,9 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
 
     if let Some(dialect) = dialect {
         push_span_api(&mut code, dialect, carry_count);
+        if !columns.is_empty() {
+            push_columns_api(&mut code, columns, par_mode);
+        }
     }
 
     let _ = write!(
@@ -866,8 +967,9 @@ impl<'p> Record<'p> {
         self.seps.len() + 1
     }
 
-    /// Raw span of field `i`: quotes and escapes intact.
-    pub fn field_raw(&self, i: usize) -> Option<&'p [u8]> {
+    /// Byte-offset span `(from, to)` of field `i`, quotes and escapes
+    /// intact; offsets index the buffer the tape was built over.
+    pub fn field_span(&self, i: usize) -> Option<(u32, u32)> {
         if i > self.seps.len() {
             return None;
         }
@@ -881,7 +983,13 @@ impl<'p> Record<'p> {
         } else {
             self.seps[i] as usize
         };
-        Some(&self.data[from..to])
+        Some((from as u32, to as u32))
+    }
+
+    /// Raw span of field `i`: quotes and escapes intact.
+    pub fn field_raw(&self, i: usize) -> Option<&'p [u8]> {
+        self.field_span(i)
+            .map(|(from, to)| &self.data[from as usize..to as usize])
     }
 
     /// Field `i` with surrounding quotes stripped and escapes resolved;
@@ -945,6 +1053,378 @@ impl<'p> Iterator for Fields<'p> {
     code.push_str(&clean_fn(dialect));
     code.push('\n');
 }
+
+/// Emit the typed columnar projection API: a `Columns` struct with one
+/// values Vec plus an Arrow-style validity bitmap per declared column,
+/// filled by walking the structural tape so unrequested fields are never
+/// read, cleaned, or copied.
+fn push_columns_api(code: &mut String, columns: &[Column], par_mode: bool) {
+    let any_i64 = columns.iter().any(|c| c.ty == ColumnType::I64);
+    let any_f64 = columns.iter().any(|c| c.ty == ColumnType::F64);
+    let any_bytes = columns.iter().any(|c| c.ty == ColumnType::Bytes);
+
+    // --- struct definition -------------------------------------------------
+    code.push_str(
+        "/// Typed columnar projection of the declared columns.\n\
+         ///\n\
+         /// Per column: a values Vec and a validity bitmap (`Vec<u64>`,\n\
+         /// LSB-first; bit `r` set = row `r` parsed). A missing, empty, or\n\
+         /// malformed cell clears the bit and leaves a zero placeholder in\n\
+         /// the values Vec, so every column has exactly `rows` entries.\n\
+         /// This layout is deliberately Arrow-primitive-array compatible.\n\
+         pub struct Columns<'a> {\n\
+         \x20   /// The input buffer; `bytes` column spans index into it.\n\
+         \x20   pub data: &'a [u8],\n\
+         \x20   /// Total number of records seen, valid or not.\n\
+         \x20   pub rows: usize,\n",
+    );
+    for column in columns {
+        let name = column.field_name();
+        let ty = column.rust_type();
+        let what = match column.ty {
+            ColumnType::I64 => "as `i64`",
+            ColumnType::F64 => "as `f64`",
+            ColumnType::Bytes => "as raw `(start, end)` spans into `data`",
+        };
+        let _ = writeln!(
+            code,
+            "    /// Field {} of each record {what}; zero where invalid.\n\
+             \x20   pub {name}: Vec<{ty}>,\n\
+             \x20   /// Validity bitmap for `{name}`.\n\
+             \x20   pub {name}_valid: Vec<u64>,",
+            column.index
+        );
+    }
+    code.push_str("}\n\n");
+
+    // --- impl: constructor, span resolver, row push ------------------------
+    code.push_str("impl<'a> Columns<'a> {\n    fn with_capacity(data: &'a [u8], rows: usize) -> Self {\n        Columns {\n            data,\n            rows: 0,\n");
+    for column in columns {
+        let name = column.field_name();
+        let _ = writeln!(
+            code,
+            "            {name}: Vec::with_capacity(rows),\n\
+             \x20           {name}_valid: Vec::with_capacity(rows / 64 + 1),"
+        );
+    }
+    code.push_str("        }\n    }\n");
+
+    if any_bytes {
+        code.push_str(
+            "\n    /// Resolve a `bytes` column span to its slice of the input.\n\
+             \x20   #[inline]\n\
+             \x20   pub fn span(&self, span: (u32, u32)) -> &'a [u8] {\n\
+             \x20       &self.data[span.0 as usize..span.1 as usize]\n\
+             \x20   }\n",
+        );
+    }
+
+    code.push_str(
+        "\n    fn push_row(&mut self, record: &Record<'_>) {\n\
+         \x20       let row = self.rows;\n\
+         \x20       if row & 63 == 0 {\n",
+    );
+    for column in columns {
+        let _ = writeln!(code, "            self.{}_valid.push(0);", column.field_name());
+    }
+    code.push_str("        }\n");
+    for column in columns {
+        let name = column.field_name();
+        let idx = column.index;
+        let body = match column.ty {
+            ColumnType::I64 | ColumnType::F64 => {
+                let parser = if column.ty == ColumnType::I64 {
+                    "parse_i64_cell"
+                } else {
+                    "parse_f64_cell"
+                };
+                let zero = column.zero();
+                format!(
+                    "        match record.field_raw({idx}).map(clean) {{\n\
+                     \x20           Some(cell) => match {parser}(&cell) {{\n\
+                     \x20               Some(v) => {{\n\
+                     \x20                   self.{name}.push(v);\n\
+                     \x20                   self.{name}_valid[row >> 6] |= 1 << (row & 63);\n\
+                     \x20               }}\n\
+                     \x20               None => self.{name}.push({zero}),\n\
+                     \x20           }},\n\
+                     \x20           None => self.{name}.push({zero}),\n\
+                     \x20       }}\n"
+                )
+            }
+            ColumnType::Bytes => format!(
+                "        match record.field_span({idx}) {{\n\
+                 \x20           Some((from, to)) if from != to => {{\n\
+                 \x20               self.{name}.push((from, to));\n\
+                 \x20               self.{name}_valid[row >> 6] |= 1 << (row & 63);\n\
+                 \x20           }}\n\
+                 \x20           _ => self.{name}.push((0, 0)),\n\
+                 \x20       }}\n"
+            ),
+        };
+        code.push_str(&body);
+    }
+    code.push_str("        self.rows = row + 1;\n    }\n}\n\n");
+
+    // --- bitmap accessor ----------------------------------------------------
+    code.push_str(
+        "/// Test bit `row` of a validity bitmap.\n\
+         #[inline]\n\
+         pub fn bitmap_get(bitmap: &[u64], row: usize) -> bool {\n\
+         \x20   bitmap[row >> 6] >> (row & 63) & 1 != 0\n\
+         }\n\n",
+    );
+
+    // --- serial entry point -------------------------------------------------
+    code.push_str(
+        "/// Parse `data` into typed columns. Only the declared columns' bytes\n\
+         /// are ever inspected; all other fields are skipped over via the\n\
+         /// structural tape.\n\
+         pub fn parse_columns(data: &[u8]) -> Columns<'_> {\n\
+         \x20   let parsed = parse(data);\n\
+         \x20   let mut cols = Columns::with_capacity(data, parsed.terminated_record_count() + 1);\n\
+         \x20   for record in parsed.records() {\n\
+         \x20       cols.push_row(&record);\n\
+         \x20   }\n\
+         \x20   cols\n\
+         }\n\n",
+    );
+
+    // --- parallel entry point ------------------------------------------------
+    if par_mode {
+        code.push_str(
+            "/// Parallel [`parse_columns`]: the tape comes from [`parse_par`],\n\
+             /// rows are converted over disjoint record ranges, and the column\n\
+             /// chunks concatenate (validity bitmaps are stitched with a bit\n\
+             /// shift, so chunk row counts need not be multiples of 64).\n\
+             pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {\n\
+             \x20   let parsed = parse_par(data, threads);\n\
+             \x20   let n = parsed.terminated_record_count();\n\
+             \x20   let threads = threads.max(1).min(n.max(1));\n\
+             \x20   if threads == 1 {\n\
+             \x20       let mut cols = Columns::with_capacity(data, n + 1);\n\
+             \x20       for record in parsed.records() {\n\
+             \x20           cols.push_row(&record);\n\
+             \x20       }\n\
+             \x20       return cols;\n\
+             \x20   }\n\
+             \x20   let mut bounds = Vec::with_capacity(threads + 1);\n\
+             \x20   bounds.push(0);\n\
+             \x20   for t in 0..threads {\n\
+             \x20       bounds.push(bounds[t] + n / threads + (t < n % threads) as usize);\n\
+             \x20   }\n\
+             \x20   let parts: Vec<Columns<'_>> = std::thread::scope(|s| {\n\
+             \x20       let parsed = &parsed;\n\
+             \x20       let handles: Vec<_> = (0..threads)\n\
+             \x20           .map(|t| {\n\
+             \x20               let range = bounds[t]..bounds[t + 1];\n\
+             \x20               s.spawn(move || {\n\
+             \x20                   let mut part = Columns::with_capacity(data, range.len() + 1);\n\
+             \x20                   for record in parsed.records_range(range) {\n\
+             \x20                       part.push_row(&record);\n\
+             \x20                   }\n\
+             \x20                   part\n\
+             \x20               })\n\
+             \x20           })\n\
+             \x20           .collect();\n\
+             \x20       handles.into_iter().map(|h| h.join().expect(\"columns thread ok\")).collect()\n\
+             \x20   });\n\
+             \x20   let mut cols = Columns::with_capacity(data, parts.iter().map(|p| p.rows).sum::<usize>());\n\
+             \x20   for part in &parts {\n",
+        );
+        for column in columns {
+            let name = column.field_name();
+            let _ = writeln!(
+                code,
+                "        cols.{name}.extend_from_slice(&part.{name});\n\
+                 \x20       append_bitmap(&mut cols.{name}_valid, cols.rows, &part.{name}_valid, part.rows);"
+            );
+        }
+        code.push_str(
+            "        cols.rows += part.rows;\n\
+             \x20   }\n\
+             \x20   cols\n\
+             }\n\n\
+             /// Append `src_rows` bits of `src` onto a bitmap currently holding\n\
+             /// `dst_rows` bits. Bits past each bitmap's row count are zero, an\n\
+             /// invariant `push_row` maintains and this function preserves.\n\
+             fn append_bitmap(dst: &mut Vec<u64>, dst_rows: usize, src: &[u64], src_rows: usize) {\n\
+             \x20   let words = src_rows.div_ceil(64);\n\
+             \x20   let shift = dst_rows & 63;\n\
+             \x20   if shift == 0 {\n\
+             \x20       dst.extend_from_slice(&src[..words]);\n\
+             \x20   } else {\n\
+             \x20       for &word in &src[..words] {\n\
+             \x20           *dst.last_mut().expect(\"non-aligned dst has a partial word\") |= word << shift;\n\
+             \x20           dst.push(word >> (64 - shift));\n\
+             \x20       }\n\
+             \x20       dst.truncate((dst_rows + src_rows).div_ceil(64));\n\
+             \x20   }\n\
+             }\n\n",
+        );
+    }
+
+    // --- cell parsers ---------------------------------------------------------
+    if any_i64 {
+        code.push_str(INT_CELL_TPL);
+    }
+    if any_f64 {
+        code.push_str(FLOAT_CELL_TPL);
+    }
+}
+
+/// Integer cell parser template: SWAR 8-digit blocks (Lemire) for the
+/// common lengths, checked scalar arithmetic for 17+ digit tails.
+const INT_CELL_TPL: &str = r#"/// Parse an integer cell with the exact acceptance rules of
+/// `str::parse::<i64>`: optional sign, ASCII digits, nothing else.
+///
+/// Cells of up to 16 digits (the overwhelming majority) are parsed as two
+/// SWAR 8-digit blocks; longer cells fall back to checked scalar
+/// arithmetic, which also rejects overflow exactly like `str::parse`.
+fn parse_i64_cell(s: &[u8]) -> Option<i64> {
+    let (neg, digits) = match s.split_first() {
+        Some((&b'-', rest)) => (true, rest),
+        Some((&b'+', rest)) => (false, rest),
+        _ => (false, s),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    if digits.len() <= 16 {
+        // Right-align into a '0'-padded buffer: leading ASCII zeros are
+        // digits that contribute nothing, so two fixed 8-digit blocks
+        // cover every length without branching on it.
+        let mut buf = [b'0'; 16];
+        buf[16 - digits.len()..].copy_from_slice(digits);
+        let hi = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let lo = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if !is_8_digits(hi) || !is_8_digits(lo) {
+            return None;
+        }
+        // <= 9_999_999_999_999_999 < i64::MAX: no overflow possible.
+        let value = (parse_8_digits(hi) * 100_000_000 + parse_8_digits(lo)) as i64;
+        return Some(if neg { -value } else { value });
+    }
+    // 17+ digits: rare; checked scalar arithmetic, accumulating negative
+    // so i64::MIN parses.
+    let mut value: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_sub((b - b'0') as i64)?;
+    }
+    if neg { Some(value) } else { value.checked_neg() }
+}
+
+/// True iff all eight bytes are ASCII digits: high nibbles must be 3, and
+/// adding 6 must not carry into the high nibble (i.e. low nibble <= 9).
+#[inline]
+fn is_8_digits(v: u64) -> bool {
+    const HI: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const THREES: u64 = 0x3030_3030_3030_3030;
+    v & HI == THREES && v.wrapping_add(0x0606_0606_0606_0606) & HI == THREES
+}
+
+/// Combine eight ASCII digits (loaded little-endian, so the first
+/// character is the low byte) into their value: three multiply-and-shift
+/// rounds, each merging adjacent digit groups (Lemire's SWAR atoi).
+#[inline]
+fn parse_8_digits(v: u64) -> u64 {
+    let v = (v & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+    let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
+}
+
+"#;
+
+/// Float cell parser template: Clinger fast path + `str::parse` fallback.
+const FLOAT_CELL_TPL: &str = r#"/// Parse a float cell with the exact semantics of `str::parse::<f64>`.
+///
+/// Fast path (Clinger 1990): when the decimal mantissa has <= 15 digits
+/// (so it is exact in an f64) and the decimal exponent is within +/-22
+/// (so 10^|e| is exact in an f64), one multiply or divide performs a
+/// single correct rounding -- bit-identical to a full parser. Everything
+/// else (long mantissas, big exponents, inf/nan spellings, malformed
+/// cells) falls through to `str::parse`, which has been Eisel-Lemire in
+/// std since Rust 1.55 -- the fallback is rarely taken, not slow.
+fn parse_f64_cell(s: &[u8]) -> Option<f64> {
+    const POW10: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+    let (neg, rest) = match s.split_first() {
+        Some((&b'-', rest)) => (true, rest),
+        Some((&b'+', rest)) => (false, rest),
+        _ => (false, s),
+    };
+    let mut i = 0;
+    let mut mantissa: u64 = 0;
+    let mut digits = 0usize;
+    while i < rest.len() && rest[i].is_ascii_digit() {
+        mantissa = mantissa.wrapping_mul(10).wrapping_add((rest[i] - b'0') as u64);
+        digits += 1;
+        i += 1;
+    }
+    let mut exp10: i32 = 0;
+    if i < rest.len() && rest[i] == b'.' {
+        i += 1;
+        while i < rest.len() && rest[i].is_ascii_digit() {
+            mantissa = mantissa.wrapping_mul(10).wrapping_add((rest[i] - b'0') as u64);
+            digits += 1;
+            exp10 -= 1;
+            i += 1;
+        }
+    }
+    if i < rest.len() && (rest[i] | 0x20) == b'e' {
+        i += 1;
+        let esign = match rest.get(i) {
+            Some(&b'-') => {
+                i += 1;
+                -1
+            }
+            Some(&b'+') => {
+                i += 1;
+                1
+            }
+            _ => 1,
+        };
+        let mut e: i32 = 0;
+        let mut exp_digits = 0;
+        while i < rest.len() && rest[i].is_ascii_digit() {
+            e = e.saturating_mul(10).saturating_add((rest[i] - b'0') as i32);
+            exp_digits += 1;
+            i += 1;
+        }
+        if exp_digits == 0 {
+            return parse_f64_fallback(s);
+        }
+        exp10 += esign * e.min(100_000);
+    }
+    // Anything the strict scanner did not consume -- no digits at all
+    // ("inf", "nan", "."), trailing bytes -- goes to the full parser.
+    if digits == 0 || i != rest.len() {
+        return parse_f64_fallback(s);
+    }
+    if digits > 15 || exp10 < -22 || exp10 > 22 {
+        return parse_f64_fallback(s);
+    }
+    let value = if exp10 < 0 {
+        mantissa as f64 / POW10[(-exp10) as usize]
+    } else {
+        mantissa as f64 * POW10[exp10 as usize]
+    };
+    Some(if neg { -value } else { value })
+}
+
+#[cold]
+fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
+    std::str::from_utf8(s).ok()?.parse::<f64>().ok()
+}
+
+"#;
 
 /// Streaming parser template; `@K@` is the kernel carry count.
 const STREAM_TPL: &str = r#"/// Incremental parser for unbounded input: feed chunks, receive complete

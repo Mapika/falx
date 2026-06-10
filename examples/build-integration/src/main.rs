@@ -25,4 +25,14 @@ fn main() {
         "quoted field should come out unquoted and unescaped"
     );
     println!("\nAssertion passed: quoted field unescaped to `Smith, \"Bob\"`.");
+
+    // The spec also declares a typed column (`age`, i64 at index 1), so the
+    // generated parser exposes a columnar API. Row 0 is the header: its
+    // "age" cell is not a number, so its validity bit is simply clear.
+    let cols = parser::parse_columns(csv_data);
+    assert_eq!(cols.rows, 2);
+    assert!(!parser::bitmap_get(&cols.age_valid, 0));
+    assert!(parser::bitmap_get(&cols.age_valid, 1));
+    assert_eq!(cols.age[1], 30);
+    println!("Typed column: age[1] = {} (header row invalid, as expected).", cols.age[1]);
 }

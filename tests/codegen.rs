@@ -15,18 +15,14 @@ impl Rng {
 }
 
 /// Test 1: Generated kernels match codegen output.
-/// Verifies that the checked-in kernel files match what the code generator currently emits.
+/// Verifies that the checked-in kernel files match what the code generator
+/// currently emits, for every entry in the kernel registry (typed-column
+/// kernels included).
 #[test]
 fn generated_kernels_match_codegen() {
-    let formats = [
-        ("csv", formats::csv_dialect()),
-        ("tsv", formats::tsv_dialect()),
-        ("logfmt", formats::logfmt_dialect()),
-        ("ndjson", formats::ndjson_dialect()),
-    ];
-
-    for (name, dialect) in &formats {
-        let generated = codegen::emit_parser(dialect, name).expect("codegen should succeed");
+    for (name, dialect, columns) in falx::kernels::targets() {
+        let generated = codegen::emit_parser_with_columns(&dialect, name, &columns)
+            .expect("codegen should succeed");
 
         let path = format!("{}/src/kernels/{}.rs", env!("CARGO_MANIFEST_DIR"), name);
         let expected = std::fs::read_to_string(&path)

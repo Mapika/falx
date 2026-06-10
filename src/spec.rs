@@ -3,6 +3,7 @@
 //! This module provides utilities for parsing declarative format specifications
 //! in TOML format into [`Spec`] values that can be consumed by code generation.
 
+use crate::codegen::{Column, ColumnType};
 use crate::formats::{Dialect, Escape};
 
 /// A parsed format specification from TOML.
@@ -12,6 +13,8 @@ pub struct Spec {
     pub name: String,
     /// The parsed dialect with structural bytes, quote byte, and escape style.
     pub dialect: Dialect,
+    /// Typed columns to project (empty = no columnar API generated).
+    pub columns: Vec<Column>,
 }
 
 /// Parse a TOML spec string into a [`Spec`].
@@ -24,6 +27,10 @@ pub struct Spec {
 /// - `quote` (string): Single-byte quote character (default: none).
 /// - `escape` (string): Escape style: "none", "doubled", or "backslash" (default: "none").
 /// - `escape_char` (string): Single-byte escape character for backslash mode (default: "\\").
+/// - `[[columns]]` (array of tables): Typed columns to project. Each entry
+///   has `index` (integer, zero-based field index), `type` (string: "i64",
+///   "f64", or "bytes"), and optional `name` (string: generated field name,
+///   default `c{index}`).
 ///
 /// # Errors
 /// Returns descriptive error messages for missing required fields, type mismatches,
@@ -101,7 +108,52 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         escape,
     };
 
-    Ok(Spec { name, dialect })
+    // Extract `[[columns]]` (optional, array of tables).
+    let mut columns = Vec::new();
+    if let Some(value) = parsed.get("columns") {
+        let arr = value
+            .as_array()
+            .ok_or("'columns' must be an array of tables ([[columns]])")?;
+        for (i, item) in arr.iter().enumerate() {
+            let table = item.as_table().ok_or(format!(
+                "columns[{}]: expected a table, got {}",
+                i,
+                value_type_name(item)
+            ))?;
+            let index = table
+                .get("index")
+                .and_then(|v| v.as_integer())
+                .ok_or(format!("columns[{i}]: missing required field 'index' (integer)"))?;
+            let index = usize::try_from(index)
+                .map_err(|_| format!("columns[{i}]: 'index' must be non-negative"))?;
+            let ty = match table.get("type").and_then(|v| v.as_str()) {
+                Some("i64") => ColumnType::I64,
+                Some("f64") => ColumnType::F64,
+                Some("bytes") => ColumnType::Bytes,
+                Some(other) => {
+                    return Err(format!(
+                        "columns[{i}]: invalid 'type' value '{other}' (must be 'i64', 'f64', or 'bytes')"
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "columns[{i}]: missing required field 'type' (string)"
+                    ))
+                }
+            };
+            let name = match table.get("name") {
+                Some(v) => Some(
+                    v.as_str()
+                        .ok_or(format!("columns[{i}]: 'name' must be a string"))?
+                        .to_string(),
+                ),
+                None => None,
+            };
+            columns.push(Column { index, name, ty });
+        }
+    }
+
+    Ok(Spec { name, dialect, columns })
 }
 
 /// Parse a TOML string value as a single byte using Rust's escape sequences.

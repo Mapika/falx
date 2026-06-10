@@ -76,8 +76,8 @@ fn main() {
         }
     };
 
-    // Generate the full parser (indexer + span API).
-    let generated = match codegen::emit_parser(&spec.dialect, &spec.name) {
+    // Generate the full parser (indexer + span API + any declared columns).
+    let generated = match codegen::emit_parser_with_columns(&spec.dialect, &spec.name, &spec.columns) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error generating code: {}", e);

@@ -12,7 +12,7 @@ fn main() {
     let spec = falx::spec::parse(&spec_content)
         .expect("Failed to parse spec.toml");
 
-    let generated = falx::codegen::emit_parser(&spec.dialect, &spec.name)
+    let generated = falx::codegen::emit_parser_with_columns(&spec.dialect, &spec.name, &spec.columns)
         .expect("Failed to generate parser");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
