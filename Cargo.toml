@@ -12,6 +12,10 @@ categories = ["parsing", "parser-implementations", "encoding"]
 toml = { version = "0.8", default-features = true, optional = true }
 
 [dev-dependencies]
+arrow-array = "59.0.0"
+arrow-buffer = "59.0.0"
+arrow-csv = "59.0.0"
+arrow-schema = "59.0.0"
 csv = "1"
 serde_json = "1"
 simd-json = "0.17.0"
