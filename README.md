@@ -42,19 +42,21 @@ sides, byte-identical output — is:
 
 | | throughput | speedup |
 |---|---|---|
-| falx `parse()` + field iteration | 0.93 GiB/s | 2.1x |
-| falx parallel field iteration (16 threads) | **1.74 GiB/s** | 3.8x |
-| csv crate `byte_records()` | 0.47 GiB/s | 1.0x |
+| falx `parse()` + field iteration | 0.97 GiB/s | 2.1x |
+| falx `parse_par()` + parallel fields (16 threads) | **4.45 GiB/s** | **9.7x** |
+| csv crate `byte_records()` | 0.46 GiB/s | 1.0x |
 
 On real data (worldcitiespop.csv, 145 MB, the csv crate's canonical
 benchmark file): indexing 2.49 GiB/s, single-threaded field iteration
 1.33 GiB/s vs the csv crate's 0.78 — with field byte totals matching the
 csv crate exactly.
 
-Parallelism falls out of the tape design: `parse()` produces a record tape
-whose end entries carry cumulative separator counts, so `records_range(a..b)`
-yields disjoint O(1) chunks that threads can walk independently (see the
-benchmark for a std-only `thread::scope` example).
+Parallelism falls out of the tape design: the record tape's end entries
+carry cumulative separator counts, so `records_range(a..b)` yields disjoint
+O(1) chunks for threads to walk, and `parse_par(data, threads)` builds the
+tape itself in parallel — chunk tapes concatenate directly, with one add
+per end entry to rebase counts. All std-only; output is byte-identical to
+the serial path (differentially tested per thread count).
 
 ### Versus the real simdjson (C++)
 

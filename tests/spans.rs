@@ -378,3 +378,28 @@ fn records_range_chunks_equal_full_iteration() {
         assert_eq!(chunked, full, "split at {split} diverged");
     }
 }
+
+/// parse_par must produce a tape identical in effect to parse(): same
+/// records, same fields, for any thread count.
+#[test]
+fn parse_par_matches_parse() {
+    let mut rng = Rng(0x5EED_5EED_5EED_5EED);
+    let alphabet = b"\",\n\rxy";
+    for _ in 0..25 {
+        let len = 4096 + (rng.next() % 150_000) as usize;
+        let data: Vec<u8> = (0..len)
+            .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+            .collect();
+        let serial: Vec<Vec<Vec<u8>>> = falx::kernels::csv::parse(&data)
+            .records()
+            .map(|r| r.fields().map(|f| f.into_owned()).collect())
+            .collect();
+        for threads in [2, 5, 16] {
+            let par: Vec<Vec<Vec<u8>>> = falx::kernels::csv::parse_par(&data, threads)
+                .records()
+                .map(|r| r.fields().map(|f| f.into_owned()).collect())
+                .collect();
+            assert_eq!(par, serial, "parse_par mismatch at {threads} threads, len {len}");
+        }
+    }
+}

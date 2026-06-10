@@ -301,7 +301,7 @@ fn main() {
     // (records_range gives O(1) disjoint chunks).
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     let parallel_fields = measure(|| {
-        let parsed = falx::kernels::csv::parse(&data);
+        let parsed = falx::kernels::csv::parse_par(&data, threads);
         let n = parsed.terminated_record_count();
         let chunk = n.div_ceil(threads).max(1);
         std::thread::scope(|s| {
@@ -332,7 +332,7 @@ fn main() {
     );
 
     let parallel_label: &'static str =
-        Box::leak(format!("falx parallel fields x{threads}").into_boxed_str());
+        Box::leak(format!("falx parallel parse+fields x{threads}").into_boxed_str());
     let rows = vec![
         Row {
             label: "falx parse+fields",
