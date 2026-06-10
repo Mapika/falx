@@ -166,6 +166,15 @@ fn emit_with(
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {{
 {carry_decl}        let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {{
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};
+            push_tape(m0, t0, offset as u32, seps, ends);
+            let (m1, t1) = unsafe {{ step(data.as_ptr().add(offset + 64){carry_arg}) }};
+            push_tape(m1, t1, (offset + 64) as u32, seps, ends);
+            offset += 128;
+        }}
         while offset + 64 <= data.len() {{
             // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
             let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};
@@ -323,6 +332,16 @@ mod avx2 {{
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
 {carry_decl}        let mut offset = 0usize;
+        // Two blocks per iteration: amortizes loop control and lets the
+        // second block's classification overlap the first block's extract.
+        while offset + 128 <= data.len() {{
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let m0 = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};
+            push_indexes(m0, offset as u32, out);
+            let m1 = unsafe {{ step(data.as_ptr().add(offset + 64){carry_arg}) }}{sel};
+            push_indexes(m1, (offset + 64) as u32, out);
+            offset += 128;
+        }}
         while offset + 64 <= data.len() {{
             // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
             let mask = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};

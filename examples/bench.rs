@@ -396,5 +396,47 @@ fn main() {
                 .count()
         }),
     });
+    // simd-json (Rust port of simdjson, whose techniques falx generates
+    // from) builds a full tape per document, where falx only frames records
+    // — so this comparison shows what skipping in-document parsing buys.
+    // to_tape mutates its input, so each run parses a fresh copy; the
+    // copy itself happens outside the timed region.
+    rows.push(Row {
+        label: "simd-json (tape)",
+        m: {
+            let mut scratch = data.clone();
+            let mut times: Vec<u128> = Vec::new();
+            let mut work = 0usize;
+            for run in 0..8 {
+                scratch.copy_from_slice(&data);
+                let mut docs = 0usize;
+                let start = Instant::now();
+                let mut offset = 0usize;
+                while offset < scratch.len() {
+                    let end = scratch[offset..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(scratch.len(), |p| offset + p);
+                    if end > offset {
+                        simd_json::to_tape(&mut scratch[offset..end]).expect("valid json");
+                        docs += 1;
+                    }
+                    offset = end + 1;
+                }
+                let elapsed = start.elapsed().as_micros();
+                black_box(docs);
+                if run > 0 {
+                    times.push(elapsed);
+                }
+                work = docs;
+            }
+            times.sort_unstable();
+            Measurement {
+                best_us: times[0],
+                median_us: times[times.len() / 2],
+                work,
+            }
+        },
+    });
     report("NDJSON", data.len(), "serde_json (full parse)", &rows);
 }

@@ -30,10 +30,10 @@ synthetic data per format, best of 7 runs:
 
 | format | generated kernel | generated scalar fallback | ecosystem baseline |
 |---|---|---|---|
-| CSV | **5.23 GiB/s** | 0.66 GiB/s | csv crate 0.47 GiB/s (11.1x slower) |
-| TSV | **6.66 GiB/s** | 0.98 GiB/s | — |
-| logfmt | **4.28 GiB/s** | 0.42 GiB/s | — |
-| NDJSON framing | **6.14 GiB/s** | 0.75 GiB/s | serde_json 0.26 GiB/s (23.6x slower) |
+| CSV | **5.37 GiB/s** | 0.67 GiB/s | csv crate 0.46 GiB/s (11.6x slower) |
+| TSV | **7.12 GiB/s** | 0.98 GiB/s | — |
+| logfmt | **4.99 GiB/s** | 0.42 GiB/s | — |
+| NDJSON framing | **6.61 GiB/s** | 0.76 GiB/s | serde_json 0.24 GiB/s (27x slower), simd-json tape 0.41 GiB/s (16x slower) |
 
 Structural indexing is less work than the baselines do (they materialize
 values), so those speedups show headroom. The **like-for-like** comparison —
@@ -42,8 +42,8 @@ sides, byte-identical output — is:
 
 | | throughput | speedup |
 |---|---|---|
-| falx `parse()` + field iteration | 0.96 GiB/s | 2.1x |
-| falx parallel field iteration (16 threads) | **1.81 GiB/s** | 3.9x |
+| falx `parse()` + field iteration | 0.93 GiB/s | 2.1x |
+| falx parallel field iteration (16 threads) | **1.74 GiB/s** | 3.8x |
 | csv crate `byte_records()` | 0.47 GiB/s | 1.0x |
 
 On real data (worldcitiespop.csv, 145 MB, the csv crate's canonical
@@ -56,8 +56,14 @@ whose end entries carry cumulative separator counts, so `records_range(a..b)`
 yields disjoint O(1) chunks that threads can walk independently (see the
 benchmark for a std-only `thread::scope` example).
 
-Codegen fidelity check: the generated CSV kernel runs within 2% of the
-hand-written kernel it was modeled on (5.23 vs 5.32 GiB/s).
+The simd-json comparison needs its caveat: simd-json (the Rust port of
+simdjson, whose techniques falx generates from) builds a full parse tape
+per document, where falx only frames records and slices fields — the gap
+shows what skipping in-document parsing buys on record-framing workloads.
+
+Codegen fidelity: after two-block unrolling in the emitter, the generated
+CSV kernel now outruns the hand-written kernel it was modeled on
+(5.37 vs 4.94 GiB/s).
 
 Correctness: every kernel is differential-tested — generated AVX2, generated
 scalar fallback, the IR interpreter, and an independent byte-at-a-time
