@@ -23,6 +23,24 @@ for record in parsed.records() {
 }
 ```
 
+Specs can also declare **typed columns**, and the generated parser then
+emits columnar buffers directly — CSV to Arrow-style typed arrays in one
+pass, skipping every undeclared field:
+
+```toml
+[[columns]]
+index = 5
+type = "f64"      # also: "i64", "bytes" (zero-copy spans)
+name = "latitude"
+```
+
+```rust
+let cols = parser::parse_columns(&data);          // or parse_columns_par
+let lat: &[f64] = &cols.latitude;                 // one Vec per column
+let ok = parser::bitmap_get(&cols.latitude_valid, row);  // Arrow-style
+// validity bitmap: empty/malformed cells clear a bit, never panic
+```
+
 ## Performance
 
 Intel Core Ultra 9 285H (AVX2 + PCLMULQDQ, WSL2, Rust 1.93), 64 MiB
@@ -58,6 +76,34 @@ O(1) chunks for threads to walk, and `parse_par(data, threads)` builds the
 tape itself in parallel — chunk tapes concatenate directly, with one add
 per end entry to rebase counts. All std-only; output is byte-identical to
 the serial path (differentially tested per thread count).
+
+### Typed columns: CSV → Arrow-layout buffers
+
+The projection benchmark — extract Latitude/Longitude as `f64` columns
+with validity bitmaps, skipping the other five fields — median of 9 runs
+(best runs are 2–5% faster; WSL2 is memory-bandwidth-limited, so medians
+are the honest figure):
+
+| | 64 MiB synthetic | worldcitiespop.csv (144 MiB) |
+|---|---|---|
+| falx `parse_columns` | 0.82 GiB/s | 0.98 GiB/s |
+| falx `parse_columns_par` (16 threads) | **1.45 GiB/s** | **1.94 GiB/s** |
+| csv crate + `str::parse` | 0.41 GiB/s | 0.53 GiB/s |
+| arrow-csv (projection enabled) | 0.49 GiB/s | 0.62 GiB/s |
+
+All four contenders agree exactly on valid-row counts and value checksums
+(`cargo run --release --example bench_columns`). The output layout *is*
+the Arrow primitive-array layout, so handing columns to Arrow is a buffer
+wrap — `examples/arrow_interop.rs` does it without copying either buffer.
+
+Caveats, stated plainly: arrow-csv is benchmarked with projection enabled
+(its like-for-like configuration) but still materializes through its own
+record reader; the parallel speedup tops out near 2x here because the
+structural tape build is already memory-bandwidth-bound on this machine
+(stage breakdown: on worldcitiespop, 60 ms of the 144 ms serial total is
+tape construction, and 16 hyperthreads lose to 8 cores). Float conversion
+costs ~12 ns/cell via the Clinger fast path; SWAR digit scanning
+([#8](https://github.com/Mapika/falx/issues/8)) is the known headroom.
 
 ### Versus the real simdjson (C++)
 
@@ -146,7 +192,7 @@ falx = { git = "https://github.com/Mapika/falx", features = ["spec"] }
 ```rust
 // build.rs
 let spec = falx::spec::parse(&std::fs::read_to_string("spec.toml")?)?;
-let code = falx::codegen::emit_parser(&spec.dialect, &spec.name)?;
+let code = falx::codegen::emit_parser_with_columns(&spec.dialect, &spec.name, &spec.columns)?;
 std::fs::write(format!("{}/parser.rs", std::env::var("OUT_DIR")?), code)?;
 ```
 
@@ -172,8 +218,9 @@ correctness, so it's pure speed work).
 ```
 cargo test                          # differential + drift tests
 cargo run --release --example bench # multi-format throughput benchmark
+cargo run --release --example bench_columns  # typed-column extraction vs csv/arrow-csv
 cargo run --example generate        # regenerate src/kernels/ from dialects
-cargo run --features cli --bin falx -- build specs/csv.toml -o parser.rs
+cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 ```
 
 ## Roadmap
@@ -188,6 +235,9 @@ cargo run --features cli --bin falx -- build specs/csv.toml -o parser.rs
 - M5 (done): records/fields span API emitted into generated parsers — lazy
   spans, quote stripping, `Cow`-based unescaping that allocates only when an
   escape is present
+- M6 (done): typed projection — specs declare typed columns, parsers emit
+  Arrow-layout columnar buffers (values + validity bitmap), SWAR int and
+  Clinger-fast-path float parsing, serial and parallel
 - Next: faster span walking (the scalar record/field layer now dominates
   end-to-end time), shuffle-based classification (large character classes),
   comment/line-start context, ARM NEON backend, e-graph simplification of
