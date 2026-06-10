@@ -222,3 +222,29 @@ fn codegen_rejects_oversized_class() {
         err
     );
 }
+
+/// Parallel indexing must be byte-identical to serial for every thread
+/// count, including quoted regions that span chunk boundaries.
+#[test]
+fn parallel_index_matches_serial() {
+    let mut rng = Rng(0x0DDB_A115_0DDB_A115);
+    let alphabet = b"\",\n\rxy";
+    for _ in 0..40 {
+        let len = 4096 + (rng.next() % 200_000) as usize;
+        let data: Vec<u8> = (0..len)
+            .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+            .collect();
+        let mut serial = Vec::new();
+        falx::kernels::csv::index_structurals(&data, &mut serial);
+        for threads in [1, 2, 3, 7, 16] {
+            let mut par = Vec::new();
+            falx::kernels::csv::index_structurals_par(&data, threads, &mut par);
+            assert_eq!(par, serial, "csv par mismatch at {threads} threads, len {len}");
+            let mut par_tsv = Vec::new();
+            falx::kernels::tsv::index_structurals_par(&data, threads, &mut par_tsv);
+            let mut serial_tsv = Vec::new();
+            falx::kernels::tsv::index_structurals(&data, &mut serial_tsv);
+            assert_eq!(par_tsv, serial_tsv, "tsv par mismatch at {threads} threads");
+        }
+    }
+}

@@ -21,6 +21,67 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     fallback::index_structurals(data, out);
 }
 
+
+/// Parallel structural indexing: byte-identical to [`index_structurals`],
+/// split across `threads` chunks. Quote context is reconstructed with a
+/// counting prepass, so both passes run fully parallel.
+pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        index_structurals(data, out);
+        return;
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
+    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
+    let mut entry = vec![0u64; threads];
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                s.spawn(move || slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1)
+            })
+            .collect();
+        let mut parity = 0u64;
+        for (t, h) in handles.into_iter().enumerate() {
+            entry[t] = parity.wrapping_neg();
+            parity ^= h.join().expect("prepass thread ok");
+        }
+    });
+    // Pass 2: index chunks concurrently with seeded entry state.
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let seed = entry[t];
+                let base = bounds[t] as u32;
+                s.spawn(move || {
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    index_structurals_seeded_dispatch(slice, seed, base, &mut part);
+                    part
+                })
+            })
+            .collect();
+        for handle in handles {
+            out.extend_from_slice(&handle.join().expect("index thread ok"));
+        }
+    });
+}
+
+fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
+        return;
+    }
+    fallback::index_structurals_seeded(data, seed, base, out);
+}
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
@@ -316,6 +377,26 @@ pub mod fallback {
         }
     }
 
+    /// Like `index_structurals` but with seeded quote-parity carry and an
+    /// absolute base offset: the building block for parallel indexing.
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+        let mut carries = [seed];
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let mask = step(block, &mut carries).0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let mask = step(&block, &mut carries).0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
+        }
+    }
+
     #[inline]
     fn step(block: &[u8; 64], carries: &mut [u64; 1]) -> (u64, u64) {
         let v0 = eq_mask(block, 10u8); // class "\n"
@@ -435,6 +516,28 @@ mod avx2 {
             let below = (sep_mask & ((1u64 << idx) - 1)).count_ones() as u64;
             ends.push(((base_count + below) << 32) | (base + idx) as u64);
             t &= t - 1;
+        }
+    }
+
+    /// Like `index_structurals` but with seeded quote-parity carry and an
+    /// absolute base offset: the building block for parallel indexing.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+        let mut carries = [seed];
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset), &mut carries) }.0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr(), &mut carries) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
         }
     }
 

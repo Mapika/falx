@@ -116,6 +116,139 @@ fn emit_with(
         None => format!("v{}", output.0),
     };
 
+    // Parallel indexing (emitted for doubled-quote/no-escape dialects):
+    // a chunk's entry state is one bit — the parity of quote bytes before
+    // it — so a counting prepass makes chunks independent.
+    let par_mode = matches!(
+        dialect,
+        Some(d) if d.escape == crate::formats::Escape::None
+    );
+    let seed_init = if carry_count == 1 {
+        "        let mut carries = [seed];\n".to_string()
+    } else if carry_count == 0 {
+        "        let _ = seed;\n".to_string()
+    } else {
+        String::new() // par_mode never emits with >1 carry
+    };
+    let seeded_kernel = |loads: &str, tail_loads: &str, attr: &str| {
+        format!(
+            r#"
+    /// Like `index_structurals` but with seeded quote-parity carry and an
+    /// absolute base offset: the building block for parallel indexing.
+{attr}    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {{
+{seed_init}        let mut offset = 0usize;
+        while offset + 64 <= data.len() {{
+            {loads}
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }}
+        let rem = data.len() - offset;
+        if rem > 0 {{
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            {tail_loads}
+            push_indexes(mask, base + offset as u32, out);
+        }}
+    }}
+"#
+        )
+    };
+    let fallback_seeded = if par_mode {
+        seeded_kernel(
+            &format!("let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();\n            let mask = step(block{carry_arg}){sel};"),
+            &format!("let mask = step(&block{carry_arg}){sel} & ((1u64 << rem) - 1);"),
+            "",
+        )
+    } else {
+        String::new()
+    };
+    let avx2_seeded = if par_mode {
+        seeded_kernel(
+            &format!("// SAFETY: offset + 64 <= data.len().\n            let mask = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};"),
+            &format!("// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let mask = unsafe {{ step(block.as_ptr(){carry_arg}) }}{sel} & ((1u64 << rem) - 1);"),
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
+        )
+    } else {
+        String::new()
+    };
+    let par_block = if par_mode {
+        let prepass = match dialect.and_then(|d| d.quote) {
+            Some(q) => format!(
+                r#"    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
+    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
+    let mut entry = vec![0u64; threads];
+    std::thread::scope(|s| {{
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {{
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                s.spawn(move || slice.iter().filter(|&&b| b == {q}u8).count() as u64 & 1)
+            }})
+            .collect();
+        let mut parity = 0u64;
+        for (t, h) in handles.into_iter().enumerate() {{
+            entry[t] = parity.wrapping_neg();
+            parity ^= h.join().expect("prepass thread ok");
+        }}
+    }});
+"#
+            ),
+            None => r#"    // No quote context in this dialect: chunks are independent.
+    let entry = vec![0u64; threads];
+"#
+            .to_string(),
+        };
+        format!(
+            r#"
+/// Parallel structural indexing: byte-identical to [`index_structurals`],
+/// split across `threads` chunks. Quote context is reconstructed with a
+/// counting prepass, so both passes run fully parallel.
+pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {{
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {{
+        index_structurals(data, out);
+        return;
+    }}
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})
+        .collect();
+{prepass}    // Pass 2: index chunks concurrently with seeded entry state.
+    std::thread::scope(|s| {{
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {{
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let seed = entry[t];
+                let base = bounds[t] as u32;
+                s.spawn(move || {{
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    index_structurals_seeded_dispatch(slice, seed, base, &mut part);
+                    part
+                }})
+            }})
+            .collect();
+        for handle in handles {{
+            out.extend_from_slice(&handle.join().expect("index thread ok"));
+        }}
+    }});
+}}
+
+fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {{
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {{
+        // SAFETY: the required target features were just detected.
+        unsafe {{ avx2::index_structurals_seeded(data, seed, base, out) }};
+        return;
+    }}
+    fallback::index_structurals_seeded(data, seed, base, out);
+}}
+"#
+        )
+    } else {
+        String::new()
+    };
+
     // Record-aware tape indexers, emitted only in parser mode. Identical in
     // both kernels except for how a block reaches step().
     let fallback_tape = if parser.is_some() {
@@ -244,6 +377,8 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
 "#
     );
 
+    code.push_str(&par_block);
+
     if let Some(dialect) = dialect {
         push_span_api(&mut code, dialect);
     }
@@ -269,7 +404,7 @@ pub mod fallback {{
             push_indexes(mask, offset as u32, out);
         }}
     }}
-{fallback_tape}
+{fallback_tape}{fallback_seeded}
     #[inline]
     fn step(block: &[u8; 64]{carry_param}) -> {step_ret_ty} {{
 "#
@@ -358,7 +493,7 @@ mod avx2 {{
         }}
     }}
 
-{avx2_tape}
+{avx2_tape}{avx2_seeded}
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.

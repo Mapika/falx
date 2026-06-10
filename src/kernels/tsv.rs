@@ -21,6 +21,53 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     fallback::index_structurals(data, out);
 }
 
+
+/// Parallel structural indexing: byte-identical to [`index_structurals`],
+/// split across `threads` chunks. Quote context is reconstructed with a
+/// counting prepass, so both passes run fully parallel.
+pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        index_structurals(data, out);
+        return;
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // No quote context in this dialect: chunks are independent.
+    let entry = vec![0u64; threads];
+    // Pass 2: index chunks concurrently with seeded entry state.
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let seed = entry[t];
+                let base = bounds[t] as u32;
+                s.spawn(move || {
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    index_structurals_seeded_dispatch(slice, seed, base, &mut part);
+                    part
+                })
+            })
+            .collect();
+        for handle in handles {
+            out.extend_from_slice(&handle.join().expect("index thread ok"));
+        }
+    });
+}
+
+fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
+        return;
+    }
+    fallback::index_structurals_seeded(data, seed, base, out);
+}
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
@@ -296,6 +343,26 @@ pub mod fallback {
         }
     }
 
+    /// Like `index_structurals` but with seeded quote-parity carry and an
+    /// absolute base offset: the building block for parallel indexing.
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+        let _ = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let mask = step(block).0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let mask = step(&block).0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
+        }
+    }
+
     #[inline]
     fn step(block: &[u8; 64]) -> (u64, u64) {
         let v0 = eq_mask(block, 10u8); // class "\n"
@@ -398,6 +465,28 @@ mod avx2 {
             let below = (sep_mask & ((1u64 << idx) - 1)).count_ones() as u64;
             ends.push(((base_count + below) << 32) | (base + idx) as u64);
             t &= t - 1;
+        }
+    }
+
+    /// Like `index_structurals` but with seeded quote-parity carry and an
+    /// absolute base offset: the building block for parallel indexing.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+        let _ = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset)) }.0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
         }
     }
 

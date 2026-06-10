@@ -30,8 +30,8 @@ synthetic data per format, best of 7 runs:
 
 | format | generated kernel | generated scalar fallback | ecosystem baseline |
 |---|---|---|---|
-| CSV | **5.37 GiB/s** | 0.67 GiB/s | csv crate 0.46 GiB/s (11.6x slower) |
-| TSV | **7.12 GiB/s** | 0.98 GiB/s | — |
+| CSV | 5.61 GiB/s serial, **9.14 GiB/s parallel x16** | 0.67 GiB/s | csv crate 0.47 GiB/s |
+| TSV | 7.33 GiB/s serial, **13.17 GiB/s parallel x16** | 0.98 GiB/s | — |
 | logfmt | **4.99 GiB/s** | 0.42 GiB/s | — |
 | NDJSON framing | **6.61 GiB/s** | 0.76 GiB/s | serde_json 0.24 GiB/s (27x slower), simd-json tape 0.41 GiB/s (16x slower) |
 
@@ -56,14 +56,38 @@ whose end entries carry cumulative separator counts, so `records_range(a..b)`
 yields disjoint O(1) chunks that threads can walk independently (see the
 benchmark for a std-only `thread::scope` example).
 
-The simd-json comparison needs its caveat: simd-json (the Rust port of
-simdjson, whose techniques falx generates from) builds a full parse tape
-per document, where falx only frames records and slices fields — the gap
-shows what skipping in-document parsing buys on record-framing workloads.
+### Versus the real simdjson (C++)
+
+simdjson 4.6.4 (the C++ original, haswell kernel, g++ -O3 -march=native),
+same machine, byte-identical NDJSON, document counts matching exactly:
+
+| | throughput |
+|---|---|
+| falx NDJSON framing kernel | **6.61 GiB/s** |
+| simdjson `iterate_many`, count documents | 2.75 GiB/s |
+| simdjson `iterate_many`, read one field per doc | 2.48 GiB/s |
+| simd-json (Rust port), full tape per document | 0.41 GiB/s |
+
+Caveat, stated plainly: simdjson parses document internals while falx
+frames records and slices fields lazily — the gap is what skipping
+in-document parsing buys on record-streaming workloads. The C++ benchmark
+lives in this repo's history (`/tmp/simdjson_bench` recipe in the commit
+message) and is reproducible with the released amalgamation.
+
+### Parallel structural indexing
+
+Parallel indexing of quoted formats is normally blocked by quote context
+(a chunk can't know if it starts inside a string). For doubled-quote
+dialects the entry state collapses to one bit — the parity of quote bytes
+before the chunk — so `index_structurals_par` runs a trivially parallel
+counting prepass, prefix-combines parities serially (nanoseconds), then
+indexes all chunks concurrently. Output is byte-identical to the serial
+indexer (tested across thread counts with quoted regions spanning every
+chunk boundary).
 
 Codegen fidelity: after two-block unrolling in the emitter, the generated
-CSV kernel now outruns the hand-written kernel it was modeled on
-(5.37 vs 4.94 GiB/s).
+CSV kernel outruns the hand-written kernel it was modeled on
+(5.61 vs 5.12 GiB/s).
 
 Correctness: every kernel is differential-tested — generated AVX2, generated
 scalar fallback, the IR interpreter, and an independent byte-at-a-time

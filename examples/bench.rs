@@ -237,6 +237,18 @@ fn main() {
             m: measure_indexer(&data, falx::kernels::csv::fallback::index_structurals),
         },
     ];
+    rows.push(Row {
+        label: "generated parallel x16",
+        m: {
+            let mut out: Vec<u32> = Vec::with_capacity(data.len() / 4);
+            let data = &data;
+            measure(move || {
+                out.clear();
+                falx::kernels::csv::index_structurals_par(data, 16, &mut out);
+                out.len()
+            })
+        },
+    });
     check_counts("csv", &rows);
     rows.push(Row {
         label: "csv crate (full parse)",
@@ -354,6 +366,22 @@ fn main() {
             m: measure_indexer(&data, falx::kernels::tsv::fallback::index_structurals),
         },
     ];
+    let rows = {
+        let mut rows = rows;
+        rows.push(Row {
+            label: "generated parallel x16",
+            m: {
+                let mut out: Vec<u32> = Vec::with_capacity(data.len() / 4);
+                let data = &data;
+                measure(move || {
+                    out.clear();
+                    falx::kernels::tsv::index_structurals_par(data, 16, &mut out);
+                    out.len()
+                })
+            },
+        });
+        rows
+    };
     check_counts("tsv", &rows);
     report("TSV", data.len(), "generated fallback (scalar)", &rows);
 
