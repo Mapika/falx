@@ -29,6 +29,8 @@ pub mod kernels;
 pub mod interp;
 pub mod ir;
 pub mod scalar;
+#[cfg(feature = "spec")]
+pub mod spec;
 
 /// Append the byte offsets of all unquoted `,` and `\n` in `data` to `out`,
 /// using the fastest kernel this CPU supports.

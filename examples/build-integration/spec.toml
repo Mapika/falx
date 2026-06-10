@@ -1,0 +1,4 @@
+name = "csv"
+structural = [",", "\n"]
+quote = "\""
+escape = "doubled"

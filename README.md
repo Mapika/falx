@@ -122,6 +122,42 @@ a structural byte set, an optional quote byte, and an escape convention
 (RFC 4180 doubled quotes or JSON-style backslash). That one family already
 covers CSV dialects, TSV, logfmt, and NDJSON record framing.
 
+## Building on falx
+
+The intended integration is a build script: keep a `spec.toml` in your
+repo, generate the parser at compile time, ship no falx dependency at
+runtime (the generated file is std-only):
+
+```toml
+# Cargo.toml
+[build-dependencies]
+falx = { git = "https://github.com/Mapika/falx", features = ["spec"] }
+```
+
+```rust
+// build.rs
+let spec = falx::spec::parse(&std::fs::read_to_string("spec.toml")?)?;
+let code = falx::codegen::emit_parser(&spec.dialect, &spec.name)?;
+std::fs::write(format!("{}/parser.rs", std::env::var("OUT_DIR")?), code)?;
+```
+
+```rust
+// src/main.rs
+mod parser { include!(concat!(env!("OUT_DIR"), "/parser.rs")); }
+```
+
+A complete runnable version lives in `examples/build-integration/`. The
+spec gallery in `specs/` covers CSV (comma and semicolon dialects), TSV,
+PSV, logfmt, and NDJSON framing; a new delimited format is usually a
+four-line TOML file.
+
+Want to extend falx itself? `ARCHITECTURE.md` explains the bitstream IR
+and the generated-kernel anatomy; `CONTRIBUTING.md` has recipes for adding
+a format preset (~20 lines), an IR op, or a backend — the
+[issue tracker](https://github.com/Mapika/falx/issues) has scoped starter
+projects, including the ARM NEON backend (CI already verifies ARM
+correctness, so it's pure speed work).
+
 ## Running
 
 ```

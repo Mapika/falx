@@ -1,0 +1,8 @@
+[package]
+name = "falx-build-integration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+falx = { path = "../..", features = ["spec"] }

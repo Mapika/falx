@@ -17,7 +17,8 @@ serde_json = "1"
 simd-json = "0.17.0"
 
 [features]
-cli = ["dep:toml"]
+spec = ["dep:toml"]
+cli = ["spec"]
 
 [[bin]]
 name = "falx"

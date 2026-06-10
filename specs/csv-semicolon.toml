@@ -1,0 +1,5 @@
+# European-style CSV: semicolon fields, RFC 4180 quoting.
+name = "csv_semicolon"
+structural = [";", "\n"]
+quote = "\""
+escape = "doubled"

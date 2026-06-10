@@ -4,129 +4,7 @@ use std::io::{self, Write};
 use std::process;
 
 use falx::codegen;
-use falx::formats::{Dialect, Escape};
-
-#[derive(Debug)]
-struct Spec {
-    name: String,
-    structural: Vec<u8>,
-    quote: Option<u8>,
-    escape: Escape,
-}
-
-fn parse_string_as_byte(s: &str) -> Result<u8, String> {
-    // Interpret a TOML string as a single byte using Rust's escape sequences.
-    let bytes = s.as_bytes();
-
-    // Handle escape sequences manually.
-    let unescaped = if s.starts_with('\\') && s.len() == 2 {
-        match &s[1..2] {
-            "n" => b'\n',
-            "t" => b'\t',
-            "r" => b'\r',
-            "\\" => b'\\',
-            "\"" => b'"',
-            _ => return Err(format!("Unknown escape sequence in string: {}", s)),
-        }
-    } else if bytes.len() == 1 {
-        bytes[0]
-    } else {
-        return Err(format!(
-            "String '{}' is not a single byte (interpreted as {} bytes)",
-            s, bytes.len()
-        ));
-    };
-
-    Ok(unescaped)
-}
-
-fn parse_spec(content: &str) -> Result<Spec, String> {
-    // Parse TOML without serde: manually extract fields from toml::Value.
-    let parsed: toml::Table = content
-        .parse()
-        .map_err(|e| format!("Failed to parse TOML: {}", e))?;
-
-    // Extract `name` (required, string).
-    let name = parsed
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing required field: 'name' (must be a string)")?
-        .to_string();
-
-    // Extract `structural` (required, array of strings).
-    let structural_arr = parsed
-        .get("structural")
-        .and_then(|v| v.as_array())
-        .ok_or("Missing required field: 'structural' (must be an array of strings)")?;
-
-    let mut structural = Vec::new();
-    for (idx, item) in structural_arr.iter().enumerate() {
-        let s = item
-            .as_str()
-            .ok_or(format!(
-                "structural[{}]: expected string, got {}",
-                idx,
-                value_type_name(item)
-            ))?;
-        let byte = parse_string_as_byte(s).map_err(|e| {
-            format!("structural[{}]: {}", idx, e)
-        })?;
-        structural.push(byte);
-    }
-
-    // Extract `quote` (optional, string, single byte).
-    let quote = match parsed.get("quote") {
-        Some(value) => {
-            let s = value.as_str().ok_or("'quote' must be a string")?;
-            Some(parse_string_as_byte(s).map_err(|e| format!("'quote': {}", e))?)
-        }
-        None => None,
-    };
-
-    // Extract `escape` (optional, string; default "none"; valid: "none", "doubled", "backslash").
-    let escape_str = parsed
-        .get("escape")
-        .and_then(|v| v.as_str())
-        .unwrap_or("none");
-
-    // Extract `escape_char` (optional, string, single byte; default "\\").
-    let escape_char_str = parsed
-        .get("escape_char")
-        .and_then(|v| v.as_str())
-        .unwrap_or("\\");
-    let escape_char = parse_string_as_byte(escape_char_str)
-        .map_err(|e| format!("'escape_char': {}", e))?;
-
-    let escape = match escape_str {
-        "none" | "doubled" => Escape::None,
-        "backslash" => Escape::Backslash(escape_char),
-        other => {
-            return Err(format!(
-                "Invalid 'escape' value: '{}' (must be 'none', 'doubled', or 'backslash')",
-                other
-            ))
-        }
-    };
-
-    Ok(Spec {
-        name,
-        structural,
-        quote,
-        escape,
-    })
-}
-
-fn value_type_name(v: &toml::Value) -> &'static str {
-    match v {
-        toml::Value::String(_) => "string",
-        toml::Value::Integer(_) => "integer",
-        toml::Value::Float(_) => "float",
-        toml::Value::Boolean(_) => "boolean",
-        toml::Value::Datetime(_) => "datetime",
-        toml::Value::Array(_) => "array",
-        toml::Value::Table(_) => "table",
-    }
-}
+use falx::spec;
 
 fn print_usage(prog: &str) {
     eprintln!("Usage: {} build <spec.toml> [-o <output.rs>]", prog);
@@ -190,7 +68,7 @@ fn main() {
     };
 
     // Parse the spec.
-    let spec = match parse_spec(&spec_content) {
+    let spec = match spec::parse(&spec_content) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error parsing spec: {}", e);
@@ -198,15 +76,8 @@ fn main() {
         }
     };
 
-    // Build the dialect.
-    let dialect = Dialect {
-        structural: spec.structural,
-        quote: spec.quote,
-        escape: spec.escape,
-    };
-
     // Generate the full parser (indexer + span API).
-    let generated = match codegen::emit_parser(&dialect, &spec.name) {
+    let generated = match codegen::emit_parser(&spec.dialect, &spec.name) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error generating code: {}", e);
