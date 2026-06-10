@@ -1,4 +1,4 @@
-//! M0 spike for the vexel parser generator: a hand-written, simdjson-style
+//! M0 spike for the falx parser generator: a hand-written, simdjson-style
 //! SIMD structural indexer for CSV.
 //!
 //! The kernel answers one question at multiple GB/s: *where are the unquoted

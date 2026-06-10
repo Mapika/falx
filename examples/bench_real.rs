@@ -21,40 +21,40 @@ fn main() -> io::Result<()> {
     const RUNS: usize = 5;
     const WARMUP: usize = 1;
 
-    // ========== vexel::kernels::csv::index_structurals ==========
+    // ========== falx::kernels::csv::index_structurals ==========
     let mut best_index_ms = f64::INFINITY;
     for _ in 0..WARMUP {
         let mut out = Vec::new();
         let _start = Instant::now();
-        vexel::kernels::csv::index_structurals(black_box(&data), &mut out);
+        falx::kernels::csv::index_structurals(black_box(&data), &mut out);
         let _ = black_box(out);
     }
     for _ in 0..RUNS {
         let mut out = Vec::new();
         let start = Instant::now();
-        vexel::kernels::csv::index_structurals(black_box(&data), &mut out);
+        falx::kernels::csv::index_structurals(black_box(&data), &mut out);
         let _ = black_box(out);
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         best_index_ms = best_index_ms.min(elapsed);
     }
 
-    // ========== vexel::kernels::csv::parse + iterate ==========
+    // ========== falx::kernels::csv::parse + iterate ==========
     let mut best_parse_ms = f64::INFINITY;
-    let mut vexel_field_bytes: u64 = 0;
+    let mut falx_field_bytes: u64 = 0;
     for _ in 0..WARMUP {
-        let parsed = vexel::kernels::csv::parse(black_box(&data));
+        let parsed = falx::kernels::csv::parse(black_box(&data));
         let _ = black_box(&parsed);
     }
     for _ in 0..RUNS {
         let start = Instant::now();
-        let parsed = vexel::kernels::csv::parse(black_box(&data));
+        let parsed = falx::kernels::csv::parse(black_box(&data));
         let mut field_bytes = 0u64;
         for record in parsed.records() {
             for field in record.fields() {
                 field_bytes += field.len() as u64;
             }
         }
-        vexel_field_bytes = black_box(field_bytes);
+        falx_field_bytes = black_box(field_bytes);
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         best_parse_ms = best_parse_ms.min(elapsed);
     }
@@ -98,11 +98,11 @@ fn main() -> io::Result<()> {
     println!("Benchmark Results (best of {} runs):", RUNS);
     println!();
     println!(
-        "vexel::kernels::csv::index_structurals:  {:.3} ms / {:.2} GiB/s ({:.2}x vs csv)",
+        "falx::kernels::csv::index_structurals:  {:.3} ms / {:.2} GiB/s ({:.2}x vs csv)",
         best_index_ms, index_throughput, speedup_index
     );
     println!(
-        "vexel::kernels::csv::parse + iterate:    {:.3} ms / {:.2} GiB/s ({:.2}x vs csv)",
+        "falx::kernels::csv::parse + iterate:    {:.3} ms / {:.2} GiB/s ({:.2}x vs csv)",
         best_parse_ms, parse_throughput, speedup_parse
     );
     println!(
@@ -111,12 +111,12 @@ fn main() -> io::Result<()> {
     );
     println!();
     println!("Field byte totals:");
-    println!("  vexel:     {}", vexel_field_bytes);
+    println!("  falx:     {}", falx_field_bytes);
     println!("  csv crate: {}", csv_field_bytes);
-    if vexel_field_bytes != csv_field_bytes {
+    if falx_field_bytes != csv_field_bytes {
         eprintln!(
-            "WARNING: Field byte totals differ! vexel={}, csv={}",
-            vexel_field_bytes, csv_field_bytes
+            "WARNING: Field byte totals differ! falx={}, csv={}",
+            falx_field_bytes, csv_field_bytes
         );
     }
 

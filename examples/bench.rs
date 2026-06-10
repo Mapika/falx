@@ -226,15 +226,15 @@ fn main() {
     let mut rows = vec![
         Row {
             label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, vexel::kernels::csv::index_structurals),
+            m: measure_indexer(&data, falx::kernels::csv::index_structurals),
         },
         Row {
             label: "hand-written M0 kernel",
-            m: measure_indexer(&data, vexel::index_structurals),
+            m: measure_indexer(&data, falx::index_structurals),
         },
         Row {
             label: "generated fallback (scalar)",
-            m: measure_indexer(&data, vexel::kernels::csv::fallback::index_structurals),
+            m: measure_indexer(&data, falx::kernels::csv::fallback::index_structurals),
         },
     ];
     check_counts("csv", &rows);
@@ -255,8 +255,8 @@ fn main() {
 
     // ---- CSV field iteration: like-for-like (spans + quote/escape
     // cleaning vs the csv crate's materialized records) ----
-    let vexel_fields = measure(|| {
-        let parsed = vexel::kernels::csv::parse(&data);
+    let falx_fields = measure(|| {
+        let parsed = falx::kernels::csv::parse(&data);
         let mut total = 0usize;
         for record in parsed.records() {
             for field in record.fields() {
@@ -278,17 +278,17 @@ fn main() {
         total
     });
     assert_eq!(
-        vexel_fields.work, csv_fields.work,
-        "vexel and csv crate disagree on total field bytes"
+        falx_fields.work, csv_fields.work,
+        "falx and csv crate disagree on total field bytes"
     );
     println!(
         "   [csv fields: byte totals agree, {} bytes across all fields]",
-        vexel_fields.work
+        falx_fields.work
     );
     let rows = vec![
         Row {
-            label: "vexel parse+fields",
-            m: vexel_fields,
+            label: "falx parse+fields",
+            m: falx_fields,
         },
         Row {
             label: "csv crate byte_records",
@@ -307,11 +307,11 @@ fn main() {
     let rows = vec![
         Row {
             label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, vexel::kernels::tsv::index_structurals),
+            m: measure_indexer(&data, falx::kernels::tsv::index_structurals),
         },
         Row {
             label: "generated fallback (scalar)",
-            m: measure_indexer(&data, vexel::kernels::tsv::fallback::index_structurals),
+            m: measure_indexer(&data, falx::kernels::tsv::fallback::index_structurals),
         },
     ];
     check_counts("tsv", &rows);
@@ -322,11 +322,11 @@ fn main() {
     let rows = vec![
         Row {
             label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, vexel::kernels::logfmt::index_structurals),
+            m: measure_indexer(&data, falx::kernels::logfmt::index_structurals),
         },
         Row {
             label: "generated fallback (scalar)",
-            m: measure_indexer(&data, vexel::kernels::logfmt::fallback::index_structurals),
+            m: measure_indexer(&data, falx::kernels::logfmt::fallback::index_structurals),
         },
     ];
     check_counts("logfmt", &rows);
@@ -337,11 +337,11 @@ fn main() {
     let mut rows = vec![
         Row {
             label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, vexel::kernels::ndjson::index_structurals),
+            m: measure_indexer(&data, falx::kernels::ndjson::index_structurals),
         },
         Row {
             label: "generated fallback (scalar)",
-            m: measure_indexer(&data, vexel::kernels::ndjson::fallback::index_structurals),
+            m: measure_indexer(&data, falx::kernels::ndjson::fallback::index_structurals),
         },
     ];
     check_counts("ndjson", &rows);

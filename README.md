@@ -1,13 +1,13 @@
-# vexel
+# falx
 
-vexel is a parser **generator** that takes a declarative format specification
+falx is a parser **generator** that takes a declarative format specification
 and emits simdjson-style branchless SIMD parsing kernels. Hand-written SIMD
 parsers (simdjson, simdzone, simdutf, Sep) each take an expert months; the
 techniques they share are mechanical enough to compile from a spec. No other
 such generator currently exists.
 
 ```
-$ cargo run --features cli --bin vexel -- build specs/logfmt.toml -o logfmt_parser.rs
+$ cargo run --features cli --bin falx -- build specs/logfmt.toml -o logfmt_parser.rs
 ```
 
 The output is a single self-contained Rust file (std only): an
@@ -42,7 +42,7 @@ sides, byte-identical output — is:
 
 | | throughput | speedup |
 |---|---|---|
-| vexel `parse()` + field iteration | **1.02 GiB/s** | 2.19x |
+| falx `parse()` + field iteration | **1.02 GiB/s** | 2.19x |
 | csv crate `byte_records()` | 0.47 GiB/s | 1.0x |
 
 Codegen fidelity check: the generated CSV kernel runs within 2% of the
@@ -85,7 +85,7 @@ covers CSV dialects, TSV, logfmt, and NDJSON record framing.
 cargo test                          # differential + drift tests
 cargo run --release --example bench # multi-format throughput benchmark
 cargo run --example generate        # regenerate src/kernels/ from dialects
-cargo run --features cli --bin vexel -- build specs/csv.toml -o parser.rs
+cargo run --features cli --bin falx -- build specs/csv.toml -o parser.rs
 ```
 
 ## Roadmap

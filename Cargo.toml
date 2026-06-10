@@ -1,9 +1,12 @@
 [package]
-name = "vexel"
+name = "falx"
 version = "0.1.0"
 edition = "2024"
-description = "M0 spike: hand-written SIMD CSV structural indexer (simdjson-style bitstream kernel)"
+description = "Parser generator that compiles declarative format specs into simdjson-style branchless SIMD kernels"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Mapika/falx"
+keywords = ["simd", "parser", "parser-generator", "csv", "performance"]
+categories = ["parsing", "parser-implementations", "encoding"]
 
 [dependencies]
 toml = { version = "0.8", default-features = true, optional = true }
@@ -16,8 +19,8 @@ serde_json = "1"
 cli = ["dep:toml"]
 
 [[bin]]
-name = "vexel"
-path = "src/bin/vexel.rs"
+name = "falx"
+path = "src/bin/falx.rs"
 required-features = ["cli"]
 
 [profile.release]

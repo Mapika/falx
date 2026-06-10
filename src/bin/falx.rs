@@ -3,8 +3,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::process;
 
-use vexel::codegen;
-use vexel::formats::{Dialect, Escape};
+use falx::codegen;
+use falx::formats::{Dialect, Escape};
 
 #[derive(Debug)]
 struct Spec {
@@ -134,7 +134,7 @@ fn print_usage(prog: &str) {
 
 fn main() {
     let mut args = env::args();
-    let prog = args.next().unwrap_or_else(|| "vexel".to_string());
+    let prog = args.next().unwrap_or_else(|| "falx".to_string());
 
     let subcommand = match args.next() {
         Some(s) => s,

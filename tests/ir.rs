@@ -1,7 +1,7 @@
-use vexel::ir::{CharClass, Graph};
-use vexel::interp;
-use vexel::scalar;
-use vexel::formats;
+use falx::ir::{CharClass, Graph};
+use falx::interp;
+use falx::scalar;
+use falx::formats;
 
 /// xorshift64* RNG; avoids a dev-dependency for test data generation.
 struct Rng(u64);

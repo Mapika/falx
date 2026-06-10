@@ -1,12 +1,12 @@
 [package]
-name = "vexel-fuzz"
+name = "falx-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vexel = { path = ".." }
+falx = { path = ".." }
 
 [[bin]]
 name = "csv_differential"

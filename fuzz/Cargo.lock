@@ -27,6 +27,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "falx"
+version = "0.1.0"
+
+[[package]]
+name = "falx-fuzz"
+version = "0.0.0"
+dependencies = [
+ "falx",
+ "libfuzzer-sys",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -81,18 +93,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "vexel"
-version = "0.1.0"
-
-[[package]]
-name = "vexel-fuzz"
-version = "0.0.0"
-dependencies = [
- "libfuzzer-sys",
- "vexel",
-]
 
 [[package]]
 name = "wasip2"

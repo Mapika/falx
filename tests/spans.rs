@@ -75,9 +75,9 @@ fn csv_fields_match_csv_crate() {
         csv_data.push(b'\n');
     }
 
-    // Parse with vexel
-    let parsed = vexel::kernels::csv::parse(&csv_data);
-    let vexel_records: Vec<Vec<Vec<u8>>> = parsed
+    // Parse with falx
+    let parsed = falx::kernels::csv::parse(&csv_data);
+    let falx_records: Vec<Vec<Vec<u8>>> = parsed
         .records()
         .map(|record| {
             (0..record.field_count())
@@ -101,28 +101,28 @@ fn csv_fields_match_csv_crate() {
         .collect();
 
     assert_eq!(
-        vexel_records.len(),
+        falx_records.len(),
         csv_records.len(),
-        "record count mismatch: vexel {} vs csv {}",
-        vexel_records.len(),
+        "record count mismatch: falx {} vs csv {}",
+        falx_records.len(),
         csv_records.len()
     );
 
-    for (i, (vexel_rec, csv_rec)) in vexel_records.iter().zip(csv_records.iter()).enumerate() {
+    for (i, (falx_rec, csv_rec)) in falx_records.iter().zip(csv_records.iter()).enumerate() {
         assert_eq!(
-            vexel_rec.len(),
+            falx_rec.len(),
             csv_rec.len(),
-            "record {}: field count mismatch: vexel {} vs csv {}",
+            "record {}: field count mismatch: falx {} vs csv {}",
             i,
-            vexel_rec.len(),
+            falx_rec.len(),
             csv_rec.len()
         );
 
-        for (j, (vexel_field, csv_field)) in vexel_rec.iter().zip(csv_rec.iter()).enumerate() {
+        for (j, (falx_field, csv_field)) in falx_rec.iter().zip(csv_rec.iter()).enumerate() {
             assert_eq!(
-                vexel_field, csv_field,
-                "record {} field {}: mismatch: vexel {:?} vs csv {:?}",
-                i, j, vexel_field, csv_field
+                falx_field, csv_field,
+                "record {} field {}: mismatch: falx {:?} vs csv {:?}",
+                i, j, falx_field, csv_field
             );
         }
     }
@@ -131,7 +131,7 @@ fn csv_fields_match_csv_crate() {
 #[test]
 fn csv_hand_cases() {
     let input = b"a,\"b,c\",\"d\"\"e\"\r\nlast,row";
-    let parsed = vexel::kernels::csv::parse(input);
+    let parsed = falx::kernels::csv::parse(input);
     let records: Vec<_> = parsed.records().collect();
 
     assert_eq!(records.len(), 2, "expected 2 records");
@@ -186,7 +186,7 @@ fn backslash_hand_cases() {
     // logfmt: a="x \" y" b=plain\n
     // The backslash escapes the quote in the quoted field.
     let input = b"a=\"x \\\" y\" b=plain\n";
-    let parsed = vexel::kernels::logfmt::parse(input);
+    let parsed = falx::kernels::logfmt::parse(input);
     let records: Vec<_> = parsed.records().collect();
 
     assert_eq!(records.len(), 1, "expected 1 record");
@@ -252,9 +252,9 @@ fn ndjson_records_match_line_split() {
         expected_lines.push(ndjson_data[line_start..line_end].to_vec());
     }
 
-    // Parse with vexel
-    let parsed = vexel::kernels::ndjson::parse(&ndjson_data);
-    let vexel_records: Vec<_> = parsed
+    // Parse with falx
+    let parsed = falx::kernels::ndjson::parse(&ndjson_data);
+    let falx_records: Vec<_> = parsed
         .records()
         .map(|r| r.as_bytes().to_vec())
         .collect();
@@ -267,20 +267,20 @@ fn ndjson_records_match_line_split() {
         .collect();
 
     assert_eq!(
-        vexel_records.len(),
+        falx_records.len(),
         split_records.len(),
         "record count mismatch"
     );
 
-    for (i, (vexel_rec, split_rec)) in vexel_records.iter().zip(split_records.iter()).enumerate() {
+    for (i, (falx_rec, split_rec)) in falx_records.iter().zip(split_records.iter()).enumerate() {
         assert_eq!(
-            vexel_rec, split_rec,
-            "record {}: byte mismatch: vexel {:?} vs split {:?}",
-            i, vexel_rec, split_rec
+            falx_rec, split_rec,
+            "record {}: byte mismatch: falx {:?} vs split {:?}",
+            i, falx_rec, split_rec
         );
 
         // Each ndjson record should have field_count()==1
-        let parsed = vexel::kernels::ndjson::parse(&ndjson_data);
+        let parsed = falx::kernels::ndjson::parse(&ndjson_data);
         let record = parsed.records().nth(i).expect("record exists");
         assert_eq!(
             record.field_count(),
@@ -296,7 +296,7 @@ fn record_edge_cases() {
     // Empty input → 0 records
     {
         let input = b"";
-        let parsed = vexel::kernels::csv::parse(input);
+        let parsed = falx::kernels::csv::parse(input);
         let records: Vec<_> = parsed.records().collect();
         assert_eq!(records.len(), 0, "empty input: expected 0 records");
     }
@@ -304,7 +304,7 @@ fn record_edge_cases() {
     // b"\n" → 1 record, field_count 1, field(0) == empty
     {
         let input = b"\n";
-        let parsed = vexel::kernels::csv::parse(input);
+        let parsed = falx::kernels::csv::parse(input);
         let records: Vec<_> = parsed.records().collect();
         assert_eq!(records.len(), 1, "newline input: expected 1 record");
 
@@ -320,7 +320,7 @@ fn record_edge_cases() {
     // b"a,b" (no trailing newline) → 1 record with 2 fields
     {
         let input = b"a,b";
-        let parsed = vexel::kernels::csv::parse(input);
+        let parsed = falx::kernels::csv::parse(input);
         let records: Vec<_> = parsed.records().collect();
         assert_eq!(
             records.len(),
@@ -337,7 +337,7 @@ fn record_edge_cases() {
     // b"a\r\nb\r\n" → records [b"a"], [b"b"] (\r trimmed)
     {
         let input = b"a\r\nb\r\n";
-        let parsed = vexel::kernels::csv::parse(input);
+        let parsed = falx::kernels::csv::parse(input);
         let records: Vec<_> = parsed.records().collect();
         assert_eq!(records.len(), 2, "crlf input: expected 2 records");
 

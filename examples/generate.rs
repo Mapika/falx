@@ -2,7 +2,7 @@
 //! Run after changing the IR, codegen, or a format definition:
 //! `cargo run --example generate`
 
-use vexel::{codegen, formats};
+use falx::{codegen, formats};
 
 fn main() {
     let targets = [
