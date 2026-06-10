@@ -1,5 +1,7 @@
 // The generated parser is produced by build.rs from spec.toml at compile
-// time; this crate has no runtime dependency on falx.
+// time; this crate has no runtime dependency on falx. The generated API
+// is larger than this demo exercises, hence the dead_code allow.
+#[allow(dead_code)]
 mod parser {
     include!(concat!(env!("OUT_DIR"), "/parser.rs"));
 }
