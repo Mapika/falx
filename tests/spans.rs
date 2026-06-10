@@ -403,3 +403,122 @@ fn parse_par_matches_parse() {
         }
     }
 }
+
+/// Feeding input in arbitrary chunks (down to 1 byte) must yield exactly
+/// the records of batch parse, for every dialect — including quotes and
+/// escape runs split across feed boundaries.
+#[test]
+fn streaming_matches_batch() {
+    fn collect_stream(
+        data: &[u8],
+        rng: &mut Rng,
+        parse_batch: fn(&[u8]) -> Vec<Vec<Vec<u8>>>,
+        run_stream: &dyn Fn(&[u8], &[usize]) -> Vec<Vec<Vec<u8>>>,
+    ) {
+        // random cut points
+        let mut cuts: Vec<usize> = (0..(rng.next() % 12))
+            .map(|_| (rng.next() % (data.len().max(1) as u64)) as usize)
+            .collect();
+        cuts.sort_unstable();
+        let batch = parse_batch(data);
+        let streamed = run_stream(data, &cuts);
+        assert_eq!(streamed, batch, "stream/batch divergence (cuts {cuts:?})");
+    }
+
+    macro_rules! check {
+        ($module:ident, $alphabet:expr, $seed:expr) => {{
+            let mut rng = Rng($seed);
+            for _ in 0..400 {
+                let len = (rng.next() % 600) as usize;
+                let alphabet = $alphabet;
+                let data: Vec<u8> = (0..len)
+                    .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+                    .collect();
+                collect_stream(
+                    &data,
+                    &mut rng,
+                    |d| {
+                        falx::kernels::$module::parse(d)
+                            .records()
+                            .map(|r| r.fields().map(|f| f.into_owned()).collect())
+                            .collect()
+                    },
+                    &|d, cuts| {
+                        let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+                        let mut s = falx::kernels::$module::stream();
+                        let mut prev = 0usize;
+                        for &c in cuts {
+                            s.feed(&d[prev..c.min(d.len())], |r| {
+                                out.push(r.fields().map(|f| f.into_owned()).collect())
+                            });
+                            prev = c.min(d.len());
+                        }
+                        s.feed(&d[prev..], |r| {
+                            out.push(r.fields().map(|f| f.into_owned()).collect())
+                        });
+                        s.finish(|r| {
+                            out.push(r.fields().map(|f| f.into_owned()).collect())
+                        });
+                        out
+                    },
+                );
+            }
+        }};
+    }
+
+    check!(csv, b"\",\n\rxy", 0x57AE_57AE_57AE_57A1);
+    check!(ndjson, b"\\\\\"\n{}x", 0x57AE_57AE_57AE_57A2);
+    check!(logfmt, b"\\\" =\nxy", 0x57AE_57AE_57AE_57A3);
+}
+
+/// Large input with small feeds: forces repeated compaction, which must
+/// preserve block alignment and byte-position parity (escape machinery).
+#[test]
+fn streaming_compaction_large_input() {
+    for (collect_batch, run_stream) in [
+        (
+            (|d: &[u8]| {
+                falx::kernels::csv::parse(d)
+                    .records()
+                    .map(|r| r.fields().map(|f| f.into_owned()).collect())
+                    .collect()
+            }) as fn(&[u8]) -> Vec<Vec<Vec<u8>>>,
+            (|d: &[u8], feed: usize| {
+                let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+                let mut s = falx::kernels::csv::stream();
+                for chunk in d.chunks(feed) {
+                    s.feed(chunk, |r| out.push(r.fields().map(|f| f.into_owned()).collect()));
+                }
+                s.finish(|r| out.push(r.fields().map(|f| f.into_owned()).collect()));
+                out
+            }) as fn(&[u8], usize) -> Vec<Vec<Vec<u8>>>,
+        ),
+        (
+            |d| {
+                falx::kernels::ndjson::parse(d)
+                    .records()
+                    .map(|r| r.fields().map(|f| f.into_owned()).collect())
+                    .collect()
+            },
+            |d, feed| {
+                let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+                let mut s = falx::kernels::ndjson::stream();
+                for chunk in d.chunks(feed) {
+                    s.feed(chunk, |r| out.push(r.fields().map(|f| f.into_owned()).collect()));
+                }
+                s.finish(|r| out.push(r.fields().map(|f| f.into_owned()).collect()));
+                out
+            },
+        ),
+    ] {
+        let mut rng = Rng(0xC0DE_C0DE_C0DE_C0DE);
+        let alphabet = b"\\\",\n{}xyz0";
+        let data: Vec<u8> = (0..300_000)
+            .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+            .collect();
+        let batch = collect_batch(&data);
+        for feed in [1024usize, 4097, 65536] {
+            assert_eq!(run_stream(&data, feed), batch, "feed size {feed}");
+        }
+    }
+}

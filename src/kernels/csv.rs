@@ -364,6 +364,151 @@ impl<'p> Iterator for Fields<'p> {
     }
 }
 
+/// Incremental parser for unbounded input: feed chunks, receive complete
+/// records via callback. Kernel carries persist across feeds, so quoted
+/// regions and escape runs spanning chunk boundaries are handled exactly.
+/// Bytes of the unfinished trailing record are buffered internally and
+/// compacted amortized; a single record must fit in memory (< 4 GiB).
+pub struct StreamParser {
+    buf: Vec<u8>,
+    seps: Vec<u32>,
+    ends: Vec<u64>,
+    indexed: usize,
+    emitted: usize,
+    emitted_seps: usize,
+    record_start: usize,
+    carries: [u64; 1],
+}
+
+/// Create a [`StreamParser`].
+pub fn stream() -> StreamParser {
+    StreamParser {
+        buf: Vec::new(),
+        seps: Vec::new(),
+        ends: Vec::new(),
+        indexed: 0,
+        emitted: 0,
+        emitted_seps: 0,
+        record_start: 0,
+        carries: [0u64; 1],
+    }
+}
+
+impl StreamParser {
+    /// Feed the next chunk; `on_record` is called once per record completed
+    /// by this chunk.
+    pub fn feed(&mut self, chunk: &[u8], mut on_record: impl FnMut(Record<'_>)) {
+        self.buf.extend_from_slice(chunk);
+        index_tape_partial_dispatch(
+            &self.buf[self.indexed..],
+            &mut self.carries,
+            self.indexed as u32,
+            &mut self.seps,
+            &mut self.ends,
+        );
+        self.indexed += (self.buf.len() - self.indexed) & !63;
+        self.emit_ready(&mut on_record);
+        self.compact();
+    }
+
+    /// Signal end of input; emits any records completed by the final
+    /// partial block plus a trailing unterminated record.
+    pub fn finish(mut self, mut on_record: impl FnMut(Record<'_>)) {
+        let rem = self.buf.len() - self.indexed;
+        if rem > 0 {
+            // True end of stream: zero padding is safe here, exactly as in
+            // the batch tail.
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&self.buf[self.indexed..]);
+            let live = (1u64 << rem) - 1;
+            index_tape_block_dispatch(
+                &block,
+                live,
+                &mut self.carries,
+                self.indexed as u32,
+                &mut self.seps,
+                &mut self.ends,
+            );
+        }
+        self.emit_ready(&mut on_record);
+        if self.record_start < self.buf.len() {
+            on_record(Record {
+                data: &self.buf,
+                start: self.record_start,
+                end: self.buf.len(),
+                seps: &self.seps[self.emitted_seps..],
+            });
+        }
+    }
+
+    fn emit_ready(&mut self, on_record: &mut impl FnMut(Record<'_>)) {
+        while self.emitted < self.ends.len() {
+            let entry = self.ends[self.emitted];
+            let end = (entry & 0xFFFF_FFFF) as usize;
+            let cum = (entry >> 32) as usize;
+            on_record(Record {
+                data: &self.buf,
+                start: self.record_start,
+                end,
+                seps: &self.seps[self.emitted_seps..cum],
+            });
+            self.record_start = end + 1;
+            self.emitted_seps = cum;
+            self.emitted += 1;
+        }
+    }
+
+    /// Drop consumed bytes/tape once they dominate the buffer. The cut is
+    /// 64-byte aligned: it keeps block boundaries and, critically, byte
+    /// position parity stable (the escape machinery's even/odd constant
+    /// masks are parity-dependent).
+    fn compact(&mut self) {
+        let base = self.record_start.min(self.indexed) & !63;
+        if base < 4096 || base < self.buf.len() / 2 {
+            return;
+        }
+        self.buf.copy_within(base.., 0);
+        self.buf.truncate(self.buf.len() - base);
+        self.indexed -= base;
+        self.seps.drain(..self.emitted_seps);
+        for p in &mut self.seps {
+            *p -= base as u32;
+        }
+        let rebase = ((self.emitted_seps as u64) << 32) | base as u64;
+        self.ends.drain(..self.emitted);
+        for e in &mut self.ends {
+            *e -= rebase;
+        }
+        self.record_start -= base;
+        self.emitted = 0;
+        self.emitted_seps = 0;
+    }
+}
+
+fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 1], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_tape_partial(data, carries, base, seps, ends) };
+        return;
+    }
+    fallback::index_tape_partial(data, carries, base, seps, ends);
+}
+
+fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 1], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_tape_block(block, live, carries, base, seps, ends) };
+        return;
+    }
+    fallback::index_tape_block(block, live, carries, base, seps, ends);
+}
+
 /// Strip surrounding quotes and collapse doubled escape quotes.
 fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     const Q: u8 = 34u8;
@@ -481,6 +626,27 @@ pub mod fallback {
             let (mask, term) = step(&block, &mut carries);
             push_tape(mask & live, term & live, base + offset as u32, seps, ends);
         }
+    }
+
+    /// Index the full 64-byte blocks of `data` (carries persist across
+    /// calls); returns the number of bytes consumed. Streaming primitive.
+    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 1], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let _ = &carries;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let (mask, term) = step(block, carries);
+            push_tape(mask, term, base + offset as u32, seps, ends);
+            offset += 64;
+        }
+    }
+
+    /// Index one final zero-padded block (end-of-stream only); `live`
+    /// masks off the padding bits.
+    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 1], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let _ = &carries;
+        let (mask, term) = step(block, carries);
+        push_tape(mask & live, term & live, base, seps, ends);
     }
 
     #[inline]
@@ -647,6 +813,30 @@ mod avx2 {
             let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
             push_tape(mask & live, term & live, base + offset as u32, seps, ends);
         }
+    }
+
+    /// Index the full 64-byte blocks of `data` (carries persist across
+    /// calls); returns the number of bytes consumed. Streaming primitive.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 1], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let _ = &carries;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), carries) };
+            push_tape(mask, term, base + offset as u32, seps, ends);
+            offset += 64;
+        }
+    }
+
+    /// Index one final zero-padded block (end-of-stream only); `live`
+    /// masks off the padding bits.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 1], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let _ = &carries;
+        // SAFETY: block is a readable 64-byte buffer.
+        let (mask, term) = unsafe { step(block.as_ptr(), carries) };
+        push_tape(mask & live, term & live, base, seps, ends);
     }
 
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]

@@ -43,7 +43,8 @@ sides, byte-identical output — is:
 | | throughput | speedup |
 |---|---|---|
 | falx `parse()` + field iteration | 0.97 GiB/s | 2.1x |
-| falx `parse_par()` + parallel fields (16 threads) | **4.45 GiB/s** | **9.7x** |
+| falx `parse_par()` + parallel fields (16 threads) | **4.80 GiB/s** | **10.3x** |
+| falx `stream()` incremental, 64 KiB feeds | 1.29 GiB/s | 2.8x |
 | csv crate `byte_records()` | 0.46 GiB/s | 1.0x |
 
 On real data (worldcitiespop.csv, 145 MB, the csv crate's canonical
@@ -121,6 +122,14 @@ Format specs (TOML, see `specs/`) currently describe the *delimited* family:
 a structural byte set, an optional quote byte, and an escape convention
 (RFC 4180 doubled quotes or JSON-style backslash). That one family already
 covers CSV dialects, TSV, logfmt, and NDJSON record framing.
+
+Generated parsers also include a streaming API for unbounded input (pipes,
+log tails, larger-than-RAM files): `stream()` accepts arbitrary chunks and
+emits complete records through a callback. Kernel state carries across
+feeds, so quoted regions and escape runs split across chunk boundaries are
+handled exactly — and the small hot working set makes it faster than
+single-threaded batch parsing. Stream-vs-batch equivalence is
+differentially tested down to 1-byte feeds, including forced compaction.
 
 ## Building on falx
 

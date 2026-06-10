@@ -331,6 +331,29 @@ fn main() {
         "parallel chunked iteration disagrees on total field bytes"
     );
 
+    // Streaming: 64 KiB feeds through the incremental parser.
+    let streaming_fields = measure(|| {
+        let mut parser = falx::kernels::csv::stream();
+        let mut total = 0usize;
+        for chunk in data.chunks(64 * 1024) {
+            parser.feed(chunk, |record| {
+                for field in record.fields() {
+                    total += field.len();
+                }
+            });
+        }
+        parser.finish(|record| {
+            for field in record.fields() {
+                total += field.len();
+            }
+        });
+        total
+    });
+    assert_eq!(
+        streaming_fields.work, csv_fields.work,
+        "streaming disagrees on total field bytes"
+    );
+
     let parallel_label: &'static str =
         Box::leak(format!("falx parallel parse+fields x{threads}").into_boxed_str());
     let rows = vec![
@@ -341,6 +364,10 @@ fn main() {
         Row {
             label: parallel_label,
             m: parallel_fields,
+        },
+        Row {
+            label: "falx streaming (64 KiB feeds)",
+            m: streaming_fields,
         },
         Row {
             label: "csv crate byte_records",
