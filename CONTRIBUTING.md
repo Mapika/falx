@@ -34,14 +34,24 @@ quote = "\""
 escape = "doubled"
 ```
 
-### 3. Wire it into the code generator `examples/generate.rs`:
+### 3. Wire it into the kernel registry `src/kernels/targets()`:
 
 ```rust
-let targets = [
-    // ...existing formats...
-    ("pipe", formats::pipe_dialect()),
-];
+// src/kernels/mod.rs
+pub mod pipe;
+
+pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
+    vec![
+        // ...existing formats...
+        ("pipe", formats::pipe_dialect(), vec![]),
+        // The Vec<Column> declares typed columns, if any — see csv_typed.
+    ]
+}
 ```
+
+Both `examples/generate.rs` and the drift test read this registry, so a
+`cargo run --example generate` regenerates your kernel and the drift test
+keeps it honest.
 
 ### 4. Add a differential test in `tests/codegen.rs`:
 
