@@ -21,42 +21,90 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     fallback::index_structurals(data, out);
 }
 
-/// Index `data` and return a lazy record/field view over it.
-pub fn parse(data: &[u8]) -> Parsed<'_> {
-    let mut structurals = Vec::with_capacity(data.len() / 16 + 8);
-    index_structurals(data, &mut structurals);
-    Parsed { data, structurals }
+/// Record-aware tape indexing used by [`parse`].
+fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_tape(data, seps, ends) };
+        return;
+    }
+    fallback::index_tape(data, seps, ends);
 }
 
-/// A structural index over borrowed input.
+/// Index `data` and return a lazy record/field view over it.
+pub fn parse(data: &[u8]) -> Parsed<'_> {
+    let mut seps = Vec::with_capacity(data.len() / 16 + 8);
+    let mut ends = Vec::with_capacity(data.len() / 32 + 8);
+    index_tape(data, &mut seps, &mut ends);
+    Parsed { data, seps, ends }
+}
+
+/// A structural tape over borrowed input: separator positions plus record
+/// ends carrying cumulative separator counts, so record iteration is O(1)
+/// per record and never rescans the input.
 pub struct Parsed<'a> {
     data: &'a [u8],
-    structurals: Vec<u32>,
+    seps: Vec<u32>,
+    ends: Vec<u64>,
 }
 
 impl<'a> Parsed<'a> {
-    /// The raw structural positions (unquoted separators and terminators).
-    pub fn structurals(&self) -> &[u32] {
-        &self.structurals
-    }
-
     /// Iterate records (lines outside quoted regions). A record's trailing
     /// `\r` is trimmed; an empty line yields a record with one empty field.
     pub fn records(&self) -> Records<'_> {
+        self.records_range(0..self.ends.len())
+    }
+
+    /// Number of newline-terminated records (a trailing unterminated record
+    /// is not counted but is still yielded by iteration).
+    pub fn terminated_record_count(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Iterate a sub-range of terminated records. Disjoint ranges cover
+    /// disjoint input and can be walked from different threads — the
+    /// building block for parallel record processing. The range ending at
+    /// `terminated_record_count()` also yields any trailing unterminated
+    /// record.
+    pub fn records_range(&self, range: std::ops::Range<usize>) -> Records<'_> {
+        let (byte_pos, sep_pos) = if range.start == 0 {
+            (0, 0)
+        } else {
+            let prev = self.ends[range.start - 1];
+            ((prev & 0xFFFF_FFFF) as usize + 1, (prev >> 32) as usize)
+        };
+        let data_end = if range.start >= range.end && !self.ends.is_empty() {
+            byte_pos // empty sub-range: fence immediately, yield nothing
+        } else if range.end == self.ends.len() {
+            self.data.len()
+        } else {
+            // Coverage fence: the byte after this chunk's last terminator.
+            (self.ends[range.end - 1] & 0xFFFF_FFFF) as usize + 1
+        };
         Records {
             data: self.data,
-            structurals: &self.structurals,
-            byte_pos: 0,
-            idx: 0,
+            seps: &self.seps,
+            ends: &self.ends[..range.end],
+            next_end: range.start,
+            byte_pos,
+            sep_pos,
+            data_end,
         }
     }
 }
 
 pub struct Records<'p> {
     data: &'p [u8],
-    structurals: &'p [u32],
+    seps: &'p [u32],
+    ends: &'p [u64],
+    next_end: usize,
     byte_pos: usize,
-    idx: usize,
+    sep_pos: usize,
+    /// Trailing-record fence: iteration past the last tape entry stops here.
+    data_end: usize,
 }
 
 impl<'p> Iterator for Records<'p> {
@@ -64,35 +112,32 @@ impl<'p> Iterator for Records<'p> {
 
     fn next(&mut self) -> Option<Record<'p>> {
         let start = self.byte_pos;
-        if start >= self.data.len() {
-            return None;
-        }
-        let sep_start = self.idx;
-        let mut i = self.idx;
-        let mut end = self.data.len();
-        let mut next_start = self.data.len();
-        while i < self.structurals.len() {
-            let pos = self.structurals[i] as usize;
-            if self.data[pos] == b'\n' {
-                end = pos;
-                next_start = pos + 1;
-                break;
-            }
-            i += 1;
-        }
-        let seps = &self.structurals[sep_start..i];
-        self.idx = if i < self.structurals.len() { i + 1 } else { i };
-        self.byte_pos = next_start;
-        let end = if end > start && self.data[end - 1] == b'\r' {
-            end - 1
+        let (end, seps) = if self.next_end < self.ends.len() {
+            let entry = self.ends[self.next_end];
+            self.next_end += 1;
+            let end = (entry & 0xFFFF_FFFF) as usize;
+            let cum = (entry >> 32) as usize;
+            let seps = &self.seps[self.sep_pos..cum];
+            self.sep_pos = cum;
+            self.byte_pos = end + 1;
+            (end, seps)
         } else {
-            end
+            // Trailing record without a newline (only at the true data end).
+            if start >= self.data_end {
+                return None;
+            }
+            let seps = &self.seps[self.sep_pos..];
+            self.sep_pos = self.seps.len();
+            self.byte_pos = self.data_end;
+            (self.data_end, seps)
         };
         Some(Record { data: self.data, start, end, seps })
     }
 }
 
 /// One record: a span of input plus the separator positions inside it.
+/// The `\r` of a `\r\n` terminator is trimmed lazily, where bytes are
+/// actually read, so tape-only walks never touch the input buffer.
 #[derive(Clone, Copy)]
 pub struct Record<'p> {
     data: &'p [u8],
@@ -102,9 +147,19 @@ pub struct Record<'p> {
 }
 
 impl<'p> Record<'p> {
+    /// Record end with a trailing `\r` (of `\r\n`) trimmed.
+    #[inline]
+    fn trimmed_end(&self) -> usize {
+        if self.end > self.start && self.data[self.end - 1] == b'\r' {
+            self.end - 1
+        } else {
+            self.end
+        }
+    }
+
     /// The whole record span, terminator excluded.
     pub fn as_bytes(&self) -> &'p [u8] {
-        &self.data[self.start..self.end]
+        &self.data[self.start..self.trimmed_end()]
     }
 
     pub fn field_count(&self) -> usize {
@@ -122,7 +177,7 @@ impl<'p> Record<'p> {
             self.seps[i - 1] as usize + 1
         };
         let to = if i == self.seps.len() {
-            self.end
+            self.trimmed_end()
         } else {
             self.seps[i] as usize
         };
@@ -135,8 +190,50 @@ impl<'p> Record<'p> {
         self.field_raw(i).map(clean)
     }
 
-    pub fn fields(&self) -> impl Iterator<Item = std::borrow::Cow<'p, [u8]>> + '_ {
-        (0..self.field_count()).map(move |i| self.field(i).expect("index in range"))
+    pub fn fields(&self) -> Fields<'p> {
+        Fields {
+            data: self.data,
+            seps: self.seps,
+            next_sep: 0,
+            from: self.start,
+            end: self.trimmed_end(),
+            done: false,
+        }
+    }
+}
+
+/// Field iterator: one running offset, one separator-slice cursor — no
+/// per-field bounds re-derivation.
+pub struct Fields<'p> {
+    data: &'p [u8],
+    seps: &'p [u32],
+    next_sep: usize,
+    from: usize,
+    end: usize,
+    done: bool,
+}
+
+impl<'p> Iterator for Fields<'p> {
+    type Item = std::borrow::Cow<'p, [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_sep < self.seps.len() {
+            let to = self.seps[self.next_sep] as usize;
+            self.next_sep += 1;
+            let span = &self.data[self.from..to];
+            self.from = to + 1;
+            Some(clean(span))
+        } else if !self.done {
+            self.done = true;
+            Some(clean(&self.data[self.from..self.end]))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.seps.len() - self.next_sep + (!self.done) as usize;
+        (n, Some(n))
     }
 }
 
@@ -151,7 +248,7 @@ pub mod fallback {
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let mask = step(block);
+            let mask = step(block).0;
             push_indexes(mask, offset as u32, out);
             offset += 64;
         }
@@ -160,15 +257,51 @@ pub mod fallback {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
             // Mask off bits that fall in the zero padding.
-            let mask = step(&block) & ((1u64 << rem) - 1);
+            let mask = step(&block).0 & ((1u64 << rem) - 1);
             push_indexes(mask, offset as u32, out);
         }
     }
 
+    /// Record-aware indexing for [`crate::parse`]-style use: separator
+    /// positions into `seps`, record ends into `ends` encoded as
+    /// (cumulative separator count << 32) | byte position.
+    pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let (mask, term) = step(block);
+            push_tape(mask, term, offset as u32, seps, ends);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            let (mask, term) = step(&block);
+            push_tape(mask & live, term & live, offset as u32, seps, ends);
+        }
+    }
+
+    fn push_tape(structural: u64, term: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let sep_mask = structural & !term;
+        let base_count = seps.len() as u64;
+        push_indexes(sep_mask, base, seps);
+        let mut t = term;
+        while t != 0 {
+            let idx = t.trailing_zeros();
+            let below = (sep_mask & ((1u64 << idx) - 1)).count_ones() as u64;
+            ends.push(((base_count + below) << 32) | (base + idx) as u64);
+            t &= t - 1;
+        }
+    }
+
     #[inline]
-    fn step(block: &[u8; 64]) -> u64 {
-        let v0 = eq_mask(block, 9u8) | eq_mask(block, 10u8); // class "\t\n"
-        v0
+    fn step(block: &[u8; 64]) -> (u64, u64) {
+        let v0 = eq_mask(block, 10u8); // class "\n"
+        let v1 = eq_mask(block, 9u8); // class "\t"
+        let v2 = v1 | v0;
+        (v2, v2 & v0)
     }
 
     #[inline]
@@ -200,7 +333,7 @@ mod avx2 {
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
-            let mask = unsafe { step(data.as_ptr().add(offset)) };
+            let mask = unsafe { step(data.as_ptr().add(offset)) }.0;
             push_indexes(mask, offset as u32, out);
             offset += 64;
         }
@@ -209,13 +342,48 @@ mod avx2 {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
             // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
-            let mask = unsafe { step(block.as_ptr()) } & ((1u64 << rem) - 1);
+            let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
             push_indexes(mask, offset as u32, out);
         }
     }
 
+
+    /// Record-aware indexing; see the fallback twin for the tape encoding.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    unsafe fn step(ptr: *const u8) -> u64 {
+    pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
+            push_tape(mask, term, offset as u32, seps, ends);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr()) };
+            push_tape(mask & live, term & live, offset as u32, seps, ends);
+        }
+    }
+
+    fn push_tape(structural: u64, term: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let sep_mask = structural & !term;
+        let base_count = seps.len() as u64;
+        push_indexes(sep_mask, base, seps);
+        let mut t = term;
+        while t != 0 {
+            let idx = t.trailing_zeros();
+            let below = (sep_mask & ((1u64 << idx) - 1)).count_ones() as u64;
+            ends.push(((base_count + below) << 32) | (base + idx) as u64);
+            t &= t - 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    unsafe fn step(ptr: *const u8) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
         let (lo, hi) = unsafe {
             (
@@ -223,8 +391,10 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 9u8) | eq_mask(lo, hi, 10u8); // class "\t\n"
-        v0
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = eq_mask(lo, hi, 9u8); // class "\t"
+        let v2 = v1 | v0;
+        (v2, v2 & v0)
     }
 
     #[target_feature(enable = "avx2")]

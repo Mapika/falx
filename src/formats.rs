@@ -74,14 +74,41 @@ pub fn ndjson_dialect() -> Dialect {
     }
 }
 
+/// A dialect graph plus the auxiliary node the code generator needs to emit
+/// record-aware tapes: which structural bytes are record terminators.
+pub struct DelimitedParts {
+    pub graph: Graph,
+    /// Raw `\n` class node (pre quote-masking); ANDed with the output stream
+    /// it marks record ends.
+    pub terminators: NodeId,
+}
+
 /// Build the structural-indexing graph for a dialect: the output stream
-/// marks every structural byte outside quoted regions.
-pub fn delimited(dialect: &Dialect) -> Graph {
+/// marks every structural byte outside quoted regions. Separators and the
+/// `\n` terminator are classified separately so kernels can emit record
+/// boundaries as their own stream.
+pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
     let mut g = Graph::new();
-    let structural = g.class(CharClass::from_bytes(&dialect.structural));
+    let separators: Vec<u8> = dialect
+        .structural
+        .iter()
+        .copied()
+        .filter(|&b| b != b'\n')
+        .collect();
+    let terminators = g.class_byte(b'\n');
+    let candidates = if separators.is_empty() {
+        terminators
+    } else {
+        let seps = g.class(CharClass::from_bytes(&separators));
+        if dialect.structural.contains(&b'\n') {
+            g.or(seps, terminators)
+        } else {
+            seps
+        }
+    };
 
     let output = match dialect.quote {
-        None => structural,
+        None => candidates,
         Some(quote) => {
             let quotes = g.class_byte(quote);
             let real_quotes = match dialect.escape {
@@ -94,11 +121,16 @@ pub fn delimited(dialect: &Dialect) -> Graph {
             };
             let inside = g.prefix_xor(real_quotes);
             let outside = g.not(inside);
-            g.and(structural, outside)
+            g.and(candidates, outside)
         }
     };
     g.set_output(output);
-    g
+    DelimitedParts { graph: g, terminators }
+}
+
+/// The structural-indexing graph alone (see [`delimited_parts`]).
+pub fn delimited(dialect: &Dialect) -> Graph {
+    delimited_parts(dialect).graph
 }
 
 /// The CSV graph used by tests and benchmarks.

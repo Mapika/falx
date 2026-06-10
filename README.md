@@ -42,8 +42,19 @@ sides, byte-identical output — is:
 
 | | throughput | speedup |
 |---|---|---|
-| falx `parse()` + field iteration | **1.02 GiB/s** | 2.19x |
+| falx `parse()` + field iteration | 0.96 GiB/s | 2.1x |
+| falx parallel field iteration (16 threads) | **1.81 GiB/s** | 3.9x |
 | csv crate `byte_records()` | 0.47 GiB/s | 1.0x |
+
+On real data (worldcitiespop.csv, 145 MB, the csv crate's canonical
+benchmark file): indexing 2.49 GiB/s, single-threaded field iteration
+1.33 GiB/s vs the csv crate's 0.78 — with field byte totals matching the
+csv crate exactly.
+
+Parallelism falls out of the tape design: `parse()` produces a record tape
+whose end entries carry cumulative separator counts, so `records_range(a..b)`
+yields disjoint O(1) chunks that threads can walk independently (see the
+benchmark for a std-only `thread::scope` example).
 
 Codegen fidelity check: the generated CSV kernel runs within 2% of the
 hand-written kernel it was modeled on (5.23 vs 5.32 GiB/s).

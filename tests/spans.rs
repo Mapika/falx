@@ -356,3 +356,25 @@ fn record_edge_cases() {
         );
     }
 }
+
+/// Chunked iteration via records_range must reproduce records() exactly,
+/// for every possible split point — the parallel-processing contract.
+#[test]
+fn records_range_chunks_equal_full_iteration() {
+    let data = b"a,b\nc,\"d\ne\"\nf\r\ng,h,i\nlast,tail";
+    let parsed = falx::kernels::csv::parse(data);
+    let full: Vec<Vec<Vec<u8>>> = parsed
+        .records()
+        .map(|r| r.fields().map(|f| f.into_owned()).collect())
+        .collect();
+    let n = parsed.terminated_record_count();
+    for split in 0..=n {
+        let mut chunked: Vec<Vec<Vec<u8>>> = Vec::new();
+        for range in [0..split, split..n] {
+            for r in parsed.records_range(range) {
+                chunked.push(r.fields().map(|f| f.into_owned()).collect());
+            }
+        }
+        assert_eq!(chunked, full, "split at {split} diverged");
+    }
+}

@@ -285,10 +285,50 @@ fn main() {
         "   [csv fields: byte totals agree, {} bytes across all fields]",
         falx_fields.work
     );
+    // Parallel field iteration: chunk the record tape across threads
+    // (records_range gives O(1) disjoint chunks).
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let parallel_fields = measure(|| {
+        let parsed = falx::kernels::csv::parse(&data);
+        let n = parsed.terminated_record_count();
+        let chunk = n.div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let parsed = &parsed;
+                    s.spawn(move || {
+                        let range = (t * chunk).min(n)..((t + 1) * chunk).min(n);
+                        let mut total = 0usize;
+                        for record in parsed.records_range(range) {
+                            for field in record.fields() {
+                                total += field.len();
+                            }
+                        }
+                        total
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread ok"))
+                .sum()
+        })
+    });
+    assert_eq!(
+        parallel_fields.work, csv_fields.work,
+        "parallel chunked iteration disagrees on total field bytes"
+    );
+
+    let parallel_label: &'static str =
+        Box::leak(format!("falx parallel fields x{threads}").into_boxed_str());
     let rows = vec![
         Row {
             label: "falx parse+fields",
             m: falx_fields,
+        },
+        Row {
+            label: parallel_label,
+            m: parallel_fields,
         },
         Row {
             label: "csv crate byte_records",
