@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::process;
 
 use vexel::codegen;
-use vexel::formats::{delimited, Dialect, Escape};
+use vexel::formats::{Dialect, Escape};
 
 #[derive(Debug)]
 struct Spec {
@@ -19,7 +19,7 @@ fn parse_string_as_byte(s: &str) -> Result<u8, String> {
     let bytes = s.as_bytes();
 
     // Handle escape sequences manually.
-    let unescaped = if s.starts_with('\\') && s.len() > 1 {
+    let unescaped = if s.starts_with('\\') && s.len() == 2 {
         match &s[1..2] {
             "n" => b'\n',
             "t" => b'\t',
@@ -75,23 +75,12 @@ fn parse_spec(content: &str) -> Result<Spec, String> {
     }
 
     // Extract `quote` (optional, string, single byte).
-    let quote = if let Some(q_val) = parsed.get("quote") {
-        Some(
-            q_val
-                .as_str()
-                .ok_or("'quote' must be a string")?
-                .parse::<u8>()
-                .map_err(|_| {
-                    let s = q_val.as_str().unwrap();
-                    parse_string_as_byte(s).map(|b| b)
-                })
-                .or_else(|_| {
-                    let s = q_val.as_str().unwrap();
-                    parse_string_as_byte(s)
-                })?,
-        )
-    } else {
-        None
+    let quote = match parsed.get("quote") {
+        Some(value) => {
+            let s = value.as_str().ok_or("'quote' must be a string")?;
+            Some(parse_string_as_byte(s).map_err(|e| format!("'quote': {}", e))?)
+        }
+        None => None,
     };
 
     // Extract `escape` (optional, string; default "none"; valid: "none", "doubled", "backslash").
@@ -216,9 +205,8 @@ fn main() {
         escape: spec.escape,
     };
 
-    // Build the graph and generate code.
-    let graph = delimited(&dialect);
-    let generated = match codegen::emit(&graph, &spec.name) {
+    // Generate the full parser (indexer + span API).
+    let generated = match codegen::emit_parser(&dialect, &spec.name) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error generating code: {}", e);

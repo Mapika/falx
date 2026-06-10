@@ -40,8 +40,27 @@ enum Flavor {
     Fallback,
 }
 
-/// Emit a complete generated source file for `graph`.
+/// Emit a generated source file exposing only the structural indexer.
 pub fn emit(graph: &Graph, format_name: &str) -> Result<String, CodegenError> {
+    emit_with(graph, format_name, None)
+}
+
+/// Emit a full generated parser for a delimited dialect: the structural
+/// indexer plus a records/fields span API with quote stripping and
+/// escape-aware field cleaning.
+pub fn emit_parser(
+    dialect: &crate::formats::Dialect,
+    format_name: &str,
+) -> Result<String, CodegenError> {
+    let graph = crate::formats::delimited(dialect);
+    emit_with(&graph, format_name, Some(dialect))
+}
+
+fn emit_with(
+    graph: &Graph,
+    format_name: &str,
+    dialect: Option<&crate::formats::Dialect>,
+) -> Result<String, CodegenError> {
     let output = graph.output();
 
     // Assign carry slots to stateful nodes.
@@ -85,6 +104,13 @@ pub fn emit(graph: &Graph, format_name: &str) -> Result<String, CodegenError> {
     };
     let carry_arg = if carry_count > 0 { ", &mut carries" } else { "" };
 
+    let parser_doc = if dialect.is_some() {
+        "//\n// Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,\n\
+         // with dialect-aware quote stripping and escape resolution.\n"
+    } else {
+        ""
+    };
+
     let mut code = String::new();
 
     let _ = write!(
@@ -95,7 +121,7 @@ pub fn emit(graph: &Graph, format_name: &str) -> Result<String, CodegenError> {
 // Structural indexer: appends to `out` the byte offset of every set bit in
 // the format's output bitstream (its structural positions). Self-contained:
 // depends only on std.
-
+{parser_doc}
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
     #[cfg(target_arch = "x86_64")]
@@ -109,7 +135,16 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
     fallback::index_structurals(data, out);
 }}
 
-/// Portable kernel, public so the dispatch-bypassed path stays testable.
+"#
+    );
+
+    if let Some(dialect) = dialect {
+        push_span_api(&mut code, dialect);
+    }
+
+    let _ = write!(
+        code,
+        r#"/// Portable kernel, public so the dispatch-bypassed path stays testable.
 pub mod fallback {{
     pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
 {carry_decl}        let mut offset = 0usize;
@@ -283,6 +318,201 @@ mod avx2 {{
     );
 
     Ok(code)
+}
+
+/// Emit the records/fields span API: lazy walking of the structural index
+/// into record and field spans, with dialect-specific field cleaning.
+fn push_span_api(code: &mut String, dialect: &crate::formats::Dialect) {
+    code.push_str(
+        r#"/// Index `data` and return a lazy record/field view over it.
+pub fn parse(data: &[u8]) -> Parsed<'_> {
+    let mut structurals = Vec::with_capacity(data.len() / 16 + 8);
+    index_structurals(data, &mut structurals);
+    Parsed { data, structurals }
+}
+
+/// A structural index over borrowed input.
+pub struct Parsed<'a> {
+    data: &'a [u8],
+    structurals: Vec<u32>,
+}
+
+impl<'a> Parsed<'a> {
+    /// The raw structural positions (unquoted separators and terminators).
+    pub fn structurals(&self) -> &[u32] {
+        &self.structurals
+    }
+
+    /// Iterate records (lines outside quoted regions). A record's trailing
+    /// `\r` is trimmed; an empty line yields a record with one empty field.
+    pub fn records(&self) -> Records<'_> {
+        Records {
+            data: self.data,
+            structurals: &self.structurals,
+            byte_pos: 0,
+            idx: 0,
+        }
+    }
+}
+
+pub struct Records<'p> {
+    data: &'p [u8],
+    structurals: &'p [u32],
+    byte_pos: usize,
+    idx: usize,
+}
+
+impl<'p> Iterator for Records<'p> {
+    type Item = Record<'p>;
+
+    fn next(&mut self) -> Option<Record<'p>> {
+        let start = self.byte_pos;
+        if start >= self.data.len() {
+            return None;
+        }
+        let sep_start = self.idx;
+        let mut i = self.idx;
+        let mut end = self.data.len();
+        let mut next_start = self.data.len();
+        while i < self.structurals.len() {
+            let pos = self.structurals[i] as usize;
+            if self.data[pos] == b'\n' {
+                end = pos;
+                next_start = pos + 1;
+                break;
+            }
+            i += 1;
+        }
+        let seps = &self.structurals[sep_start..i];
+        self.idx = if i < self.structurals.len() { i + 1 } else { i };
+        self.byte_pos = next_start;
+        let end = if end > start && self.data[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        Some(Record { data: self.data, start, end, seps })
+    }
+}
+
+/// One record: a span of input plus the separator positions inside it.
+#[derive(Clone, Copy)]
+pub struct Record<'p> {
+    data: &'p [u8],
+    start: usize,
+    end: usize,
+    seps: &'p [u32],
+}
+
+impl<'p> Record<'p> {
+    /// The whole record span, terminator excluded.
+    pub fn as_bytes(&self) -> &'p [u8] {
+        &self.data[self.start..self.end]
+    }
+
+    pub fn field_count(&self) -> usize {
+        self.seps.len() + 1
+    }
+
+    /// Raw span of field `i`: quotes and escapes intact.
+    pub fn field_raw(&self, i: usize) -> Option<&'p [u8]> {
+        if i > self.seps.len() {
+            return None;
+        }
+        let from = if i == 0 {
+            self.start
+        } else {
+            self.seps[i - 1] as usize + 1
+        };
+        let to = if i == self.seps.len() {
+            self.end
+        } else {
+            self.seps[i] as usize
+        };
+        Some(&self.data[from..to])
+    }
+
+    /// Field `i` with surrounding quotes stripped and escapes resolved;
+    /// borrows unless an escape sequence forces a copy.
+    pub fn field(&self, i: usize) -> Option<std::borrow::Cow<'p, [u8]>> {
+        self.field_raw(i).map(clean)
+    }
+
+    pub fn fields(&self) -> impl Iterator<Item = std::borrow::Cow<'p, [u8]>> + '_ {
+        (0..self.field_count()).map(move |i| self.field(i).expect("index in range"))
+    }
+}
+
+"#,
+    );
+    code.push_str(&clean_fn(dialect));
+    code.push('\n');
+}
+
+/// The dialect-specific field-cleaning function for the span API.
+fn clean_fn(dialect: &crate::formats::Dialect) -> String {
+    use crate::formats::Escape;
+    match (dialect.quote, dialect.escape) {
+        (None, _) => r#"/// No quote convention in this dialect: fields are returned verbatim.
+fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Borrowed(raw)
+}
+"#
+        .to_string(),
+        (Some(q), Escape::None) => format!(
+            r#"/// Strip surrounding quotes and collapse doubled escape quotes.
+fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
+    const Q: u8 = {q}u8;
+    if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
+        let inner = &raw[1..raw.len() - 1];
+        if !inner.windows(2).any(|w| w[0] == Q && w[1] == Q) {{
+            return std::borrow::Cow::Borrowed(inner);
+        }}
+        let mut out = Vec::with_capacity(inner.len());
+        let mut i = 0;
+        while i < inner.len() {{
+            out.push(inner[i]);
+            if inner[i] == Q && i + 1 < inner.len() && inner[i + 1] == Q {{
+                i += 2;
+            }} else {{
+                i += 1;
+            }}
+        }}
+        return std::borrow::Cow::Owned(out);
+    }}
+    std::borrow::Cow::Borrowed(raw)
+}}
+"#
+        ),
+        (Some(q), Escape::Backslash(e)) => format!(
+            r#"/// Strip surrounding quotes and resolve backslash escapes (`\x` -> `x`).
+fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
+    const Q: u8 = {q}u8;
+    const E: u8 = {e}u8;
+    let body = if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
+        &raw[1..raw.len() - 1]
+    }} else {{
+        raw
+    }};
+    if !body.contains(&E) {{
+        return std::borrow::Cow::Borrowed(body);
+    }}
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {{
+        if body[i] == E && i + 1 < body.len() {{
+            out.push(body[i + 1]);
+            i += 2;
+        }} else {{
+            out.push(body[i]);
+            i += 1;
+        }}
+    }}
+    std::borrow::Cow::Owned(out)
+}}
+"#
+        ),
+    }
 }
 
 /// Emit one `let vN = ...;` line per node. Shared between kernels except for

@@ -1,0 +1,24 @@
+[package]
+name = "vexel-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vexel = { path = ".." }
+
+[[bin]]
+name = "csv_differential"
+path = "fuzz_targets/csv_differential.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ndjson_differential"
+path = "fuzz_targets/ndjson_differential.rs"
+test = false
+doc = false
+
+[package.metadata]
+cargo-fuzz = true

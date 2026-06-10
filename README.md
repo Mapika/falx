@@ -11,8 +11,17 @@ $ cargo run --features cli --bin vexel -- build specs/logfmt.toml -o logfmt_pars
 ```
 
 The output is a single self-contained Rust file (std only): an
-AVX2+PCLMULQDQ structural indexer with a portable scalar fallback and
-runtime dispatch, ready to drop into any project.
+AVX2+PCLMULQDQ structural indexer with a portable scalar fallback, runtime
+dispatch, and a zero-copy record/field API — ready to drop into any project:
+
+```rust
+let parsed = logfmt_parser::parse(&data);
+for record in parsed.records() {
+    for field in record.fields() {   // Cow<[u8]>: unquoted, unescaped,
+        handle(&field);              // borrows unless an escape forced a copy
+    }
+}
+```
 
 ## Performance
 
@@ -26,11 +35,18 @@ synthetic data per format, best of 7 runs:
 | logfmt | **4.28 GiB/s** | 0.42 GiB/s | — |
 | NDJSON framing | **6.14 GiB/s** | 0.75 GiB/s | serde_json 0.26 GiB/s (23.6x slower) |
 
-Two honesty notes. The baselines do more work (field/value
-materialization) — the comparison shows the headroom structural indexing
-creates, not a like-for-like parse. And the codegen fidelity check: the
-generated CSV kernel runs within 2% of the hand-written kernel it was
-modeled on (5.23 vs 5.32 GiB/s).
+Structural indexing is less work than the baselines do (they materialize
+values), so those speedups show headroom. The **like-for-like** comparison —
+full record/field iteration with quote stripping and unescaping on both
+sides, byte-identical output — is:
+
+| | throughput | speedup |
+|---|---|---|
+| vexel `parse()` + field iteration | **1.02 GiB/s** | 2.19x |
+| csv crate `byte_records()` | 0.47 GiB/s | 1.0x |
+
+Codegen fidelity check: the generated CSV kernel runs within 2% of the
+hand-written kernel it was modeled on (5.23 vs 5.32 GiB/s).
 
 Correctness: every kernel is differential-tested — generated AVX2, generated
 scalar fallback, the IR interpreter, and an independent byte-at-a-time
@@ -81,9 +97,13 @@ cargo run --features cli --bin vexel -- build specs/csv.toml -o parser.rs
 - M3 (done): declarative TOML spec + CLI emitting self-contained parser files
 - M4 (done): escape machinery (`Add`/`Const` ops) and the wider delimited
   family: TSV, logfmt, NDJSON framing
-- Next: shuffle-based classification (large character classes), multiple
-  output streams (field spans, not just positions), comment/line-start
-  context, ARM NEON backend, e-graph simplification of format graphs
+- M5 (done): records/fields span API emitted into generated parsers — lazy
+  spans, quote stripping, `Cow`-based unescaping that allocates only when an
+  escape is present
+- Next: faster span walking (the scalar record/field layer now dominates
+  end-to-end time), shuffle-based classification (large character classes),
+  comment/line-start context, ARM NEON backend, e-graph simplification of
+  format graphs
 
 ## License
 

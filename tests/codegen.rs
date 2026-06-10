@@ -26,8 +26,7 @@ fn generated_kernels_match_codegen() {
     ];
 
     for (name, dialect) in &formats {
-        let graph = formats::delimited(dialect);
-        let generated = codegen::emit(&graph, name).expect("codegen should succeed");
+        let generated = codegen::emit_parser(dialect, name).expect("codegen should succeed");
 
         let path = format!("{}/src/kernels/{}.rs", env!("CARGO_MANIFEST_DIR"), name);
         let expected = std::fs::read_to_string(&path)

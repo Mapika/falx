@@ -253,6 +253,55 @@ fn main() {
     });
     report("CSV", data.len(), "csv crate (full parse)", &rows);
 
+    // ---- CSV field iteration: like-for-like (spans + quote/escape
+    // cleaning vs the csv crate's materialized records) ----
+    let vexel_fields = measure(|| {
+        let parsed = vexel::kernels::csv::parse(&data);
+        let mut total = 0usize;
+        for record in parsed.records() {
+            for field in record.fields() {
+                total += field.len();
+            }
+        }
+        total
+    });
+    let csv_fields = measure(|| {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(&data[..]);
+        let mut total = 0usize;
+        for record in reader.byte_records() {
+            for field in record.expect("valid csv").iter() {
+                total += field.len();
+            }
+        }
+        total
+    });
+    assert_eq!(
+        vexel_fields.work, csv_fields.work,
+        "vexel and csv crate disagree on total field bytes"
+    );
+    println!(
+        "   [csv fields: byte totals agree, {} bytes across all fields]",
+        vexel_fields.work
+    );
+    let rows = vec![
+        Row {
+            label: "vexel parse+fields",
+            m: vexel_fields,
+        },
+        Row {
+            label: "csv crate byte_records",
+            m: csv_fields,
+        },
+    ];
+    report(
+        "CSV field iteration (like-for-like)",
+        data.len(),
+        "csv crate byte_records",
+        &rows,
+    );
+
     // ---- TSV ----
     let data = generate_tsv(TARGET_BYTES);
     let rows = vec![

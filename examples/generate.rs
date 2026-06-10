@@ -12,8 +12,7 @@ fn main() {
         ("ndjson", formats::ndjson_dialect()),
     ];
     for (name, dialect) in targets {
-        let graph = formats::delimited(&dialect);
-        let code = codegen::emit(&graph, name).expect("dialect should be emittable");
+        let code = codegen::emit_parser(&dialect, name).expect("dialect should be emittable");
         let path = format!("{}/src/kernels/{name}.rs", env!("CARGO_MANIFEST_DIR"));
         std::fs::write(&path, code).expect("write generated kernel");
         println!("wrote {path}");

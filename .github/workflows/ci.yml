@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup default stable
+      - run: cargo test --all-targets --features cli
+      - run: cargo build --release --features cli
