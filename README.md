@@ -86,27 +86,32 @@ are the honest figure):
 
 | | 64 MiB synthetic | worldcitiespop.csv (144 MiB) |
 |---|---|---|
-| falx `parse_columns` | 0.80 GiB/s | 1.04 GiB/s |
-| falx `parse_columns_par` (16 threads) | **1.40 GiB/s** | **1.89 GiB/s** |
+| falx `parse_columns` | 1.05 GiB/s | 1.28 GiB/s |
+| falx `parse_columns_par` (16 threads) | **4.87 GiB/s** | **3.05 GiB/s** |
 | csv crate + `str::parse` | 0.42 GiB/s | 0.52 GiB/s |
-| arrow-csv (projection enabled) | 0.49 GiB/s | 0.59 GiB/s |
+| arrow-csv (projection enabled) | 0.49 GiB/s | 0.61 GiB/s |
 
 All four contenders agree exactly on valid-row counts and value checksums
 (`cargo run --release --example bench_columns`). The output layout *is*
 the Arrow primitive-array layout, so handing columns to Arrow is a buffer
 wrap — `examples/arrow_interop.rs` does it without copying either buffer.
 
+The columnar path is *fused*: structural masks feed a projection sink
+directly, so no tape is materialized and undeclared fields cost one
+counter increment each. Parallel workers reconcile chunk boundaries by
+terminator ownership rather than tape splitting (see ARCHITECTURE.md) —
+removing the tape pass is what took parallel extraction from 1.9 to
+3+ GiB/s.
+
 Caveats, stated plainly: arrow-csv is benchmarked with projection enabled
 (its like-for-like configuration) but still materializes through its own
-record reader; the parallel speedup tops out near 2x here because the
-structural tape build is already memory-bandwidth-bound on this machine
-(stage breakdown: on worldcitiespop, ~61 ms of the 136 ms serial total is
-tape construction, and 16 hyperthreads lose to 8 cores). Float parsing
-runs ~8 ns/cell at the scalar frontier — SWAR digit scanning was
-prototyped and measured slower on real short-mantissa data (closed
-[#8](https://github.com/Mapika/falx/issues/8) has the numbers); the
-remaining structural headroom is a projection-fused tape driver
-([#10](https://github.com/Mapika/falx/issues/10)).
+record reader; serial falx is now conversion-bound — float parsing runs
+~8 ns/cell at the scalar frontier, and SWAR digit scanning was prototyped
+and measured *slower* on real short-mantissa data (closed
+[#8](https://github.com/Mapika/falx/issues/8) has the numbers). The
+144 MiB real file parallelizes to 3.05 GiB/s versus the 64 MiB synthetic
+input's 4.87 — the larger working set runs into WSL2's memory-bandwidth
+ceiling sooner.
 
 ### Versus the real simdjson (C++)
 

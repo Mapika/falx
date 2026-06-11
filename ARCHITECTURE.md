@@ -66,12 +66,16 @@ null bitmap, LSB-first), so handing a column to Arrow is a buffer wrap,
 not a conversion — see `examples/arrow_interop.rs`. Generated files stay
 std-only; the Arrow dependency lives in that example, never in the kernel.
 
-**Projection** — rows are filled by walking the structural tape: field
-boundaries come from `seps` positions, so only the bytes of *declared*
-columns are read (and only those cells are quote-cleaned). A 20-field CSV
-with two declared columns never touches the other 18 fields' bytes after
-indexing. `bytes` columns store raw `(start, end)` spans into the input —
-zero-copy, quotes and escapes intact.
+**Projection** — fused: a `ColumnSink` consumes the `(structural, terminator)`
+masks straight out of `step()`, so the columnar path materializes no tape
+at all. Per-record state is three registers (field ordinal, field start,
+record start) plus one pending-span slot per declared column; a separator
+bumps the ordinal (storing a span only when that ordinal is declared), a
+terminator flushes one row. Undeclared separators are never written
+anywhere — a 20-field CSV with two declared columns spends nothing on the
+other 18 beyond one counter increment each, and only declared cells are
+read or quote-cleaned. `bytes` columns store raw `(start, end)` spans into
+the input — zero-copy, quotes and escapes intact.
 
 **Number parsing** —
 - `i64`: cells of ≤16 digits (effectively all real data) are parsed as two
@@ -89,10 +93,18 @@ zero-copy, quotes and escapes intact.
   Eisel-Lemire would only duplicate std; the remaining headroom is SWAR
   digit scanning in the fast path, tracked as an issue.
 
-`parse_columns_par` reuses the `parse_par` tape, converts disjoint record
-ranges on separate threads, then concatenates column chunks; validity
-bitmaps are stitched with a bit shift, so chunk row counts need not be
-multiples of 64.
+`parse_columns_par` cannot reuse the tape chunking (a worker starting
+mid-record would not know its field ordinal), so records are assigned by
+*terminator ownership*: after the usual quote-parity prepass, worker *t*
+scans from its 64-byte-aligned chunk start, skips to the first record
+boundary (the partial record before it belongs to the previous worker),
+and keeps converting until it flushes the first terminator at or past its
+chunk end — overrunning by at most one record. Every terminator is flushed
+by exactly one worker, and the one still emitting at end-of-data owns the
+unterminated trailer. Column chunks then concatenate; validity bitmaps are
+stitched with a bit shift, so chunk row counts need not be multiples
+of 64. Eliminating the tape pass took parallel extraction from ~1.9 to
+~3 GiB/s on worldcitiespop (4.9 GiB/s on cache-friendlier synthetic data).
 
 ### Parallel Variants
 

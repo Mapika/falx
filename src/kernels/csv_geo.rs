@@ -572,20 +572,123 @@ impl<'a> Columns<'a> {
             longitude_valid: Vec::with_capacity(rows / 64 + 1),
         }
     }
+}
 
-    fn push_row(&mut self, record: &Record<'_>) {
-        let row = self.rows;
-        if row & 63 == 0 {
-            self.latitude_valid.push(0);
-            self.longitude_valid.push(0);
+/// Streaming projection state: drivers feed structural masks in,
+/// finished rows come out. `end` bounds the record range this sink
+/// owns (records are assigned by terminator position; a sink may
+/// overrun `end` by one record to finish what it started).
+pub(crate) struct ColumnSink<'a> {
+    cols: Columns<'a>,
+    field_start: u32,
+    record_start: u32,
+    ordinal: u32,
+    pending: [(u32, u32); 2],
+    /// Bit k set = declared column k's span is pending this record.
+    found: u32,
+    end: u32,
+    /// False until the first terminator at or past the sink's start
+    /// (the partial record before it belongs to the previous sink).
+    emitting: bool,
+    pub(crate) done: bool,
+}
+
+impl<'a> ColumnSink<'a> {
+    pub(crate) fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> ColumnSink<'a> {
+        ColumnSink {
+            cols: Columns::with_capacity(data, (end - start) as usize / 32 + 8),
+            field_start: start,
+            record_start: start,
+            ordinal: 0,
+            pending: [(0, 0); 2],
+            found: 0,
+            end,
+            emitting,
+            done: false,
         }
-        let v = record.field_raw(5).and_then(parse_f64_field);
-        self.latitude.push(v.unwrap_or(0.0));
-        self.latitude_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
-        let v = record.field_raw(6).and_then(parse_f64_field);
-        self.longitude.push(v.unwrap_or(0.0));
-        self.longitude_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
-        self.rows = row + 1;
+    }
+
+    #[inline]
+    pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {
+        let mut m = mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros();
+            if term & bit != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+            5 => { self.pending[0] = (self.field_start, p); self.found |= 1; }
+            6 => { self.pending[1] = (self.field_start, p); self.found |= 2; }
+                _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    /// Emit the row terminated (exclusively) at `end`.
+    fn flush(&mut self, end: u32) {
+        let data = self.cols.data;
+        // Record-level trim of the `\r` in `\r\n` terminators.
+        let to = if end > self.record_start && data[end as usize - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        match self.ordinal {
+            5 => { self.pending[0] = (self.field_start, to); self.found |= 1; }
+            6 => { self.pending[1] = (self.field_start, to); self.found |= 2; }
+        _ => {}
+        }
+        let row = self.cols.rows;
+        if row & 63 == 0 {
+            self.cols.latitude_valid.push(0);
+            self.cols.longitude_valid.push(0);
+        }
+        let (cfrom, cto) = self.pending[0];
+        let v = if self.found & 1 != 0 {
+            parse_f64_field(&data[cfrom as usize..cto as usize])
+        } else {
+            None
+        };
+        self.cols.latitude.push(v.unwrap_or(0.0));
+        self.cols.latitude_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
+        let (cfrom, cto) = self.pending[1];
+        let v = if self.found & 2 != 0 {
+            parse_f64_field(&data[cfrom as usize..cto as usize])
+        } else {
+            None
+        };
+        self.cols.longitude.push(v.unwrap_or(0.0));
+        self.cols.longitude_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
+        self.cols.rows = row + 1;
+    }
+
+    /// Flush any trailing unterminated record and surrender the
+    /// columns. Exactly one sink owns the trailer: the one still
+    /// emitting at end of data (sinks past it never saw a
+    /// terminator and never started).
+    pub(crate) fn finish(mut self) -> Columns<'a> {
+        let len = self.cols.data.len() as u32;
+        if self.emitting && !self.done && self.record_start < len {
+            self.flush(len);
+        }
+        self.cols
     }
 }
 
@@ -595,49 +698,68 @@ pub fn bitmap_get(bitmap: &[u64], row: usize) -> bool {
     bitmap[row >> 6] >> (row & 63) & 1 != 0
 }
 
-/// Parse `data` into typed columns. Only the declared columns' bytes
-/// are ever inspected; all other fields are skipped over via the
-/// structural tape.
+/// Parse `data` into typed columns: a fused single pass feeds the
+/// structural masks straight into the projection sink, so no tape is
+/// built and only the declared columns' bytes are ever inspected.
 pub fn parse_columns(data: &[u8]) -> Columns<'_> {
-    let parsed = parse(data);
-    let mut cols = Columns::with_capacity(data, parsed.terminated_record_count() + 1);
-    for record in parsed.records() {
-        cols.push_row(&record);
-    }
-    cols
+    let mut sink = ColumnSink::new(data, 0, data.len() as u32, true);
+    index_cells_dispatch(data, 0, 0, &mut sink);
+    sink.finish()
 }
 
-/// Parallel [`parse_columns`]: the tape comes from [`parse_par`],
-/// rows are converted over disjoint record ranges, and the column
-/// chunks concatenate (validity bitmaps are stitched with a bit
-/// shift, so chunk row counts need not be multiples of 64).
+fn index_cells_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut ColumnSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_cells(data, seed, start, sink) };
+        return;
+    }
+    fallback::index_cells(data, seed, start, sink);
+}
+
+/// Parallel [`parse_columns`]: records are assigned to workers by
+/// terminator ownership — worker t skips to the first record
+/// boundary at or past its chunk start, and finishes the record it
+/// is mid-way through at chunk end — so every record is converted
+/// exactly once, with no tape built. Quote context comes from the
+/// same counting prepass as [`parse_par`]; column chunks
+/// concatenate, validity bitmaps stitch bit-shifted.
 pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
-    let parsed = parse_par(data, threads);
-    let n = parsed.terminated_record_count();
-    let threads = threads.max(1).min(n.max(1));
-    if threads == 1 {
-        let mut cols = Columns::with_capacity(data, n + 1);
-        for record in parsed.records() {
-            cols.push_row(&record);
-        }
-        return cols;
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse_columns(data);
     }
-    let mut bounds = Vec::with_capacity(threads + 1);
-    bounds.push(0);
-    for t in 0..threads {
-        bounds.push(bounds[t] + n / threads + (t < n % threads) as usize);
-    }
-    let parts: Vec<Columns<'_>> = std::thread::scope(|s| {
-        let parsed = &parsed;
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
+    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
+    let mut entry = vec![0u64; threads];
+    std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let range = bounds[t]..bounds[t + 1];
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                s.spawn(move || slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1)
+            })
+            .collect();
+        let mut parity = 0u64;
+        for (t, h) in handles.into_iter().enumerate() {
+            entry[t] = parity.wrapping_neg();
+            parity ^= h.join().expect("prepass thread ok");
+        }
+    });
+    let parts: Vec<Columns<'_>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let seed = entry[t];
+                let (start, end) = (bounds[t], bounds[t + 1]);
                 s.spawn(move || {
-                    let mut part = Columns::with_capacity(data, range.len() + 1);
-                    for record in parsed.records_range(range) {
-                        part.push_row(&record);
-                    }
-                    part
+                    let mut sink = ColumnSink::new(data, start as u32, end as u32, t == 0);
+                    index_cells_dispatch(data, seed, start, &mut sink);
+                    sink.finish()
                 })
             })
             .collect();
@@ -882,6 +1004,32 @@ pub mod fallback {
         push_tape(mask & live, term & live, base, seps, ends);
     }
 
+    /// Fused projection driver: structural masks go straight into the
+    /// column sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        while offset + 64 <= data.len() {
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let (mask, term) = step(block, &mut carries);
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            let (mask, term) = step(&block, &mut carries);
+            sink.drive(mask & live, term & live, offset as u32);
+        }
+    }
+
     #[inline]
     fn step(block: &[u8; 64], carries: &mut [u64; 1]) -> (u64, u64) {
         let v0 = eq_mask(block, 10u8); // class "\n"
@@ -1070,6 +1218,34 @@ mod avx2 {
         // SAFETY: block is a readable 64-byte buffer.
         let (mask, term) = unsafe { step(block.as_ptr(), carries) };
         push_tape(mask & live, term & live, base, seps, ends);
+    }
+
+    /// Fused projection driver: structural masks go straight into the
+    /// column sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(mask & live, term & live, offset as u32);
+        }
     }
 
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]

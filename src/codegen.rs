@@ -85,6 +85,13 @@ impl Column {
 const RESERVED_FIELDS: &[&str] = &["data", "rows"];
 
 fn validate_columns(columns: &[Column]) -> Result<(), CodegenError> {
+    // The sink's found-mask is a u32, one bit per declared column.
+    if columns.len() > 32 {
+        return Err(CodegenError(format!(
+            "{} columns declared; the projection sink supports at most 32",
+            columns.len()
+        )));
+    }
     let mut seen = std::collections::HashSet::new();
     for column in columns {
         let name = column.field_name();
@@ -323,6 +330,72 @@ fn emit_with(
     } else {
         String::new()
     };
+    // Fused projection drivers (only when columns are declared): identical
+    // loop shape to index_tape, but masks feed the column sink directly —
+    // nothing is materialized in between. Parallel-capable dialects get a
+    // seeded variant that can start mid-stream and stops once the sink has
+    // finished its assigned record range.
+    let has_columns = parser.is_some() && !columns.is_empty();
+    let cells_tpl = r#"
+    /// Fused projection driver: structural masks go straight into the
+    /// column sink; no tape is materialized.@DOC@
+@ATTR@    pub(crate) fn index_cells(@PARAMS@sink: &mut super::ColumnSink) {
+@INIT@@START@        while offset + 64 <= data.len() {
+            @LOAD@
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            @LOAD2@
+            sink.drive(mask & live, term & live, offset as u32);
+        }
+    }
+"#;
+    let cells_fill = |attr: &str, load: &str, load2: &str| -> String {
+        let (doc, params, init, start) = if par_mode {
+            (
+                " Scans 64-byte blocks from\n    /// `start` (block-aligned) onward, until end of data or until the\n    /// sink completes its record range.",
+                "data: &[u8], seed: u64, start: usize, ",
+                seed_init.as_str(),
+                "        let mut offset = start;\n",
+            )
+        } else {
+            ("", "data: &[u8], ", carry_decl.as_str(), "        let mut offset = 0usize;\n")
+        };
+        cells_tpl
+            .replace("@DOC@", doc)
+            .replace("@ATTR@", attr)
+            .replace("@PARAMS@", params)
+            .replace("@INIT@", init)
+            .replace("@START@", start)
+            .replace("@LOAD@", load)
+            .replace("@LOAD2@", load2)
+    };
+    let fallback_cells = if has_columns {
+        cells_fill(
+            "",
+            &format!("let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();\n            let (mask, term) = step(block{carry_arg});"),
+            &format!("let (mask, term) = step(&block{carry_arg});"),
+        )
+    } else {
+        String::new()
+    };
+    let avx2_cells = if has_columns {
+        cells_fill(
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
+            &format!("// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"),
+            &format!("// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"),
+        )
+    } else {
+        String::new()
+    };
     let carry_fwd = if carry_count > 0 { ", carries" } else { "" };
     // Streaming building block: index only the full blocks of a slice with
     // caller-owned carries; the sub-block remainder stays unconsumed.
@@ -365,31 +438,7 @@ fn emit_with(
     };
 
     let par_block = if par_mode {
-        let prepass = match dialect.and_then(|d| d.quote) {
-            Some(q) => format!(
-                r#"    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
-    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
-    let mut entry = vec![0u64; threads];
-    std::thread::scope(|s| {{
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {{
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                s.spawn(move || slice.iter().filter(|&&b| b == {q}u8).count() as u64 & 1)
-            }})
-            .collect();
-        let mut parity = 0u64;
-        for (t, h) in handles.into_iter().enumerate() {{
-            entry[t] = parity.wrapping_neg();
-            parity ^= h.join().expect("prepass thread ok");
-        }}
-    }});
-"#
-            ),
-            None => r#"    // No quote context in this dialect: chunks are independent.
-    let entry = vec![0u64; threads];
-"#
-            .to_string(),
-        };
+        let prepass = prepass_snippet(dialect.and_then(|d| d.quote));
         format!(
             r#"
 /// Parallel structural indexing: byte-identical to [`index_structurals`],
@@ -650,7 +699,7 @@ pub mod fallback {{
             push_indexes(mask, offset as u32, out);
         }}
     }}
-{fallback_tape}{fallback_seeded}{fallback_tape_seeded}{fallback_partial}
+{fallback_tape}{fallback_seeded}{fallback_tape_seeded}{fallback_partial}{fallback_cells}
     #[inline]
     fn step(block: &[u8; 64]{carry_param}) -> {step_ret_ty} {{
 "#
@@ -739,7 +788,7 @@ mod avx2 {{
         }}
     }}
 
-{avx2_tape}{avx2_seeded}{avx2_tape_seeded}{avx2_partial}
+{avx2_tape}{avx2_seeded}{avx2_tape_seeded}{avx2_partial}{avx2_cells}
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
@@ -816,6 +865,36 @@ mod avx2 {{
     );
 
     Ok(code)
+}
+
+/// The quote-parity counting prepass shared by every parallel entry
+/// point; the emitted code leaves `entry[t]` as the carry seed for chunk t.
+fn prepass_snippet(quote: Option<u8>) -> String {
+    match quote {
+        Some(q) => format!(
+            r#"    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
+    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
+    let mut entry = vec![0u64; threads];
+    std::thread::scope(|s| {{
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {{
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                s.spawn(move || slice.iter().filter(|&&b| b == {q}u8).count() as u64 & 1)
+            }})
+            .collect();
+        let mut parity = 0u64;
+        for (t, h) in handles.into_iter().enumerate() {{
+            entry[t] = parity.wrapping_neg();
+            parity ^= h.join().expect("prepass thread ok");
+        }}
+    }});
+"#
+        ),
+        None => r#"    // No quote context in this dialect: chunks are independent.
+    let entry = vec![0u64; threads];
+"#
+        .to_string(),
+    }
 }
 
 /// Emit the records/fields span API: lazy walking of the structural index
@@ -1124,25 +1203,127 @@ fn push_columns_api(
         );
     }
 
-    code.push_str(
-        "\n    fn push_row(&mut self, record: &Record<'_>) {\n\
-         \x20       let row = self.rows;\n\
-         \x20       if row & 63 == 0 {\n",
+    code.push_str("}\n\n");
+
+    // --- the projection sink ------------------------------------------------
+    // Per-record state is three registers plus a K-slot pending-span
+    // array; separators only ever bump a counter (and store a span when
+    // the ordinal is declared), terminators flush one row. No tape is
+    // materialized anywhere on this path.
+    let k_count = columns.len();
+    let mut by_ordinal: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (k, column) in columns.iter().enumerate() {
+        by_ordinal.entry(column.index).or_default().push(k);
+    }
+    let arms = |end_expr: &str| -> String {
+        let mut out = String::new();
+        for (ordinal, ks) in &by_ordinal {
+            let mut stores = String::new();
+            for &k in ks {
+                let _ = write!(
+                    stores,
+                    "self.pending[{k}] = (self.field_start, {end_expr}); self.found |= {}; ",
+                    1u32 << k
+                );
+            }
+            let _ = writeln!(out, "            {ordinal} => {{ {stores}}}");
+        }
+        out
+    };
+    let sep_arms = arms("p");
+    let last_arms = arms("to");
+
+    let _ = write!(
+        code,
+        "/// Streaming projection state: drivers feed structural masks in,\n\
+         /// finished rows come out. `end` bounds the record range this sink\n\
+         /// owns (records are assigned by terminator position; a sink may\n\
+         /// overrun `end` by one record to finish what it started).\n\
+         pub(crate) struct ColumnSink<'a> {{\n\
+         \x20   cols: Columns<'a>,\n\
+         \x20   field_start: u32,\n\
+         \x20   record_start: u32,\n\
+         \x20   ordinal: u32,\n\
+         \x20   pending: [(u32, u32); {k_count}],\n\
+         \x20   /// Bit k set = declared column k's span is pending this record.\n\
+         \x20   found: u32,\n\
+         \x20   end: u32,\n\
+         \x20   /// False until the first terminator at or past the sink's start\n\
+         \x20   /// (the partial record before it belongs to the previous sink).\n\
+         \x20   emitting: bool,\n\
+         \x20   pub(crate) done: bool,\n\
+         }}\n\n\
+         impl<'a> ColumnSink<'a> {{\n\
+         \x20   pub(crate) fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> ColumnSink<'a> {{\n\
+         \x20       ColumnSink {{\n\
+         \x20           cols: Columns::with_capacity(data, (end - start) as usize / 32 + 8),\n\
+         \x20           field_start: start,\n\
+         \x20           record_start: start,\n\
+         \x20           ordinal: 0,\n\
+         \x20           pending: [(0, 0); {k_count}],\n\
+         \x20           found: 0,\n\
+         \x20           end,\n\
+         \x20           emitting,\n\
+         \x20           done: false,\n\
+         \x20       }}\n\
+         \x20   }}\n\n\
+         \x20   #[inline]\n\
+         \x20   pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {{\n\
+         \x20       let mut m = mask;\n\
+         \x20       while m != 0 {{\n\
+         \x20           let bit = m & m.wrapping_neg();\n\
+         \x20           let p = base + m.trailing_zeros();\n\
+         \x20           if term & bit != 0 {{\n\
+         \x20               if self.emitting {{\n\
+         \x20                   self.flush(p);\n\
+         \x20               }} else {{\n\
+         \x20                   self.emitting = true;\n\
+         \x20               }}\n\
+         \x20               self.record_start = p + 1;\n\
+         \x20               self.field_start = p + 1;\n\
+         \x20               self.ordinal = 0;\n\
+         \x20               self.found = 0;\n\
+         \x20               if p >= self.end {{\n\
+         \x20                   self.done = true;\n\
+         \x20                   return;\n\
+         \x20               }}\n\
+         \x20           }} else if self.emitting {{\n\
+         \x20               match self.ordinal {{\n\
+         {sep_arms}\
+         \x20               _ => {{}}\n\
+         \x20               }}\n\
+         \x20               self.ordinal += 1;\n\
+         \x20               self.field_start = p + 1;\n\
+         \x20           }}\n\
+         \x20           m &= m - 1;\n\
+         \x20       }}\n\
+         \x20   }}\n\n\
+         \x20   /// Emit the row terminated (exclusively) at `end`.\n\
+         \x20   fn flush(&mut self, end: u32) {{\n\
+         \x20       let data = self.cols.data;\n\
+         \x20       // Record-level trim of the `\\r` in `\\r\\n` terminators.\n\
+         \x20       let to = if end > self.record_start && data[end as usize - 1] == b'\\r' {{\n\
+         \x20           end - 1\n\
+         \x20       }} else {{\n\
+         \x20           end\n\
+         \x20       }};\n\
+         \x20       match self.ordinal {{\n\
+         {last_arms}\
+         \x20       _ => {{}}\n\
+         \x20       }}\n\
+         \x20       let row = self.cols.rows;\n\
+         \x20       if row & 63 == 0 {{\n"
     );
     for column in columns {
-        let _ = writeln!(code, "            self.{}_valid.push(0);", column.field_name());
+        let _ = writeln!(code, "            self.cols.{}_valid.push(0);", column.field_name());
     }
     code.push_str("        }\n");
-    // Branchless row conversion: every column unconditionally pushes a
-    // value (placeholder where invalid) and ORs its validity bit, so the
-    // only data-dependent branches left are inside cell parsing itself.
-    for column in columns {
+    for (k, column) in columns.iter().enumerate() {
         let name = column.field_name();
-        let idx = column.index;
+        let found_bit = 1u32 << k;
         let body = match column.ty {
             ColumnType::I64 | ColumnType::F64 => {
-                // The *_field wrappers skip Cow construction for unquoted
-                // cells (the overwhelming majority).
                 let parser = if column.ty == ColumnType::I64 {
                     if dialect.quote.is_some() { "parse_i64_field" } else { "parse_i64_cell" }
                 } else if dialect.quote.is_some() {
@@ -1152,20 +1333,41 @@ fn push_columns_api(
                 };
                 let zero = column.zero();
                 format!(
-                    "        let v = record.field_raw({idx}).and_then({parser});\n\
-                     \x20       self.{name}.push(v.unwrap_or({zero}));\n\
-                     \x20       self.{name}_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);\n"
+                    "        let (cfrom, cto) = self.pending[{k}];\n\
+                     \x20       let v = if self.found & {found_bit} != 0 {{\n\
+                     \x20           {parser}(&data[cfrom as usize..cto as usize])\n\
+                     \x20       }} else {{\n\
+                     \x20           None\n\
+                     \x20       }};\n\
+                     \x20       self.cols.{name}.push(v.unwrap_or({zero}));\n\
+                     \x20       self.cols.{name}_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);\n"
                 )
             }
             ColumnType::Bytes => format!(
-                "        let s = record.field_span({idx}).filter(|&(from, to)| from != to);\n\
-                 \x20       self.{name}.push(s.unwrap_or((0, 0)));\n\
-                 \x20       self.{name}_valid[row >> 6] |= (s.is_some() as u64) << (row & 63);\n"
+                "        let (cfrom, cto) = self.pending[{k}];\n\
+                 \x20       let ok = self.found & {found_bit} != 0 && cfrom != cto;\n\
+                 \x20       self.cols.{name}.push(if ok {{ (cfrom, cto) }} else {{ (0, 0) }});\n\
+                 \x20       self.cols.{name}_valid[row >> 6] |= (ok as u64) << (row & 63);\n"
             ),
         };
         code.push_str(&body);
     }
-    code.push_str("        self.rows = row + 1;\n    }\n}\n\n");
+    code.push_str(
+        "        self.cols.rows = row + 1;\n\
+         \x20   }\n\n\
+         \x20   /// Flush any trailing unterminated record and surrender the\n\
+         \x20   /// columns. Exactly one sink owns the trailer: the one still\n\
+         \x20   /// emitting at end of data (sinks past it never saw a\n\
+         \x20   /// terminator and never started).\n\
+         \x20   pub(crate) fn finish(mut self) -> Columns<'a> {\n\
+         \x20       let len = self.cols.data.len() as u32;\n\
+         \x20       if self.emitting && !self.done && self.record_start < len {\n\
+         \x20           self.flush(len);\n\
+         \x20       }\n\
+         \x20       self.cols\n\
+         \x20   }\n\
+         }\n\n",
+    );
 
     // --- bitmap accessor ----------------------------------------------------
     code.push_str(
@@ -1177,61 +1379,76 @@ fn push_columns_api(
     );
 
     // --- serial entry point -------------------------------------------------
-    code.push_str(
-        "/// Parse `data` into typed columns. Only the declared columns' bytes\n\
-         /// are ever inspected; all other fields are skipped over via the\n\
-         /// structural tape.\n\
-         pub fn parse_columns(data: &[u8]) -> Columns<'_> {\n\
-         \x20   let parsed = parse(data);\n\
-         \x20   let mut cols = Columns::with_capacity(data, parsed.terminated_record_count() + 1);\n\
-         \x20   for record in parsed.records() {\n\
-         \x20       cols.push_row(&record);\n\
-         \x20   }\n\
-         \x20   cols\n\
-         }\n\n",
+    let (dispatch_sig, dispatch_serial_args, seed_param) = if par_mode {
+        (
+            "data: &[u8], seed: u64, start: usize, sink: &mut ColumnSink",
+            "data, 0, 0, &mut sink",
+            "data, seed, start, sink",
+        )
+    } else {
+        ("data: &[u8], sink: &mut ColumnSink", "data, &mut sink", "data, sink")
+    };
+    let _ = write!(
+        code,
+        "/// Parse `data` into typed columns: a fused single pass feeds the\n\
+         /// structural masks straight into the projection sink, so no tape is\n\
+         /// built and only the declared columns' bytes are ever inspected.\n\
+         pub fn parse_columns(data: &[u8]) -> Columns<'_> {{\n\
+         \x20   let mut sink = ColumnSink::new(data, 0, data.len() as u32, true);\n\
+         \x20   index_cells_dispatch({dispatch_serial_args});\n\
+         \x20   sink.finish()\n\
+         }}\n\n\
+         fn index_cells_dispatch({dispatch_sig}) {{\n\
+         \x20   #[cfg(target_arch = \"x86_64\")]\n\
+         \x20   if std::arch::is_x86_feature_detected!(\"avx2\")\n\
+         \x20       && std::arch::is_x86_feature_detected!(\"pclmulqdq\")\n\
+         \x20   {{\n\
+         \x20       // SAFETY: the required target features were just detected.\n\
+         \x20       unsafe {{ avx2::index_cells({seed_param}) }};\n\
+         \x20       return;\n\
+         \x20   }}\n\
+         \x20   fallback::index_cells({seed_param});\n\
+         }}\n\n"
     );
 
     // --- parallel entry point ------------------------------------------------
     if par_mode {
-        code.push_str(
-            "/// Parallel [`parse_columns`]: the tape comes from [`parse_par`],\n\
-             /// rows are converted over disjoint record ranges, and the column\n\
-             /// chunks concatenate (validity bitmaps are stitched with a bit\n\
-             /// shift, so chunk row counts need not be multiples of 64).\n\
-             pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {\n\
-             \x20   let parsed = parse_par(data, threads);\n\
-             \x20   let n = parsed.terminated_record_count();\n\
-             \x20   let threads = threads.max(1).min(n.max(1));\n\
-             \x20   if threads == 1 {\n\
-             \x20       let mut cols = Columns::with_capacity(data, n + 1);\n\
-             \x20       for record in parsed.records() {\n\
-             \x20           cols.push_row(&record);\n\
-             \x20       }\n\
-             \x20       return cols;\n\
-             \x20   }\n\
-             \x20   let mut bounds = Vec::with_capacity(threads + 1);\n\
-             \x20   bounds.push(0);\n\
-             \x20   for t in 0..threads {\n\
-             \x20       bounds.push(bounds[t] + n / threads + (t < n % threads) as usize);\n\
-             \x20   }\n\
-             \x20   let parts: Vec<Columns<'_>> = std::thread::scope(|s| {\n\
-             \x20       let parsed = &parsed;\n\
+        let prepass = prepass_snippet(dialect.quote);
+        let _ = write!(
+            code,
+            "/// Parallel [`parse_columns`]: records are assigned to workers by\n\
+             /// terminator ownership — worker t skips to the first record\n\
+             /// boundary at or past its chunk start, and finishes the record it\n\
+             /// is mid-way through at chunk end — so every record is converted\n\
+             /// exactly once, with no tape built. Quote context comes from the\n\
+             /// same counting prepass as [`parse_par`]; column chunks\n\
+             /// concatenate, validity bitmaps stitch bit-shifted.\n\
+             pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {{\n\
+             \x20   let threads = threads.max(1).min(data.len() / 64 + 1);\n\
+             \x20   let chunk = (data.len() / threads + 63) & !63;\n\
+             \x20   if threads == 1 || chunk == 0 {{\n\
+             \x20       return parse_columns(data);\n\
+             \x20   }}\n\
+             \x20   let bounds: Vec<usize> = (0..=threads)\n\
+             \x20       .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})\n\
+             \x20       .collect();\n\
+             {prepass}\
+             \x20   let parts: Vec<Columns<'_>> = std::thread::scope(|s| {{\n\
              \x20       let handles: Vec<_> = (0..threads)\n\
-             \x20           .map(|t| {\n\
-             \x20               let range = bounds[t]..bounds[t + 1];\n\
-             \x20               s.spawn(move || {\n\
-             \x20                   let mut part = Columns::with_capacity(data, range.len() + 1);\n\
-             \x20                   for record in parsed.records_range(range) {\n\
-             \x20                       part.push_row(&record);\n\
-             \x20                   }\n\
-             \x20                   part\n\
-             \x20               })\n\
-             \x20           })\n\
+             \x20           .map(|t| {{\n\
+             \x20               let seed = entry[t];\n\
+             \x20               let (start, end) = (bounds[t], bounds[t + 1]);\n\
+             \x20               s.spawn(move || {{\n\
+             \x20                   let mut sink = ColumnSink::new(data, start as u32, end as u32, t == 0);\n\
+             \x20                   index_cells_dispatch(data, seed, start, &mut sink);\n\
+             \x20                   sink.finish()\n\
+             \x20               }})\n\
+             \x20           }})\n\
              \x20           .collect();\n\
              \x20       handles.into_iter().map(|h| h.join().expect(\"columns thread ok\")).collect()\n\
-             \x20   });\n\
+             \x20   }});\n\
              \x20   let mut cols = Columns::with_capacity(data, parts.iter().map(|p| p.rows).sum::<usize>());\n\
-             \x20   for part in &parts {\n",
+             \x20   for part in &parts {{\n"
         );
         for column in columns {
             let name = column.field_name();
