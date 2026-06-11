@@ -325,25 +325,36 @@ pub enum MultiOutcome {
     NotFound { failed_spec: usize, stats: Stats },
 }
 
+/// One output of a multi-output synthesis: its spec plus the leaves it
+/// declares as inputs — the way a real kernel output names its byte
+/// classes. Earlier outputs join every later library automatically.
+pub struct MultiSpec<'a> {
+    pub leaves: &'a [Leaf],
+    pub spec: Spec<'a>,
+}
+
 /// Synthesize several output streams against one corpus, sharing work
 /// across them: specs are solved in order, and every solved stream joins
 /// the leaf library for the streams after it (named `O0`, `O1`, ...), so
 /// later outputs can be expressed in terms of earlier ones at size 1 —
 /// which is how real kernels are built (`step_nested` returns three masks
-/// from one shared DAG). The merged graph shares all common
-/// subexpressions; `shared_cost` vs `separate_cost` is the fusion win.
+/// from one shared DAG). Each spec searches over ITS declared leaves plus
+/// the solved streams, keeping every search small. The merged graph
+/// shares all common subexpressions; `shared_cost` vs `separate_cost` is
+/// the fusion win.
 pub fn synthesize_multi(
-    leaves: &[Leaf],
     corpus: &[Vec<u8>],
-    specs: &[Spec],
+    specs: &[MultiSpec],
     budget: &Budget,
 ) -> MultiOutcome {
-    let mut library: Vec<Leaf> = leaves.to_vec();
+    let mut derived: Vec<Leaf> = Vec::new();
     let mut solutions: Vec<Solution> = Vec::new();
-    for (k, spec) in specs.iter().enumerate() {
-        match synthesize(&library, corpus, spec, budget) {
+    for (k, multi_spec) in specs.iter().enumerate() {
+        let mut library: Vec<Leaf> = multi_spec.leaves.to_vec();
+        library.extend(derived.iter().cloned());
+        match synthesize(&library, corpus, &multi_spec.spec, budget) {
             Outcome::Found(solution) => {
-                library.push(Leaf::derived(&format!("O{k}"), solution.graph.clone()));
+                derived.push(Leaf::derived(&format!("O{k}"), solution.graph.clone()));
                 solutions.push(*solution);
             }
             Outcome::NotFound(stats) => {
@@ -2184,9 +2195,11 @@ mod tests {
             })
         };
         match synthesize_multi(
-            &leaves,
             &corpus,
-            &[Spec::exact(&inside_ref), Spec::exact(&outside_ref)],
+            &[
+                MultiSpec { leaves: &leaves, spec: Spec::exact(&inside_ref) },
+                MultiSpec { leaves: &[], spec: Spec::exact(&outside_ref) },
+            ],
             &budget(4),
         ) {
             MultiOutcome::Found(multi) => {

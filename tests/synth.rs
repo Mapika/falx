@@ -5,9 +5,8 @@
 
 use falx::ir::Graph;
 use falx::synth::{
-    Order,
-    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, Outcome, ProveOutcome, Spec,
-    prove, synthesize, synthesize_auto,
+    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, MultiSpec, Order,
+    Outcome, ProveOutcome, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
 };
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
@@ -311,5 +310,90 @@ fn dont_care_escape_form_is_exact_on_non_escape_bytes() {
         ProveOutcome::Proven(proof) => assert!(proof.product_states <= 1024),
         ProveOutcome::Refuted(witness) => panic!("refuted by {witness:?}"),
         ProveOutcome::Aborted { explored } => panic!("aborted at {explored}"),
+    }
+}
+
+/// CSV stage 1 as a three-output multi synthesis — in-string, structural,
+/// terminator masks from per-spec leaves, later outputs reusing earlier
+/// ones. Fast enough to run unconditionally.
+#[test]
+fn csv_trio_multi_output_stays_green() {
+    let mut rng = Rng(0x2222_3333_4444_5555);
+    let corpus: Vec<Vec<u8>> = vec![
+        uniform(b"\",\nx", 2, &mut rng),
+        uniform(b"\",", 2, &mut rng),
+        runs(b"\",\nx", 2, &mut rng),
+    ];
+    let in_string_ref = |data: &[u8]| {
+        let mut inside = false;
+        mask_ref(data, |b| {
+            if b == b'"' {
+                inside = !inside;
+            }
+            inside
+        })
+    };
+    let structural_ref = |data: &[u8]| {
+        let mut inside = false;
+        mask_ref(data, |b| {
+            if b == b'"' {
+                inside = !inside;
+            }
+            (b == b',' || b == b'\n') && !inside
+        })
+    };
+    let terminator_ref = |data: &[u8]| {
+        let mut inside = false;
+        mask_ref(data, |b| {
+            if b == b'"' {
+                inside = !inside;
+            }
+            b == b'\n' && !inside
+        })
+    };
+    match synthesize_multi(
+        &corpus,
+        &[
+            MultiSpec { leaves: &[Leaf::class("Q", b"\"")], spec: Spec::exact(&in_string_ref) },
+            MultiSpec {
+                leaves: &[Leaf::class("Struct", b",\n")],
+                spec: Spec::exact(&structural_ref),
+            },
+            MultiSpec { leaves: &[Leaf::class("N", b"\n")], spec: Spec::exact(&terminator_ref) },
+        ],
+        &Budget {
+            max_level: 6,
+            max_candidates: 5_000_000,
+            max_bank: 500_000,
+            settle_levels: 0,
+            cost: CostModel::avx2(),
+            order: Order::TreeSize,
+            progress: false,
+        },
+    ) {
+        MultiOutcome::Found(multi) => {
+            assert_eq!(multi.exprs[0], "PrefixXor(Q)");
+            assert!(multi.shared_cost < multi.separate_cost);
+            // The synthesized structural mask must agree with the
+            // production CSV graph everywhere.
+            let production = falx::formats::csv();
+            let mut synthesized = multi.graph.clone();
+            synthesized.set_output(multi.outputs[1]);
+            let mut check = Rng(0x6666_7777_8888_9999);
+            let alphabet = b"\",\nx";
+            for _ in 0..2_000 {
+                let len = (check.next() % 300) as usize;
+                let input: Vec<u8> = (0..len)
+                    .map(|_| alphabet[(check.next() % alphabet.len() as u64) as usize])
+                    .collect();
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                falx::interp::run(&synthesized, &input, &mut a);
+                falx::interp::run(&production, &input, &mut b);
+                assert_eq!(a, b, "CSV stage 1 diverged on {input:?}");
+            }
+        }
+        MultiOutcome::NotFound { failed_spec, stats } => {
+            panic!("spec {failed_spec} not found: {stats:?}")
+        }
     }
 }

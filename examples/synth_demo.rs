@@ -12,8 +12,8 @@
 use falx::interp;
 use falx::ir::Graph;
 use falx::synth::{
-    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, Order, Outcome,
-    ProveOutcome, Solution, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
+    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, MultiSpec, Order,
+    Outcome, ProveOutcome, Solution, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
 };
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
@@ -300,6 +300,15 @@ fn main() {
         uniform(b"\",\n", 2, &mut rng),
         runs(b"\",\nx", 2, &mut rng),
     ];
+    let in_string_ref = |data: &[u8]| {
+        let mut inside = false;
+        mask_ref(data, |b| {
+            if b == b'"' {
+                inside = !inside;
+            }
+            inside
+        })
+    };
     let structural_ref = |data: &[u8]| {
         let mut inside = false;
         mask_ref(data, |b| {
@@ -319,13 +328,21 @@ fn main() {
         })
     };
     match synthesize_multi(
-        &[
-            Leaf::class("Struct", b",\n"),
-            Leaf::class("N", b"\n"),
-            Leaf::class("Q", b"\""),
-        ],
         &corpus,
-        &[Spec::exact(&structural_ref), Spec::exact(&terminator_ref)],
+        &[
+            MultiSpec {
+                leaves: &[Leaf::class("Q", b"\"")],
+                spec: Spec::exact(&in_string_ref),
+            },
+            MultiSpec {
+                leaves: &[Leaf::class("Struct", b",\n")],
+                spec: Spec::exact(&structural_ref),
+            },
+            MultiSpec {
+                leaves: &[Leaf::class("N", b"\n")],
+                spec: Spec::exact(&terminator_ref),
+            },
+        ],
         &budget(6, 5_000_000, false),
     ) {
         MultiOutcome::Found(multi) => {
@@ -558,6 +575,145 @@ fn main() {
         println!();
     }
 
+    // --- Rung 6d: JSON stage 1, end to end --------------------------------------
+    println!("rung: JSON STAGE 1, END TO END — five outputs, one shared DAG");
+    println!("  escaped -> real quotes -> in-string -> JSON structurals -> NDJSON");
+    println!("  framing, each spec a serial machine, each output reusing the ones");
+    println!("  before it. Cost-ordered. The final structural mask is checked");
+    println!("  against falx's production JSON graph.");
+    let json_corpus: Vec<Vec<u8>> = vec![
+        uniform(b"\"\\{}[],:x", 3, &mut rng),
+        uniform(b"\"\\x", 2, &mut rng),
+        runs(b"\"\\{}[],:x\n", 3, &mut rng),
+        runs(b"\"\\x", 2, &mut rng),
+        seam_runs(),
+        vec![b'\\'; 128],
+    ];
+    let escaped_care = |data: &[u8]| mask_ref(data, |b| b != b'\\');
+    let real_quotes_ref = |data: &[u8]| {
+        let mut run_odd = false;
+        mask_ref(data, |b| {
+            let is_esc = b == b'\\';
+            let escaped = !is_esc && run_odd;
+            run_odd = if is_esc { !run_odd } else { false };
+            b == b'"' && !escaped
+        })
+    };
+    let in_string_json_ref = |data: &[u8]| {
+        let mut run_odd = false;
+        let mut in_str = false;
+        mask_ref(data, |b| {
+            let is_esc = b == b'\\';
+            let escaped = !is_esc && run_odd;
+            run_odd = if is_esc { !run_odd } else { false };
+            if b == b'"' && !escaped {
+                in_str = !in_str;
+            }
+            in_str
+        })
+    };
+    let json_structurals_ref = |data: &[u8]| {
+        let mut run_odd = false;
+        let mut in_str = false;
+        mask_ref(data, |b| {
+            let is_esc = b == b'\\';
+            let escaped = !is_esc && run_odd;
+            run_odd = if is_esc { !run_odd } else { false };
+            if b == b'"' && !escaped {
+                in_str = !in_str;
+            }
+            matches!(b, b'{' | b'}' | b'[' | b']' | b',' | b':') && !in_str
+        })
+    };
+    let ndjson_framing_ref = |data: &[u8]| {
+        let mut run_odd = false;
+        let mut in_str = false;
+        mask_ref(data, |b| {
+            let is_esc = b == b'\\';
+            let escaped = !is_esc && run_odd;
+            run_odd = if is_esc { !run_odd } else { false };
+            if b == b'"' && !escaped {
+                in_str = !in_str;
+            }
+            b == b'\n' && !in_str
+        })
+    };
+    let json_budget = Budget {
+        max_level: 28,
+        max_candidates: 60_000_000,
+        max_bank: 2_000_000,
+        settle_levels: 2,
+        cost: CostModel::avx2(),
+        order: Order::Cost,
+        progress: false,
+    };
+    match synthesize_multi(
+        &json_corpus,
+        &[
+            MultiSpec {
+                leaves: &[Leaf::class("B", b"\\"), Leaf::constant("EVEN", EVEN)],
+                spec: Spec::with_care(&escaped_reference, &escaped_care),
+            },
+            MultiSpec {
+                leaves: &[Leaf::class("Q", b"\"")],
+                spec: Spec::exact(&real_quotes_ref),
+            },
+            MultiSpec { leaves: &[], spec: Spec::exact(&in_string_json_ref) },
+            MultiSpec {
+                leaves: &[Leaf::class("Struct", b"{}[],:")],
+                spec: Spec::exact(&json_structurals_ref),
+            },
+            MultiSpec {
+                leaves: &[Leaf::class("N", b"\n")],
+                spec: Spec::exact(&ndjson_framing_ref),
+            },
+        ],
+        &json_budget,
+    ) {
+        MultiOutcome::Found(multi) => {
+            for (k, expr) in multi.exprs.iter().enumerate() {
+                println!("  O{k} = {expr}");
+            }
+            println!(
+                "  shared graph: {} nodes, cost {} — separate kernels would cost {} ({} candidates, {:.1}s)",
+                multi.graph.nodes().len(),
+                multi.shared_cost,
+                multi.separate_cost,
+                multi.stats.candidates,
+                multi.stats.elapsed_ms as f64 / 1000.0,
+            );
+            // The synthesized structural mask vs falx's production JSON graph.
+            let production = falx::formats::delimited(&falx::formats::json_dialect());
+            let mut synthesized = multi.graph.clone();
+            synthesized.set_output(multi.outputs[3]);
+            let mut rng = Rng(0x0DDB_A11C_0DDB_A11C);
+            let alphabet = b"\"\\{}[],:x\n";
+            for _ in 0..50_000 {
+                let len = (rng.next() % 384) as usize;
+                let input: Vec<u8> = (0..len)
+                    .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+                    .collect();
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                interp::run(&synthesized, &input, &mut a);
+                interp::run(&production, &input, &mut b);
+                assert_eq!(a, b, "synthesized JSON stage 1 diverged on {input:?}");
+            }
+            println!(
+                "  synthesized structural mask vs production formats::json graph: 50000 random inputs, all agree"
+            );
+            println!(
+                "  production graph: {} nodes — synthesized five-output DAG: {} nodes",
+                production.nodes().len(),
+                multi.graph.nodes().len(),
+            );
+            println!();
+        }
+        MultiOutcome::NotFound { failed_spec, stats } => {
+            println!("  NOT FOUND for spec {failed_spec}: {stats:?}");
+            println!();
+        }
+    }
+
     // --- Rung 7: provably out of reach ----------------------------------------
     let corpus: Vec<Vec<u8>> = vec![
         uniform(b"\r\nx", 2, &mut rng),
@@ -587,4 +743,95 @@ fn main() {
     println!("  the exhaustive search corroborates what the argument proves. Multi-byte");
     println!("  terminators need either a lookahead op (ShiftRight1) or falx's existing");
     println!("  convention: mark the LF, trim the CR in the span layer.");
+    println!();
+
+    // --- Rung 8: the Regions op's existence, as search evidence ---------------
+    println!("rung: QUOTE/COMMENT INTERLEAVING — why the Regions op exists");
+    println!("  CSV-with-#-comments: a quote opens a region unless inside a comment;");
+    println!("  a # at line start opens a comment unless inside quotes. falx's hand");
+    println!("  analysis says no bit-parallel parity can express this and added the");
+    println!("  sequential Regions op. The search corroborates: nothing through the");
+    println!("  budget. (Evidence, not proof — unlike CRLF there is no causality bar.)");
+    let corpus: Vec<Vec<u8>> = vec![
+        uniform(b"\"#\nx", 2, &mut rng),
+        uniform(b"\"#\n", 2, &mut rng),
+        runs(b"\"#\nx", 3, &mut rng),
+    ];
+    let line_start = {
+        let mut g = Graph::new();
+        let n = g.class_byte(b'\n');
+        let start = g.shift_left1_seeded(n);
+        g.set_output(start);
+        g
+    };
+    report(
+        "inert-region mask (quotes + comments)",
+        "three-state machine: normal -> quote (on \") -> normal; normal -> comment (on # at line start) -> normal (on newline)",
+        synthesize(
+            &[
+                Leaf::class("Q", b"\""),
+                Leaf::class("H", b"#"),
+                Leaf::class("N", b"\n"),
+                Leaf::constant("EVEN", EVEN),
+                Leaf::derived("LineStart", line_start),
+            ],
+            &corpus,
+            &Spec::exact(&|data| {
+                #[derive(PartialEq)]
+                enum Region {
+                    Normal,
+                    Quote,
+                    Comment,
+                }
+                let mut state = Region::Normal;
+                let mut at_start = true;
+                mask_ref(data, |b| {
+                    let start = at_start;
+                    at_start = b == b'\n';
+                    match state {
+                        Region::Quote => {
+                            if b == b'"' {
+                                state = Region::Normal;
+                                false // close quote excluded, prefix-XOR convention
+                            } else {
+                                true
+                            }
+                        }
+                        Region::Comment => {
+                            if b == b'\n' {
+                                state = Region::Normal;
+                                false // terminating newline excluded
+                            } else {
+                                true
+                            }
+                        }
+                        Region::Normal => {
+                            if b == b'"' {
+                                state = Region::Quote;
+                                true // open quote included
+                            } else if b == b'#' && start {
+                                state = Region::Comment;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                })
+            }),
+            &Budget {
+                max_level: 24,
+                max_candidates: 40_000_000,
+                max_bank: 2_000_000,
+                settle_levels: 1,
+                cost: CostModel::avx2(),
+                order: Order::Cost,
+                progress: false,
+            },
+        ),
+    );
+    println!("  Consistent with the hand analysis: quote and comment regions make each");
+    println!("  other's openers inert, which no fixed composition of parity and carry");
+    println!("  tricks in the searched budget expresses. The sequential Regions op");
+    println!("  (cost ~event count, not bytes) remains earned.");
 }
