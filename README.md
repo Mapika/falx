@@ -230,6 +230,22 @@ handled exactly — and the small hot working set makes it faster than
 single-threaded batch parsing. Stream-vs-batch equivalence is
 differentially tested down to 1-byte feeds, including forced compaction.
 
+## falx-synth: the generator discovers its own kernels
+
+`src/synth.rs` inverts the generation direction. Instead of compiling a fixed set of known bit-parallel tricks, it searches for them: given a byte-at-a-time reference implementation (the state machine a person would naively write), it enumerates the bitstream IR bottom-up to find an equivalent branchless graph. The search uses observational-equivalence dedup (terms are pruned if their behavior on a corpus equals an earlier term), CEGIS verification loops (a differential mismatch on fresh random inputs becomes a new corpus entry and the search restarts), and cost-weighted settling (the cheapest verified form, not the first match).
+
+The search includes automatic abstraction discovery: when a round of enumeration exhausts, banked terms are scored by gate (precision × recall against the target bits), generativity (how many novel terms build on them), and near-miss subterm frequency, and the best are promoted to leaves for the next round; single-hole templates mined by anti-unification join the grammar as ops. Enumeration itself runs sharded across threads with a deterministic merge.
+
+Demo: `cargo run --release --example synth_demo`.
+
+Starting from only the escape-byte class and the even-position constant, the system re-derived the simdjson odd-backslash-run escape trick by inventing its own intermediate abstractions. It then found a 9-node form (two carried states) that beats the 16-node hand derivation falx originally shipped — that form now is the `escaped_positions` kernel in `src/formats.rs`, feeding JSON, NDJSON, and logfmt.
+
+Verification is exhaustive. Every candidate passes 4,000-input differential CEGIS verification and 50,000-input differential comparison with the hand graph. Beyond that, every IR op has an exact byte-serial form carrying at most one bit of state, so a graph is a finite automaton over bytes. Complete equivalence is proven via product-automaton reachability against the spec machine — equality for all inputs, no SMT solver. The escape kernel's proof has 224 product states.
+
+Caveats, stated plainly. An earlier discovery (a PrefixXor-based 9-node form) was 5–8% slower in the kernels despite being smaller; PrefixXor is a carry-less multiply on AVX2. The search now optimizes a per-backend cost model instead of node count. Throughput of the escape kernels is flat either way on this WSL2 box (memory-bandwidth-bound), so the practical win is smaller generated code and one fewer carried state, not GiB/s. With don't-care masks (the stream is only read at quote bytes), the search found a 6-node form. The prover also certifies impossibilities: CR-before-LF needs one byte of lookahead, every IR op is causal, so no graph of any size computes it ([#3](https://github.com/Mapika/falx/issues/3) context).
+
+Multi-output synthesis solves several specs against one corpus, later outputs reusing earlier ones and merging into a shared-CSE graph.
+
 ## Building on falx
 
 The intended integration is a build script: keep a `spec.toml` in your
@@ -299,7 +315,7 @@ cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
   nested builder's serial prepass), per-field clean/Cow cost (the
   remaining span-layer headroom, ~2.5 ns/field), configurable record
   terminators ([#3](https://github.com/Mapika/falx/issues/3), in
-  progress), ARM NEON backend, e-graph simplification of format graphs
+  progress), ARM NEON backend, cost-weighted e-graph simplification of format graphs (the synthesizer's cost models are the seed)
 
 ## License
 

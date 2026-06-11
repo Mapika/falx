@@ -171,6 +171,24 @@ For doubled-quote dialects (no backslash escapes, so quote parity is independent
 - `parse_par(data, threads)`: Parallel tape building; end entries carry cumulative separator counts, so chunk tapes concatenate with one add per end entry.
 - Output is byte-identical to serial (tested across thread counts).
 
+## The Synthesizer (src/synth.rs)
+
+**Inversion of the generator**: The IR ops are bit-parallel tricks humans discovered by hand; the synthesizer inverts this, discovering kernels from a byte-at-a-time reference semantics instead of compiling known ones.
+
+**Search space**: Bottom-up enumeration by expression-tree size; observational-equivalence dedup via a multi-block corpus (a term enters the bank only if its behavior is new). Per-size, sharded parallel evaluation with deterministic serial merge: each shard keeps only `(hash, term)` pairs; survivors are re-evaluated into an eval arena. Bank saturation freezes admissions but never aborts the search.
+
+**Matching and cost ranking**: All corpus-matching forms are collected; the cheapest under a per-backend `CostModel` (avx2/scalar/nodes presets) wins. Care masks (don't-care bits admit smaller circuits) are respected. Cost is measured, not a heuristic — `PrefixXor` is expensive on both AVX2 and scalar, a fact proved in the `escaped_positions` discovery.
+
+**Verification (CEGIS)**: Candidates matching the corpus are reconstructed as real IR graphs (with CSE applied) and differentially verified against the reference on thousands of fresh random inputs. Verification failures become new corpus inputs and the search restarts.
+
+**Automatic abstraction discovery** (`synthesize_auto`): Rounds of bounded enumeration; on exhaustion, banked terms are scored by three target-agnostic signals — *gate* (precision × recall of bits against the target), *generativity* (direct-child count among behaviorally novel terms), and *near-miss harvest* (subterm frequency among the 64 Hamming-closest candidates). Promotion is round-robin across three rankings with behavioral-diversity minimum Hamming distance and small-fragment size cap. Anti-unification of near-miss pairs mines single-hole templates that join the grammar as unary ops.
+
+**Multi-output** (`synthesize_multi`): Specs are solved in order; each solved stream joins the next one's leaf library (named O0, O1, ...), merged into one shared-CSE graph. `shared_cost` vs `separate_cost` is the fusion win.
+
+**Proof** (`prove`): Every IR op except `Regions` has an exact byte-serial form carrying at most one bit of state, so a graph IS a finite automaton over bytes (state = one bit per stateful node + position mod 64 for block constants). Equivalence against an explicit Fsm spec is product reachability — complete over all inputs, dependency-free. `byte_serial_masks` exposes the byte-serial executor, differentially pinned against the interpreter in unit tests; refutations return shortest witnesses via BFS parent links.
+
+**Regions exemption**: The sole sequential escape hatch. Graph synthesis excludes it; the prover does not support it. `escaped_positions` in `formats.rs` is a synthesizer discovery, proven and shipped.
+
 ## Testing Strategy
 
 **Layered differential testing**: every kernel must agree at every layer.
