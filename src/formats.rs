@@ -39,6 +39,12 @@ pub struct Dialect {
     /// inert through its terminating newline. The newline stays a record
     /// boundary; record walkers skip records that begin with this byte.
     pub comment: Option<u8>,
+    /// Bracket pairs `(open, close)` that nest. Non-empty makes the
+    /// generated parser emit a nested tape (`parse_nested`) on top of the
+    /// structural index: brackets outside quoted regions are matched into
+    /// a navigable tree. Nesting bytes must be members of `structural` —
+    /// the indexer only reports bytes it classifies.
+    pub nesting: Vec<(u8, u8)>,
 }
 
 /// RFC 4180 CSV: comma/newline structure, double-quote regions, `""` escapes.
@@ -48,6 +54,7 @@ pub fn csv_dialect() -> Dialect {
         quote: Some(b'"'),
         escape: Escape::None,
         comment: None,
+        nesting: vec![],
     }
 }
 
@@ -58,6 +65,7 @@ pub fn tsv_dialect() -> Dialect {
         quote: None,
         escape: Escape::None,
         comment: None,
+        nesting: vec![],
     }
 }
 
@@ -68,6 +76,7 @@ pub fn logfmt_dialect() -> Dialect {
         quote: Some(b'"'),
         escape: Escape::Backslash(b'\\'),
         comment: None,
+        nesting: vec![],
     }
 }
 
@@ -82,6 +91,7 @@ pub fn multi_dialect() -> Dialect {
         quote: Some(b'"'),
         escape: Escape::None,
         comment: None,
+        nesting: vec![],
     }
 }
 
@@ -93,6 +103,7 @@ pub fn csv_hash_dialect() -> Dialect {
         quote: Some(b'"'),
         escape: Escape::None,
         comment: Some(b'#'),
+        nesting: vec![],
     }
 }
 
@@ -104,6 +115,21 @@ pub fn ndjson_dialect() -> Dialect {
         quote: Some(b'"'),
         escape: Escape::Backslash(b'\\'),
         comment: None,
+        nesting: vec![],
+    }
+}
+
+/// JSON structural parsing: brace/bracket pairs nest, commas and colons
+/// separate, strings are backslash-escaped quote regions. The structural
+/// index is exactly simdjson's stage 1 (minus pseudo-structural scalar
+/// starts); the nested tape built on top of it matches the brackets.
+pub fn json_dialect() -> Dialect {
+    Dialect {
+        structural: vec![b'{', b'}', b'[', b']', b',', b':'],
+        quote: Some(b'"'),
+        escape: Escape::Backslash(b'\\'),
+        comment: None,
+        nesting: vec![(b'{', b'}'), (b'[', b']')],
     }
 }
 

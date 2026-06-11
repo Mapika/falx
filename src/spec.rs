@@ -29,6 +29,10 @@ pub struct Spec {
 /// - `escape_char` (string): Single-byte escape character for backslash mode (default: "\\").
 /// - `comment` (string): Single-byte line-start comment character; comment
 ///   lines are skipped by record walkers (default: none).
+/// - `nesting` (array of two-character strings): Bracket pairs that nest,
+///   open byte then close byte (e.g. `["{}", "[]"]`). Non-empty makes the
+///   generated parser expose `parse_nested`. Nesting bytes are added to the
+///   structural set automatically (default: none).
 /// - `[[columns]]` (array of tables): Typed columns to project. Each entry
 ///   has `index` (integer, zero-based field index), `type` (string: "i64",
 ///   "f64", "string", or "bytes"), and optional `name` (string: generated
@@ -120,11 +124,61 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         None => None,
     };
 
+    // Extract `nesting` (optional, array of two-character strings, e.g.
+    // ["{}", "[]"]). Nesting bytes are structural by definition, so any
+    // not already listed in `structural` are appended for convenience.
+    let mut nesting: Vec<(u8, u8)> = Vec::new();
+    if let Some(value) = parsed.get("nesting") {
+        let arr = value
+            .as_array()
+            .ok_or("'nesting' must be an array of two-character strings (e.g. [\"{}\", \"[]\"])")?;
+        for (i, item) in arr.iter().enumerate() {
+            let s = item.as_str().ok_or(format!(
+                "nesting[{}]: expected string, got {}",
+                i,
+                value_type_name(item)
+            ))?;
+            let bytes = s.as_bytes();
+            if bytes.len() != 2 {
+                return Err(format!(
+                    "nesting[{i}]: '{s}' must be exactly two bytes (open then close)"
+                ));
+            }
+            let (open, close) = (bytes[0], bytes[1]);
+            if open == close {
+                return Err(format!(
+                    "nesting[{i}]: open and close byte must differ"
+                ));
+            }
+            for byte in [open, close] {
+                if Some(byte) == quote {
+                    return Err(format!("nesting[{i}]: byte conflicts with 'quote'"));
+                }
+                if Some(byte) == comment {
+                    return Err(format!("nesting[{i}]: byte conflicts with 'comment'"));
+                }
+                if byte == b'\n' {
+                    return Err(format!("nesting[{i}]: '\\n' cannot be a nesting byte"));
+                }
+                if nesting.iter().any(|&(o, c)| o == byte || c == byte) {
+                    return Err(format!(
+                        "nesting[{i}]: byte appears in more than one pair"
+                    ));
+                }
+                if !structural.contains(&byte) {
+                    structural.push(byte);
+                }
+            }
+            nesting.push((open, close));
+        }
+    }
+
     let dialect = Dialect {
         structural,
         quote,
         escape,
         comment,
+        nesting,
     };
 
     // Extract `[[columns]]` (optional, array of tables).

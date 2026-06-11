@@ -115,6 +115,29 @@ stitched with a bit shift, so chunk row counts need not be multiples
 of 64. Eliminating the tape pass took parallel extraction from ~1.9 to
 ~3 GiB/s on worldcitiespop (4.9 GiB/s on cache-friendlier synthetic data).
 
+### Nested Tape (bracket matching)
+
+When a spec declares nesting bracket pairs, the generated parser exposes
+`parse_nested(data) -> Nested`, which runs the existing structural indexer
+(quotes and escapes already make in-string brackets inert), then a scalar
+pass that matches brackets into a *nested tape* — one `u64` entry per
+structural byte. Low 32 bits hold the byte position; high 32 bits hold the
+tape index of the matching partner bracket (`u32::MAX` while unclosed;
+separators leave it zero). Matched bracket pairs make skipping a container
+O(1), using a stack-based builder on the heap (no recursion). This is a
+pure tape stage on top of stage-1 indexing, exactly like simdjson's
+two-stage design — no new IR ops were needed.
+
+`Nested` carries an `error: Option<NestError>` with `UnmatchedClose(pos)` /
+`UnclosedOpen(pos)`. Building stops at the first unmatched close; navigation
+over an errored tape is best-effort and never panics.
+
+Navigation is through `Nested::items()` (top-level iteration) and `Node`
+(container or scalar span). `Node::items()` walks one nesting level with
+O(1)-skipping of nested containers. All separator bytes split items, so JSON
+object keys and values appear as consecutive items — falx stays
+format-agnostic by treating `:` like any separator.
+
 ### Parallel Variants
 
 For doubled-quote dialects (no backslash escapes, so quote parity is independent):
@@ -138,6 +161,7 @@ Tests cover:
 - **IR block-boundary cases** (`tests/ir.rs`): Carries across 64-byte seams (quote parity, backslash runs).
 - **Span API** (`tests/spans.rs`): Quote stripping, escape resolution, parallel iteration.
 - **Typed columns** (`tests/columns.rs`): A dumb scalar reference (quote-parity split + `str::parse` per cell) must agree with `parse_columns` — values, placeholders, and validity bitmaps, f64 compared by bit pattern — on thousands of randomized inputs including quoted/escaped cells and block-boundary placements; `parse_columns_par` must equal serial for several thread counts.
+- **Nested structure** (`tests/nested.rs`): Randomized differential vs serde_json (structure equality: container kind/arity, scalar spans re-parse to equal values), 130-position pad sweep across 64-byte block seams, 100k-deep nesting, exact error positions, tape partner mutuality invariants, and (feature `spec`) specs emitting byte-identical kernels.
 - **Hand-picked cases** (`src/lib.rs`): Escaped quotes, unclosed strings, edge cases.
 
 ## Invariants for Contributors

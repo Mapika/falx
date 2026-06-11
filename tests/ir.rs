@@ -144,6 +144,7 @@ fn alternative_dialects_differential() {
             quote: Some(*quote),
             escape: formats::Escape::None,
             comment: None,
+            nesting: vec![],
         });
 
         // Run 500 randomized tests.

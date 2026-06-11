@@ -176,6 +176,42 @@ fn validate_columns(columns: &[Column]) -> Result<(), CodegenError> {
     Ok(())
 }
 
+fn validate_nesting(dialect: &crate::formats::Dialect) -> Result<(), CodegenError> {
+    let mut seen = std::collections::HashSet::new();
+    for &(open, close) in &dialect.nesting {
+        if open == close {
+            return Err(CodegenError(format!(
+                "nesting pair has identical open and close byte 0x{open:02x}"
+            )));
+        }
+        for byte in [open, close] {
+            if !dialect.structural.contains(&byte) {
+                return Err(CodegenError(format!(
+                    "nesting byte 0x{byte:02x} is not in the structural set; \
+                     the indexer only reports bytes it classifies"
+                )));
+            }
+            if Some(byte) == dialect.quote || Some(byte) == dialect.comment {
+                return Err(CodegenError(format!(
+                    "nesting byte 0x{byte:02x} conflicts with the quote or \
+                     comment byte"
+                )));
+            }
+            if byte == b'\n' {
+                return Err(CodegenError(
+                    "'\\n' cannot nest; it is the record-terminator class".into(),
+                ));
+            }
+            if !seen.insert(byte) {
+                return Err(CodegenError(format!(
+                    "nesting byte 0x{byte:02x} appears in more than one pair"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Which kernel a step body is being emitted for.
 #[derive(Clone, Copy, PartialEq)]
 enum Flavor {
@@ -208,6 +244,7 @@ pub fn emit_parser_with_columns(
     columns: &[Column],
 ) -> Result<String, CodegenError> {
     validate_columns(columns)?;
+    validate_nesting(dialect)?;
     let parts = crate::formats::delimited_parts(dialect);
     emit_with(
         &parts.graph,
@@ -763,6 +800,9 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
         push_span_api(&mut code, dialect, carry_count);
         if !columns.is_empty() {
             push_columns_api(&mut code, dialect, columns, par_mode);
+        }
+        if !dialect.nesting.is_empty() {
+            push_nested_api(&mut code, dialect);
         }
     }
 
@@ -2382,4 +2422,289 @@ fn emit_step_body(code: &mut String, graph: &Graph, carry_slot: &[usize], flavor
         };
         let _ = writeln!(code, "        {line}");
     }
+}
+
+/// Emit the nested-tape API for dialects with bracket pairs: a tape builder
+/// that matches brackets over the structural index (each bracket entry
+/// carries the tape index of its partner, so skipping a container is O(1)),
+/// plus item iterators for walking one nesting level at a time.
+///
+/// The template is brace-heavy Rust, so dialect-specific fragments are
+/// substituted as placeholders rather than fighting `format!` escaping.
+fn push_nested_api(code: &mut String, dialect: &crate::formats::Dialect) {
+    fn byte_lit(b: u8) -> String {
+        if b.is_ascii_graphic() && b != b'\'' && b != b'\\' {
+            format!("b'{}'", b as char)
+        } else {
+            format!("0x{b:02x}")
+        }
+    }
+    let open_pat = dialect
+        .nesting
+        .iter()
+        .map(|&(open, _)| byte_lit(open))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let close_pat = dialect
+        .nesting
+        .iter()
+        .map(|&(_, close)| byte_lit(close))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let close_arms = dialect
+        .nesting
+        .iter()
+        .map(|&(open, close)| format!("        {} => {},\n", byte_lit(open), byte_lit(close)))
+        .collect::<String>();
+
+    const TEMPLATE: &str = r##"/// How bracket matching failed. Positions are byte offsets into the input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NestError {
+    /// A close bracket with no matching open, or closing the wrong kind.
+    UnmatchedClose(u32),
+    /// Input ended with brackets still open; the innermost open's position.
+    UnclosedOpen(u32),
+}
+
+/// The nested structural tape over borrowed input: one `u64` entry per
+/// structural byte. The low 32 bits are the byte position; for bracket
+/// entries the high 32 bits are the tape index of the matching partner
+/// (`u32::MAX` while unclosed), making container skips O(1). Separator
+/// entries leave the high bits zero and are classified by re-reading the
+/// input byte, never by the partner field.
+pub struct Nested<'a> {
+    data: &'a [u8],
+    tape: Vec<u64>,
+    /// First bracket-matching error. Tape building stops at an unmatched
+    /// close; navigation over an errored tape is best-effort, never panics.
+    pub error: Option<NestError>,
+}
+
+/// Index `data` and match nesting brackets into a navigable tape.
+/// Brackets inside quoted regions are inert and never reach the tape.
+pub fn parse_nested(data: &[u8]) -> Nested<'_> {
+    let mut idx = Vec::new();
+    index_structurals(data, &mut idx);
+    let mut tape: Vec<u64> = Vec::with_capacity(idx.len());
+    let mut stack: Vec<u32> = Vec::new();
+    let mut error = None;
+    for &pos in &idx {
+        match data[pos as usize] {
+            __OPEN_PAT__ => {
+                stack.push(tape.len() as u32);
+                tape.push(((u32::MAX as u64) << 32) | pos as u64);
+            }
+            b @ (__CLOSE_PAT__) => {
+                let open = match stack.pop() {
+                    Some(i) if close_of((tape[i as usize] as u32) as usize, data) == b => i,
+                    _ => {
+                        error = Some(NestError::UnmatchedClose(pos));
+                        break;
+                    }
+                };
+                let close = tape.len() as u32;
+                tape[open as usize] = ((close as u64) << 32) | (tape[open as usize] as u32) as u64;
+                tape.push(((open as u64) << 32) | pos as u64);
+            }
+            _ => tape.push(pos as u64),
+        }
+    }
+    // Edition-agnostic single condition: generated files compile under the
+    // consumer's edition, so no let-chains.
+    if let (None, Some(&innermost)) = (error, stack.last()) {
+        error = Some(NestError::UnclosedOpen(tape[innermost as usize] as u32));
+    }
+    Nested { data, tape, error }
+}
+
+/// The close byte that matches the open bracket at `pos`. Returns 0 for a
+/// non-open byte, which can never equal a close byte that reaches the
+/// caller's comparison, so a corrupt position degrades to a match failure.
+fn close_of(pos: usize, data: &[u8]) -> u8 {
+    match data[pos] {
+__CLOSE_ARMS__        _ => 0,
+    }
+}
+
+/// Trim ASCII whitespace from both ends of `data[start..end]`, as offsets.
+fn trim_ws(data: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start < end && matches!(data[start], b' ' | b'\t' | b'\r' | b'\n') {
+        start += 1;
+    }
+    while end > start && matches!(data[end - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        end -= 1;
+    }
+    (start, end)
+}
+
+impl<'a> Nested<'a> {
+    /// Raw tape access; see the type docs for the entry layout.
+    pub fn tape(&self) -> &[u64] {
+        &self.tape
+    }
+
+    /// The top-level items: every bracketed container and every
+    /// non-whitespace scalar run between top-level structural bytes.
+    pub fn items(&self) -> Items<'a, '_> {
+        Items {
+            nested: self,
+            next: 0,
+            end: self.tape.len(),
+            cursor: 0,
+            limit: self.data.len(),
+        }
+    }
+}
+
+/// One value: a bracketed container or a whitespace-trimmed scalar span.
+#[derive(Clone, Copy)]
+pub struct Node<'a, 'p> {
+    nested: &'p Nested<'a>,
+    repr: Repr,
+}
+
+#[derive(Clone, Copy)]
+enum Repr {
+    /// Tape index of the opening bracket.
+    Container(usize),
+    /// Trimmed byte span.
+    Scalar(usize, usize),
+}
+
+impl<'a, 'p> Node<'a, 'p> {
+    /// The container's opening bracket byte; `None` for scalars.
+    pub fn open(&self) -> Option<u8> {
+        match self.repr {
+            Repr::Container(i) => {
+                Some(self.nested.data[(self.nested.tape[i] as u32) as usize])
+            }
+            Repr::Scalar(..) => None,
+        }
+    }
+
+    /// The full input span: brackets included for containers, trimmed bytes
+    /// for scalars (quotes and escapes intact — spans are zero-copy).
+    pub fn bytes(&self) -> &'a [u8] {
+        match self.repr {
+            Repr::Container(i) => {
+                let entry = self.nested.tape[i];
+                let start = (entry as u32) as usize;
+                let close = (entry >> 32) as u32;
+                let end = if close == u32::MAX {
+                    self.nested.data.len()
+                } else {
+                    (self.nested.tape[close as usize] as u32) as usize + 1
+                };
+                &self.nested.data[start..end]
+            }
+            Repr::Scalar(start, end) => &self.nested.data[start..end],
+        }
+    }
+
+    /// The container's items in input order; empty for scalars. Every
+    /// separator byte splits items, so formats that separate keys from
+    /// values with a second separator (JSON objects' `:`) yield keys and
+    /// values as consecutive items.
+    pub fn items(&self) -> Items<'a, 'p> {
+        match self.repr {
+            Repr::Container(i) => {
+                let entry = self.nested.tape[i];
+                let close = (entry >> 32) as u32;
+                let (end, limit) = if close == u32::MAX {
+                    (self.nested.tape.len(), self.nested.data.len())
+                } else {
+                    (
+                        close as usize,
+                        (self.nested.tape[close as usize] as u32) as usize,
+                    )
+                };
+                Items {
+                    nested: self.nested,
+                    next: i + 1,
+                    end,
+                    cursor: (entry as u32) as usize + 1,
+                    limit,
+                }
+            }
+            Repr::Scalar(..) => Items {
+                nested: self.nested,
+                next: 0,
+                end: 0,
+                cursor: 0,
+                limit: 0,
+            },
+        }
+    }
+}
+
+/// Iterator over the items of one nesting level.
+pub struct Items<'a, 'p> {
+    nested: &'p Nested<'a>,
+    /// Next tape index to inspect; `end` is this level's exclusive bound.
+    next: usize,
+    end: usize,
+    /// Byte position where the pending scalar gap starts.
+    cursor: usize,
+    /// Byte end of this level's contents.
+    limit: usize,
+}
+
+impl<'a, 'p> Iterator for Items<'a, 'p> {
+    type Item = Node<'a, 'p>;
+
+    fn next(&mut self) -> Option<Node<'a, 'p>> {
+        loop {
+            if self.next >= self.end {
+                let (s, e) = trim_ws(self.nested.data, self.cursor, self.limit);
+                self.cursor = self.limit;
+                if s < e {
+                    return Some(Node { nested: self.nested, repr: Repr::Scalar(s, e) });
+                }
+                return None;
+            }
+            let entry = self.nested.tape[self.next];
+            let pos = (entry as u32) as usize;
+            match self.nested.data[pos] {
+                __OPEN_PAT__ => {
+                    // A pending scalar gap is yielded before the bracket
+                    // (well-formed input always separates siblings, so the
+                    // gap is normally whitespace).
+                    let (s, e) = trim_ws(self.nested.data, self.cursor, pos);
+                    if s < e {
+                        self.cursor = pos;
+                        return Some(Node { nested: self.nested, repr: Repr::Scalar(s, e) });
+                    }
+                    let node = Node { nested: self.nested, repr: Repr::Container(self.next) };
+                    let close = (entry >> 32) as u32;
+                    if close == u32::MAX || close as usize >= self.end {
+                        // Unclosed (errored tape): the container swallows
+                        // the rest of this level.
+                        self.next = self.end;
+                        self.cursor = self.limit;
+                    } else {
+                        self.next = close as usize + 1;
+                        self.cursor = (self.nested.tape[close as usize] as u32) as usize + 1;
+                    }
+                    return Some(node);
+                }
+                _ => {
+                    self.next += 1;
+                    let (s, e) = trim_ws(self.nested.data, self.cursor, pos);
+                    self.cursor = pos + 1;
+                    if s < e {
+                        return Some(Node { nested: self.nested, repr: Repr::Scalar(s, e) });
+                    }
+                }
+            }
+        }
+    }
+}
+
+"##;
+    code.push_str(
+        &TEMPLATE
+            .replace("__OPEN_PAT__", &open_pat)
+            .replace("__CLOSE_PAT__", &close_pat)
+            .replace("__CLOSE_ARMS__", &close_arms),
+    );
 }

@@ -10,6 +10,7 @@ pub mod csv_geo;
 pub mod csv_geo_text;
 pub mod csv_typed;
 pub mod csv_hash;
+pub mod json;
 pub mod logfmt;
 pub mod multi;
 pub mod ndjson;
@@ -24,6 +25,9 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
         ("tsv", formats::tsv_dialect(), vec![]),
         ("logfmt", formats::logfmt_dialect(), vec![]),
         ("ndjson", formats::ndjson_dialect(), vec![]),
+        // Bracket nesting: the structural index feeds a nested tape with
+        // matched brackets (parse_nested) instead of a record tape.
+        ("json", formats::json_dialect(), vec![]),
         // 9 structural bytes: classified via PSHUFB nibble tables.
         ("multi", formats::multi_dialect(), vec![]),
         // CSV with # comments; typed columns so the projection sink's

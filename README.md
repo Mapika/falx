@@ -187,10 +187,14 @@ Format specs (TOML, see `specs/`) currently describe the *delimited* family:
 a structural byte set, an optional quote byte, an escape convention
 (RFC 4180 doubled quotes or JSON-style backslash), and an optional
 line-start comment byte (`comment = "#"` skips comment lines exactly,
-quotes-in-comments and comments-in-quotes included). That one family
-already covers CSV dialects (with or without `#` comments), TSV, logfmt,
-NDJSON record framing, and separator-rich formats with arbitrarily large
-structural byte sets.
+quotes-in-comments and comments-in-quotes included). Specs can also declare
+nesting bracket pairs (`nesting = ["{}", "[]"]`), which adds a `parse_nested`
+API: the structural index feeds a bracket-matching tape with O(1) container
+skips and a zero-copy navigation API; the generated JSON structural parser
+(`specs/json.toml`) demonstrates this, differentially tested against
+serde_json. That one family already covers CSV dialects (with or without `#`
+comments), TSV, logfmt, NDJSON record framing, and separator-rich formats
+with arbitrarily large structural byte sets.
 
 Generated parsers also include a streaming API for unbounded input (pipes,
 log tails, larger-than-RAM files): `stream()` accepts arbitrary chunks and
@@ -261,10 +265,14 @@ cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 - M6 (done): typed projection — specs declare typed columns, parsers emit
   Arrow-layout columnar buffers (values + validity bitmap), SWAR int and
   Clinger-fast-path float parsing, serial and parallel
+- M7 (done): nested structure — specs declare bracket pairs, generated parsers
+  add a matched-bracket nested tape with O(1) container skips and a navigation
+  API; JSON structural parsing differentially tested against serde_json
 - Next: faster span walking (the scalar record/field layer now dominates
-  end-to-end time), shuffle-based classification (large character classes),
-  comment/line-start context, ARM NEON backend, e-graph simplification of
-  format graphs
+  end-to-end time), SIMD-accelerated bracket matching (the nested tape's
+  scalar pass dominates `parse_nested`), configurable record terminators
+  ([#3](https://github.com/Mapika/falx/issues/3), in progress), ARM NEON
+  backend, e-graph simplification of format graphs
 
 ## License
 

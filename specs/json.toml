@@ -1,0 +1,5 @@
+name = "json"
+structural = [",", ":"]
+nesting = ["{}", "[]"]
+quote = "\""
+escape = "backslash"
