@@ -409,11 +409,13 @@ fn parse_par_matches_parse() {
 /// escape runs split across feed boundaries.
 #[test]
 fn streaming_matches_batch() {
+    /// Records of cleaned fields, the comparison currency of this test.
+    type Records = Vec<Vec<Vec<u8>>>;
     fn collect_stream(
         data: &[u8],
         rng: &mut Rng,
-        parse_batch: fn(&[u8]) -> Vec<Vec<Vec<u8>>>,
-        run_stream: &dyn Fn(&[u8], &[usize]) -> Vec<Vec<Vec<u8>>>,
+        parse_batch: fn(&[u8]) -> Records,
+        run_stream: &dyn Fn(&[u8], &[usize]) -> Records,
     ) {
         // random cut points
         let mut cuts: Vec<usize> = (0..(rng.next() % 12))

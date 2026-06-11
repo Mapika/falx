@@ -64,9 +64,9 @@ fn nibble_tables(class: &crate::ir::CharClass) -> Option<([u8; 16], [u8; 16])> {
             return None;
         }
         hi[h] |= 1 << bit;
-        for l in 0..16 {
+        for (l, lo_entry) in lo.iter_mut().enumerate() {
             if row & (1 << l) != 0 {
-                lo[l] |= 1 << bit;
+                *lo_entry |= 1 << bit;
             }
         }
     }
@@ -116,6 +116,8 @@ impl Column {
             ColumnType::I64 => "i64",
             ColumnType::F64 => "f64",
             ColumnType::Bytes => "(u32, u32)",
+            // String columns use the Arrow varbinary layout (offsets + data buffers),
+            // so they never go through the scalar value-type/zero-placeholder path.
             ColumnType::Str => unreachable!("string columns emit offsets + data"),
         }
     }
@@ -125,6 +127,8 @@ impl Column {
             ColumnType::I64 => "0",
             ColumnType::F64 => "0.0",
             ColumnType::Bytes => "(0, 0)",
+            // String columns use the Arrow varbinary layout (offsets + data buffers),
+            // so they never go through the scalar value-type/zero-placeholder path.
             ColumnType::Str => unreachable!("string columns emit offsets + data"),
         }
     }
@@ -1680,6 +1684,7 @@ fn push_columns_api(
                 ColumnType::I64 => "as `i64`",
                 ColumnType::F64 => "as `f64`",
                 ColumnType::Bytes => "as raw `(start, end)` spans into `data`",
+                // String columns emit via the Str branch above; emission branches on the column type before this is called.
                 ColumnType::Str => unreachable!(),
             };
             let _ = writeln!(
@@ -2231,7 +2236,7 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
     if digits == 0 || i != rest.len() {
         return parse_f64_fallback(s);
     }
-    if digits > 15 || exp10 < -22 || exp10 > 22 {
+    if digits > 15 || !(-22..=22).contains(&exp10) {
         return parse_f64_fallback(s);
     }
     let value = if exp10 < 0 {
@@ -3155,7 +3160,15 @@ pub fn parse_nested_par_into<'a>(
     // Workers write through this address into disjoint slot ranges; the
     // Vec itself is not touched again until after the scope.
     let master_addr = tape.as_mut_ptr() as usize;
-    let results: Vec<(Option<NestError>, usize, Vec<u64>, Vec<u64>)> =
+    struct ChunkOutcome {
+        error: Option<NestError>,
+        written: usize,
+        /// Leftover open stack, bottom to top: (global tape idx << 8) | close byte.
+        opens: Vec<u64>,
+        /// Closes with no local open, in order: (global tape idx << 32) | pos.
+        pending: Vec<u64>,
+    }
+    let results: Vec<ChunkOutcome> =
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
@@ -3170,13 +3183,13 @@ pub fn parse_nested_par_into<'a>(
                         // SAFETY: the prepass counted this chunk's slots
                         // exactly, the master capacity covers the total,
                         // and slot ranges are disjoint by prefix sum.
-                        let (err, written) = unsafe {
+                        let (error, written) = unsafe {
                             nested_tape_seeded_dispatch(
                                 slice, seed, pos_base, master, tape_base,
                                 &mut stack, &mut pending,
                             )
                         };
-                        (err, written, stack, pending)
+                        ChunkOutcome { error, written, opens: stack, pending }
                     })
                 })
                 .collect();
@@ -3185,7 +3198,7 @@ pub fn parse_nested_par_into<'a>(
     let consistent = results
         .iter()
         .zip(&counts)
-        .all(|((err, written, _, _), &count)| err.is_none() && *written == count);
+        .all(|(outcome, &count)| outcome.error.is_none() && outcome.written == count);
     if !consistent {
         // A chunk found a definite mismatch (wrong close against an open
         // in the same chunk). Serial reproduces the exact first-error
@@ -3201,8 +3214,8 @@ pub fn parse_nested_par_into<'a>(
     // All indexes are already global.
     let mut gstack: Vec<u64> = Vec::new();
     let mut mismatch = false;
-    'merge: for (_, _, opens, pending) in &results {
-        for &pend in pending {
+    'merge: for outcome in &results {
+        for &pend in &outcome.pending {
             let close_idx = (pend >> 32) as usize;
             let close_pos = (pend as u32) as usize;
             match gstack.pop() {
@@ -3218,7 +3231,7 @@ pub fn parse_nested_par_into<'a>(
                 }
             }
         }
-        gstack.extend_from_slice(opens);
+        gstack.extend_from_slice(&outcome.opens);
     }
     if mismatch {
         return parse_nested_into(data, Nested { data: &[], tape, error: None });

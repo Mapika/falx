@@ -91,10 +91,8 @@ fn main() {
             eprintln!("Error writing to '{}': {}", out_path, e);
             process::exit(1);
         }
-    } else {
-        if let Err(e) = io::stdout().write_all(generated.as_bytes()) {
-            eprintln!("Error writing to stdout: {}", e);
-            process::exit(1);
-        }
+    } else if let Err(e) = io::stdout().write_all(generated.as_bytes()) {
+        eprintln!("Error writing to stdout: {}", e);
+        process::exit(1);
     }
 }

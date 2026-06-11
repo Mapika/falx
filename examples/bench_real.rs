@@ -74,11 +74,9 @@ fn main() -> io::Result<()> {
             .has_headers(false)
             .from_reader(black_box(&data[..]));
         let mut field_bytes = 0u64;
-        for result in reader.byte_records() {
-            if let Ok(record) = result {
-                for field in record.iter() {
-                    field_bytes += field.len() as u64;
-                }
+        for record in reader.byte_records().flatten() {
+            for field in record.iter() {
+                field_bytes += field.len() as u64;
             }
         }
         csv_field_bytes = black_box(field_bytes);

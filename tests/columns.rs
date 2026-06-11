@@ -1,8 +1,8 @@
-/// Differential test suite for the typed columnar API of falx::kernels::csv_typed.
-///
-/// Reference implementation: a dumb scalar parser that independently decodes CSV
-/// records and columns without calling any falx functions. Tests compare the
-/// library output against this reference via the exact API contract.
+//! Differential test suite for the typed columnar API of falx::kernels::csv_typed.
+//!
+//! Reference implementation: a dumb scalar parser that independently decodes CSV
+//! records and columns without calling any falx functions. Tests compare the
+//! library output against this reference via the exact API contract.
 
 use std::borrow::Cow;
 
@@ -139,7 +139,7 @@ fn ref_parse_columns(data: &[u8]) -> RefColumns {
         }
 
         // Field 0 (id): i64
-        if record.len() > 0 {
+        if !record.is_empty() {
             let raw = record[0];
             let cleaned = ref_clean_cell(raw);
             if let Some(v) = ref_parse_i64(&cleaned) {
@@ -389,8 +389,8 @@ fn randomized_differential() {
                 match cell_type {
                     0 => {
                         // Random i64-ish: optional sign, 1..22 digits
-                        let sign = if rng.next() % 2 == 0 { b'-' } else { b'+' };
-                        if rng.next() % 3 == 0 {
+                        let sign = if rng.next().is_multiple_of(2) { b'-' } else { b'+' };
+                        if rng.next().is_multiple_of(3) {
                             csv.push(sign);
                         }
                         let len = rng.next() as usize % 22 + 1;
@@ -400,7 +400,7 @@ fn randomized_differential() {
                     }
                     1 => {
                         // Random float: "<int>.<frac>" or "<int>e<exp>"
-                        let sign = rng.next() % 2 == 0;
+                        let sign = rng.next().is_multiple_of(2);
                         if sign {
                             csv.push(b'-');
                         }
@@ -432,7 +432,7 @@ fn randomized_differential() {
                                     csv.push(b'0' + (rng.next() % 10) as u8);
                                 }
                                 csv.push(b'e');
-                                let exp_sign = rng.next() % 2 == 0;
+                                let exp_sign = rng.next().is_multiple_of(2);
                                 if exp_sign {
                                     csv.push(b'-');
                                 }
@@ -513,7 +513,7 @@ fn randomized_differential() {
         }
 
         // ~1/3 chance of unterminated final record
-        if rng.next() % 3 == 0 {
+        if rng.next().is_multiple_of(3) {
             let num_fields = rng.next() as usize % 8;
             for field_idx in 0..num_fields {
                 if field_idx > 0 {
@@ -631,7 +631,7 @@ fn parallel_matches_serial() {
                         }
                     }
                     1 => {
-                        let sign = rng.next() % 2 == 0;
+                        let sign = rng.next().is_multiple_of(2);
                         if sign {
                             csv.push(b'-');
                         }

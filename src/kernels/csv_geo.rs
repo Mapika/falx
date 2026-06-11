@@ -915,7 +915,7 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
     if digits == 0 || i != rest.len() {
         return parse_f64_fallback(s);
     }
-    if digits > 15 || exp10 < -22 || exp10 > 22 {
+    if digits > 15 || !(-22..=22).contains(&exp10) {
         return parse_f64_fallback(s);
     }
     let value = if exp10 < 0 {

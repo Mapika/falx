@@ -138,7 +138,7 @@ fn randomized_record_differential() {
                 }
             }
         }
-        if rng.next() % 3 == 0 {
+        if rng.next().is_multiple_of(3) {
             data.extend_from_slice(b"# unterminated trailer");
         }
 
@@ -152,7 +152,7 @@ fn randomized_record_differential() {
             .filter(|(i, line)| {
                 // the final empty split after a trailing newline is not a record
                 !(line.is_empty() && *i == data.iter().filter(|&&b| b == b'\n').count())
-                    && !line.first().is_some_and(|&b| b == b'#')
+                    && line.first().is_none_or(|&b| b != b'#')
             })
             .map(|(_, line)| line)
             .collect();

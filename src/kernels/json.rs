@@ -825,7 +825,15 @@ pub fn parse_nested_par_into<'a>(
     // Workers write through this address into disjoint slot ranges; the
     // Vec itself is not touched again until after the scope.
     let master_addr = tape.as_mut_ptr() as usize;
-    let results: Vec<(Option<NestError>, usize, Vec<u64>, Vec<u64>)> =
+    struct ChunkOutcome {
+        error: Option<NestError>,
+        written: usize,
+        /// Leftover open stack, bottom to top: (global tape idx << 8) | close byte.
+        opens: Vec<u64>,
+        /// Closes with no local open, in order: (global tape idx << 32) | pos.
+        pending: Vec<u64>,
+    }
+    let results: Vec<ChunkOutcome> =
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
@@ -840,13 +848,13 @@ pub fn parse_nested_par_into<'a>(
                         // SAFETY: the prepass counted this chunk's slots
                         // exactly, the master capacity covers the total,
                         // and slot ranges are disjoint by prefix sum.
-                        let (err, written) = unsafe {
+                        let (error, written) = unsafe {
                             nested_tape_seeded_dispatch(
                                 slice, seed, pos_base, master, tape_base,
                                 &mut stack, &mut pending,
                             )
                         };
-                        (err, written, stack, pending)
+                        ChunkOutcome { error, written, opens: stack, pending }
                     })
                 })
                 .collect();
@@ -855,7 +863,7 @@ pub fn parse_nested_par_into<'a>(
     let consistent = results
         .iter()
         .zip(&counts)
-        .all(|((err, written, _, _), &count)| err.is_none() && *written == count);
+        .all(|(outcome, &count)| outcome.error.is_none() && outcome.written == count);
     if !consistent {
         // A chunk found a definite mismatch (wrong close against an open
         // in the same chunk). Serial reproduces the exact first-error
@@ -871,8 +879,8 @@ pub fn parse_nested_par_into<'a>(
     // All indexes are already global.
     let mut gstack: Vec<u64> = Vec::new();
     let mut mismatch = false;
-    'merge: for (_, _, opens, pending) in &results {
-        for &pend in pending {
+    'merge: for outcome in &results {
+        for &pend in &outcome.pending {
             let close_idx = (pend >> 32) as usize;
             let close_pos = (pend as u32) as usize;
             match gstack.pop() {
@@ -888,7 +896,7 @@ pub fn parse_nested_par_into<'a>(
                 }
             }
         }
-        gstack.extend_from_slice(opens);
+        gstack.extend_from_slice(&outcome.opens);
     }
     if mismatch {
         return parse_nested_into(data, Nested { data: &[], tape, error: None });

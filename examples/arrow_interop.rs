@@ -5,8 +5,9 @@
 //!     (= Arrow primitive array),
 //!   - string columns: `offsets: Vec<i32>` + contiguous `data: Vec<u8>` +
 //!     validity bitmap (= Arrow varbinary array).
-//! Converting a column is therefore a buffer *wrap*, not a conversion —
-//! every Vec moves into Arrow untouched.
+//!
+//!     Converting a column is therefore a buffer *wrap*, not a conversion —
+//!     every Vec moves into Arrow untouched.
 //!
 //! The generated kernels themselves stay std-only; arrow is a
 //! dev-dependency of this example alone.

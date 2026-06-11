@@ -25,7 +25,7 @@ impl Rng {
 
     /// Uniform in [0, n)
     fn range_usize(&mut self, n: usize) -> usize {
-        ((self.next() as u128) * (n as u128) >> 64) as usize
+        (((self.next() as u128) * (n as u128)) >> 64) as usize
     }
 }
 
@@ -222,7 +222,7 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
             let reader = csv::ReaderBuilder::new()
                 .has_headers(false)
                 .flexible(true)
-                .from_reader(black_box(&data[..]));
+                .from_reader(black_box(data));
             let _ = black_box(reader);
         }
         for _ in 0..RUNS {
@@ -230,26 +230,23 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
             let mut reader = csv::ReaderBuilder::new()
                 .has_headers(false)
                 .flexible(true)
-                .from_reader(black_box(&data[..]));
+                .from_reader(black_box(data));
             let mut valid_count = 0usize;
             let mut sum_lat = 0.0f64;
             let mut sum_lon = 0.0f64;
             for record in reader.byte_records() {
-                if let Ok(rec) = record {
-                    if rec.len() > 6 {
-                        if let Ok(lat_str) = std::str::from_utf8(&rec[5]) {
-                            if let Ok(lat) = lat_str.parse::<f64>() {
+                if let Ok(rec) = record
+                    && rec.len() > 6 {
+                        if let Ok(lat_str) = std::str::from_utf8(&rec[5])
+                            && let Ok(lat) = lat_str.parse::<f64>() {
                                 sum_lat += lat;
                                 valid_count += 1;
                             }
-                        }
-                        if let Ok(lon_str) = std::str::from_utf8(&rec[6]) {
-                            if let Ok(lon) = lon_str.parse::<f64>() {
+                        if let Ok(lon_str) = std::str::from_utf8(&rec[6])
+                            && let Ok(lon) = lon_str.parse::<f64>() {
                                 sum_lon += lon;
                             }
-                        }
                     }
-                }
             }
             let valid = black_box(valid_count);
             let lat = black_box(sum_lat);
@@ -421,7 +418,7 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
             let mut reader = csv::ReaderBuilder::new()
                 .has_headers(false)
                 .flexible(true)
-                .from_reader(black_box(&data[..]));
+                .from_reader(black_box(data));
             let mut offsets: Vec<i32> = vec![0];
             let mut city_data: Vec<u8> = Vec::new();
             let mut valid = 0usize;
@@ -432,11 +429,10 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
                     valid += 1;
                 }
                 offsets.push(city_data.len() as i32);
-                if let Some(cell) = record.get(5) {
-                    if let Ok(lat) = std::str::from_utf8(cell).unwrap_or("").parse::<f64>() {
+                if let Some(cell) = record.get(5)
+                    && let Ok(lat) = std::str::from_utf8(cell).unwrap_or("").parse::<f64>() {
                         sum_lat += lat;
                     }
-                }
                 if let Some(cell) = record.get(6) {
                     let _ = black_box(std::str::from_utf8(cell).unwrap_or("").parse::<f64>().ok());
                 }

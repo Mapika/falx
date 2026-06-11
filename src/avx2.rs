@@ -10,6 +10,11 @@ use std::arch::x86_64::*;
 ///
 /// Callers must ensure the CPU supports AVX2 and PCLMULQDQ (the safe
 /// dispatcher in the crate root checks this).
+///
+/// # Safety
+///
+/// Callers must ensure AVX2 and PCLMULQDQ are available; the function reads
+/// `data` in 64-byte blocks via intrinsics.
 #[target_feature(enable = "avx2", enable = "pclmulqdq")]
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     let mut carry_inside: u64 = 0;

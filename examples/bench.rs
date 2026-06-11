@@ -462,12 +462,14 @@ fn main() {
     rows.push(Row {
         label: "serde_json (full parse)",
         m: measure(|| {
-            data.split(|&b| b == b'\n')
+            let mut count = 0;
+            for line in data.split(|&b| b == b'\n')
                 .filter(|line| !line.is_empty())
-                .map(|line| {
-                    serde_json::from_slice::<serde_json::Value>(line).expect("valid json")
-                })
-                .count()
+            {
+                serde_json::from_slice::<serde_json::Value>(line).expect("valid json");
+                count += 1;
+            }
+            count
         }),
     });
     // simd-json (Rust port of simdjson, whose techniques falx generates

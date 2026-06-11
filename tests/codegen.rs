@@ -96,25 +96,25 @@ fn generated_kernels_differential() {
 
             // Test dispatched kernel.
             let mut dispatched = Vec::new();
-            match name {
-                &"csv" => falx::kernels::csv::index_structurals(&data, &mut dispatched),
-                &"tsv" => falx::kernels::tsv::index_structurals(&data, &mut dispatched),
-                &"logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
-                &"ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
-                &"multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
-                &"csv_hash" => falx::kernels::csv_hash::index_structurals(&data, &mut dispatched),
+            match *name {
+                "csv" => falx::kernels::csv::index_structurals(&data, &mut dispatched),
+                "tsv" => falx::kernels::tsv::index_structurals(&data, &mut dispatched),
+                "logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
+                "ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
+                "multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
+                "csv_hash" => falx::kernels::csv_hash::index_structurals(&data, &mut dispatched),
                 _ => panic!("unknown format: {}", name),
             }
 
             // Test fallback kernel.
             let mut fallback = Vec::new();
-            match name {
-                &"csv" => falx::kernels::csv::fallback::index_structurals(&data, &mut fallback),
-                &"tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
-                &"logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
-                &"ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
-                &"multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
-                &"csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
+            match *name {
+                "csv" => falx::kernels::csv::fallback::index_structurals(&data, &mut fallback),
+                "tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
+                "logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
+                "ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
+                "multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
+                "csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
                 _ => panic!("unknown format: {}", name),
             }
 
@@ -189,25 +189,25 @@ fn generated_kernels_long_input() {
 
         // Test dispatched kernel.
         let mut dispatched = Vec::new();
-        match name {
-            &"csv" => falx::kernels::csv::index_structurals(&data, &mut dispatched),
-            &"tsv" => falx::kernels::tsv::index_structurals(&data, &mut dispatched),
-            &"logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
-            &"ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
-            &"multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
-            &"csv_hash" => falx::kernels::csv_hash::index_structurals(&data, &mut dispatched),
+        match *name {
+            "csv" => falx::kernels::csv::index_structurals(&data, &mut dispatched),
+            "tsv" => falx::kernels::tsv::index_structurals(&data, &mut dispatched),
+            "logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
+            "ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
+            "multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
+            "csv_hash" => falx::kernels::csv_hash::index_structurals(&data, &mut dispatched),
             _ => panic!("unknown format: {}", name),
         }
 
         // Test fallback kernel.
         let mut fallback = Vec::new();
-        match name {
-            &"csv" => falx::kernels::csv::fallback::index_structurals(&data, &mut fallback),
-            &"tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
-            &"logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
-            &"ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
-            &"multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
-            &"csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
+        match *name {
+            "csv" => falx::kernels::csv::fallback::index_structurals(&data, &mut fallback),
+            "tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
+            "logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
+            "ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
+            "multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
+            "csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
             _ => panic!("unknown format: {}", name),
         }
 
