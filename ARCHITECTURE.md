@@ -57,14 +57,22 @@ Specs may declare typed columns (`[[columns]]` with `index`, `type` of
 exposes `parse_columns(data) -> Columns` (and `parse_columns_par` for
 parallel-capable dialects).
 
-**Layout** — per column, a values `Vec<T>` plus a validity bitmap
-(`Vec<u64>`, LSB-first, bit `r` = row `r` parsed). A missing, empty, or
-malformed cell clears its bit and leaves a zero placeholder in the values
-Vec; nothing panics, and every column always has exactly `rows` entries.
-This is deliberately the Arrow primitive-array layout (values buffer +
-null bitmap, LSB-first), so handing a column to Arrow is a buffer wrap,
-not a conversion — see `examples/arrow_interop.rs`. Generated files stay
-std-only; the Arrow dependency lives in that example, never in the kernel.
+**Layout** — per numeric/bytes column, a values `Vec<T>` plus a validity
+bitmap (`Vec<u64>`, LSB-first, bit `r` = row `r` parsed). A missing,
+empty, or malformed cell clears its bit and leaves a zero placeholder in
+the values Vec; nothing panics, and every column always has exactly
+`rows` entries. This is deliberately the Arrow primitive-array layout
+(values buffer + null bitmap, LSB-first). `string` columns use Arrow's
+varbinary layout instead: `offsets: Vec<i32>` (rows + 1 entries, ≤ 2 GiB
+of text per column), a contiguous cleaned-bytes `data: Vec<u8>`, and the
+same validity bitmap — cells are quote-stripped/unescaped while being
+appended during the single projection pass, so the unquoted common case
+is one memcpy and no intermediate allocation exists. A missing field is
+null; an empty cell is a valid empty string (`bytes` columns, which have
+no offsets to disambiguate with, keep empty = invalid). Handing any
+column to Arrow is a buffer wrap, not a conversion — see
+`examples/arrow_interop.rs`. Generated files stay std-only; the Arrow
+dependency lives in that example, never in the kernel.
 
 **Projection** — fused: a `ColumnSink` consumes the `(structural, terminator)`
 masks straight out of `step()`, so the columnar path materializes no tape

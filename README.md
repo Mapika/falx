@@ -30,8 +30,8 @@ pass, skipping every undeclared field:
 ```toml
 [[columns]]
 index = 5
-type = "f64"      # also: "i64", "bytes" (zero-copy spans)
-name = "latitude"
+type = "f64"      # also: "i64", "string" (cleaned, Arrow varbinary
+name = "latitude" #   layout), "bytes" (zero-copy raw spans)
 ```
 
 ```rust
@@ -102,6 +102,13 @@ counter increment each. Parallel workers reconcile chunk boundaries by
 terminator ownership rather than tape splitting (see ARCHITECTURE.md) —
 removing the tape pass is what took parallel extraction from 1.9 to
 3+ GiB/s.
+
+Text projects too: `string` columns materialize cleaned cells (quotes
+stripped, escapes resolved) straight into Arrow varbinary buffers during
+the same pass. Extracting *City as string + lat/lon as f64* from
+worldcitiespop runs at 1.07 GiB/s serial / 1.79 GiB/s parallel vs the
+csv crate's 0.48 and arrow-csv's 0.56 — same `bench_columns` example,
+city byte totals matching across contenders.
 
 Caveats, stated plainly: arrow-csv is benchmarked with projection enabled
 (its like-for-like configuration) but still materializes through its own

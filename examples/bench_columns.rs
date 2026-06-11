@@ -107,6 +107,7 @@ fn main() -> io::Result<()> {
     println!("=== Synthetic Data (64 MiB) ===");
     bench_file(&synthetic_data, "synthetic", false);
     println!();
+    bench_text(&synthetic_data, "synthetic", false);
 
     // If a file path is provided, read and benchmark it
     if args.len() == 2 {
@@ -119,6 +120,7 @@ fn main() -> io::Result<()> {
                 // sums agree either way.
                 bench_file(&real_data, &args[1], true);
                 println!();
+                bench_text(&real_data, &args[1], true);
             }
             Err(e) => {
                 eprintln!("Warning: Could not read '{}': {}", args[1], e);
@@ -372,4 +374,146 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
     for result in &results {
         println!("  {:<25}: {:.6}", result.name, result.sum_lon);
     }
+}
+
+/// "City as cleaned string + lat/lon as f64" — the text-and-numbers
+/// projection benchmark (kernel: csv_geo_text). Every contender
+/// materializes the city bytes into an owned buffer, so the comparison is
+/// like-for-like.
+fn bench_text(data: &[u8], label: &str, has_header: bool) {
+    let file_size = data.len();
+    println!("File: {} (city string + lat/lon)", label);
+    const WARMUP: usize = 2;
+    const RUNS: usize = 9;
+    let mut results = Vec::new();
+
+    // Row tuples: (elapsed_ms, valid_cities, city_bytes, sum_lat).
+    // ---- falx serial / parallel ----
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    for (name, par) in [("falx parse_columns", false), ("falx parse_columns_par", true)] {
+        let mut times = Vec::new();
+        for run in 0..WARMUP + RUNS {
+            let start = Instant::now();
+            let cols = if par {
+                falx::kernels::csv_geo_text::parse_columns_par(black_box(data), threads)
+            } else {
+                falx::kernels::csv_geo_text::parse_columns(black_box(data))
+            };
+            let valid = cols.city_valid.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+            let city_bytes = cols.city_data.len();
+            let sum_lat = cols.latitude.iter().copied().sum::<f64>();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let _ = black_box((&cols.city_offsets, &cols.city_data));
+            if run >= WARMUP {
+                times.push((elapsed, valid, city_bytes, sum_lat));
+            }
+        }
+        times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let median = times[RUNS / 2];
+        results.push((name, times[0].0, median, file_size as f64 / 1073741824.0 / (median.0 / 1000.0)));
+    }
+
+    // ---- csv crate: unescaped city into owned offsets+data, str::parse lat/lon ----
+    {
+        let mut times = Vec::new();
+        for run in 0..WARMUP + RUNS {
+            let start = Instant::now();
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .from_reader(black_box(&data[..]));
+            let mut offsets: Vec<i32> = vec![0];
+            let mut city_data: Vec<u8> = Vec::new();
+            let mut valid = 0usize;
+            let mut sum_lat = 0.0f64;
+            for record in reader.byte_records().flatten() {
+                if let Some(city) = record.get(1) {
+                    city_data.extend_from_slice(city);
+                    valid += 1;
+                }
+                offsets.push(city_data.len() as i32);
+                if let Some(cell) = record.get(5) {
+                    if let Ok(lat) = std::str::from_utf8(cell).unwrap_or("").parse::<f64>() {
+                        sum_lat += lat;
+                    }
+                }
+                if let Some(cell) = record.get(6) {
+                    let _ = black_box(std::str::from_utf8(cell).unwrap_or("").parse::<f64>().ok());
+                }
+            }
+            let city_bytes = city_data.len();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let _ = black_box((&offsets, &city_data));
+            if run >= WARMUP {
+                times.push((elapsed, valid, city_bytes, sum_lat));
+            }
+        }
+        times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let median = times[RUNS / 2];
+        results.push(("csv crate", times[0].0, median, file_size as f64 / 1073741824.0 / (median.0 / 1000.0)));
+    }
+
+    // ---- arrow-csv: projection [1, 5, 6] ----
+    {
+        use arrow_array::Array;
+        use arrow_csv::ReaderBuilder;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("country", DataType::Utf8, true),
+            Field::new("city", DataType::Utf8, true),
+            Field::new("accent_city", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("population", DataType::Int64, true),
+            Field::new("latitude", DataType::Float64, true),
+            Field::new("longitude", DataType::Float64, true),
+        ]));
+        let run_arrow = |data: &[u8]| -> Result<(usize, usize, f64), arrow_schema::ArrowError> {
+            let reader = ReaderBuilder::new(schema.clone())
+                .with_header(has_header)
+                .with_batch_size(65536)
+                .with_projection(vec![1, 5, 6])
+                .build(std::io::Cursor::new(data))?;
+            let (mut valid, mut city_bytes, mut sum_lat) = (0usize, 0usize, 0.0f64);
+            for batch in reader {
+                let batch = batch?;
+                let city = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().expect("city utf8");
+                valid += city.len() - city.null_count();
+                city_bytes += city.value_data().len();
+                let lat = batch.column(1).as_any().downcast_ref::<arrow_array::Float64Array>().expect("lat f64");
+                sum_lat += lat.iter().flatten().sum::<f64>();
+            }
+            Ok((valid, city_bytes, sum_lat))
+        };
+        match run_arrow(black_box(data)) {
+            Err(e) => eprintln!("arrow-csv skipped on {label} (text bench): {e}"),
+            Ok(_) => {
+                for _ in 1..WARMUP {
+                    let _ = black_box(run_arrow(black_box(data)));
+                }
+                let mut times = Vec::new();
+                for _ in 0..RUNS {
+                    let start = Instant::now();
+                    let out = run_arrow(black_box(data)).expect("arrow ok after probe");
+                    let out = black_box(out);
+                    times.push((start.elapsed().as_secs_f64() * 1000.0, out.0, out.1, out.2));
+                }
+                times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let median = times[RUNS / 2];
+                results.push(("arrow-csv", times[0].0, median, file_size as f64 / 1073741824.0 / (median.0 / 1000.0)));
+            }
+        }
+    }
+
+    println!("{:<26} {:>9} {:>11} {:>10}  {:>12} {:>12} {:>14}", "Contender", "Best (ms)", "Median (ms)", "GiB/s", "Valid city", "City bytes", "Sum lat");
+    for (name, best, median, gibs) in &results {
+        println!(
+            "{:<26} {:>9.3} {:>11.3} {:>10.2}  {:>12} {:>12} {:>14.2}",
+            name, best, median.0, gibs, median.1, median.2, median.3
+        );
+    }
+    if has_header {
+        println!("(arrow-csv skips the header row; falx/csv count its city cell as one valid string — hence exactly one row / a few bytes of difference)");
+    }
+    println!();
 }

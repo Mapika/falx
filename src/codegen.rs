@@ -44,6 +44,11 @@ pub enum ColumnType {
     /// Zero-copy `(start, end)` byte spans into the input, quotes and
     /// escapes intact.
     Bytes,
+    /// Cleaned cell bytes (quotes stripped, escapes resolved) materialized
+    /// into an Arrow varbinary-layout pair: `<name>_offsets: Vec<i32>`
+    /// (rows + 1 entries) plus a contiguous `<name>_data: Vec<u8>`.
+    /// A missing field is invalid; an empty cell is a valid empty string.
+    Str,
 }
 
 /// One requested typed column: project field `index` of every record.
@@ -64,11 +69,14 @@ impl Column {
         }
     }
 
+    /// Element type of the values Vec; `Str` columns have no single values
+    /// Vec (offsets + data buffers instead) and never ask for one.
     fn rust_type(&self) -> &'static str {
         match self.ty {
             ColumnType::I64 => "i64",
             ColumnType::F64 => "f64",
             ColumnType::Bytes => "(u32, u32)",
+            ColumnType::Str => unreachable!("string columns emit offsets + data"),
         }
     }
 
@@ -77,6 +85,7 @@ impl Column {
             ColumnType::I64 => "0",
             ColumnType::F64 => "0.0",
             ColumnType::Bytes => "(0, 0)",
+            ColumnType::Str => unreachable!("string columns emit offsets + data"),
         }
     }
 }
@@ -109,9 +118,16 @@ fn validate_columns(columns: &[Column]) -> Result<(), CodegenError> {
                 "column name '{name}' is reserved by the generated struct"
             )));
         }
-        // Each column claims `name` and `name_valid`; collisions between
-        // any of them make the generated struct uncompilable.
-        if !seen.insert(name.clone()) || !seen.insert(format!("{name}_valid")) {
+        // Each column claims its whole derived-field namespace (values,
+        // validity, and the string-layout buffers) regardless of type, so
+        // no pair of declarations can make the struct uncompilable.
+        let claims = [
+            name.clone(),
+            format!("{name}_valid"),
+            format!("{name}_offsets"),
+            format!("{name}_data"),
+        ];
+        if claims.into_iter().any(|claim| !seen.insert(claim)) {
             return Err(CodegenError(format!(
                 "column name '{name}' collides with another column"
             )));
@@ -1146,6 +1162,7 @@ fn push_columns_api(
     let any_i64 = columns.iter().any(|c| c.ty == ColumnType::I64);
     let any_f64 = columns.iter().any(|c| c.ty == ColumnType::F64);
     let any_bytes = columns.iter().any(|c| c.ty == ColumnType::Bytes);
+    let any_str = columns.iter().any(|c| c.ty == ColumnType::Str);
 
     // --- struct definition -------------------------------------------------
     code.push_str(
@@ -1164,20 +1181,36 @@ fn push_columns_api(
     );
     for column in columns {
         let name = column.field_name();
-        let ty = column.rust_type();
-        let what = match column.ty {
-            ColumnType::I64 => "as `i64`",
-            ColumnType::F64 => "as `f64`",
-            ColumnType::Bytes => "as raw `(start, end)` spans into `data`",
-        };
-        let _ = writeln!(
-            code,
-            "    /// Field {} of each record {what}; zero where invalid.\n\
-             \x20   pub {name}: Vec<{ty}>,\n\
-             \x20   /// Validity bitmap for `{name}`.\n\
-             \x20   pub {name}_valid: Vec<u64>,",
-            column.index
-        );
+        let idx = column.index;
+        if column.ty == ColumnType::Str {
+            let _ = writeln!(
+                code,
+                "    /// Field {idx} of each record, cleaned, in Arrow varbinary\n\
+                 \x20   /// layout: `{name}_offsets[r]..{name}_offsets[r + 1]` indexes\n\
+                 \x20   /// `{name}_data` (use [`string_at`]). Always rows + 1 entries.\n\
+                 \x20   pub {name}_offsets: Vec<i32>,\n\
+                 \x20   /// Contiguous cleaned bytes of field {idx} of every record.\n\
+                 \x20   pub {name}_data: Vec<u8>,\n\
+                 \x20   /// Validity bitmap for `{name}` (missing field = invalid;\n\
+                 \x20   /// an empty cell is a valid empty string).\n\
+                 \x20   pub {name}_valid: Vec<u64>,"
+            );
+        } else {
+            let ty = column.rust_type();
+            let what = match column.ty {
+                ColumnType::I64 => "as `i64`",
+                ColumnType::F64 => "as `f64`",
+                ColumnType::Bytes => "as raw `(start, end)` spans into `data`",
+                ColumnType::Str => unreachable!(),
+            };
+            let _ = writeln!(
+                code,
+                "    /// Field {idx} of each record {what}; zero where invalid.\n\
+                 \x20   pub {name}: Vec<{ty}>,\n\
+                 \x20   /// Validity bitmap for `{name}`.\n\
+                 \x20   pub {name}_valid: Vec<u64>,"
+            );
+        }
     }
     code.push_str("}\n\n");
 
@@ -1185,11 +1218,22 @@ fn push_columns_api(
     code.push_str("impl<'a> Columns<'a> {\n    fn with_capacity(data: &'a [u8], rows: usize) -> Self {\n        Columns {\n            data,\n            rows: 0,\n");
     for column in columns {
         let name = column.field_name();
-        let _ = writeln!(
-            code,
-            "            {name}: Vec::with_capacity(rows),\n\
-             \x20           {name}_valid: Vec::with_capacity(rows / 64 + 1),"
-        );
+        if column.ty == ColumnType::Str {
+            // Offsets carry the Arrow invariant of a leading 0 from birth,
+            // so serial fill and parallel merge share it.
+            let _ = writeln!(
+                code,
+                "            {name}_offsets: {{ let mut v = Vec::with_capacity(rows + 1); v.push(0); v }},\n\
+                 \x20           {name}_data: Vec::new(),\n\
+                 \x20           {name}_valid: Vec::with_capacity(rows / 64 + 1),"
+            );
+        } else {
+            let _ = writeln!(
+                code,
+                "            {name}: Vec::with_capacity(rows),\n\
+                 \x20           {name}_valid: Vec::with_capacity(rows / 64 + 1),"
+            );
+        }
     }
     code.push_str("        }\n    }\n");
 
@@ -1349,6 +1393,19 @@ fn push_columns_api(
                  \x20       self.cols.{name}.push(if ok {{ (cfrom, cto) }} else {{ (0, 0) }});\n\
                  \x20       self.cols.{name}_valid[row >> 6] |= (ok as u64) << (row & 63);\n"
             ),
+            ColumnType::Str => format!(
+                "        let (cfrom, cto) = self.pending[{k}];\n\
+                 \x20       let ok = self.found & {found_bit} != 0;\n\
+                 \x20       if ok {{\n\
+                 \x20           append_clean(&mut self.cols.{name}_data, &data[cfrom as usize..cto as usize]);\n\
+                 \x20       }}\n\
+                 \x20       assert!(\n\
+                 \x20           self.cols.{name}_data.len() <= i32::MAX as usize,\n\
+                 \x20           \"string column '{name}' exceeds the 2 GiB Arrow i32-offset limit\"\n\
+                 \x20       );\n\
+                 \x20       self.cols.{name}_offsets.push(self.cols.{name}_data.len() as i32);\n\
+                 \x20       self.cols.{name}_valid[row >> 6] |= (ok as u64) << (row & 63);\n"
+            ),
         };
         code.push_str(&body);
     }
@@ -1377,6 +1434,16 @@ fn push_columns_api(
          \x20   bitmap[row >> 6] >> (row & 63) & 1 != 0\n\
          }\n\n",
     );
+    if any_str {
+        code.push_str(
+            "/// Slice row `row` of a string column out of its offsets + data\n\
+             /// buffers.\n\
+             #[inline]\n\
+             pub fn string_at<'b>(offsets: &[i32], data: &'b [u8], row: usize) -> &'b [u8] {\n\
+             \x20   &data[offsets[row] as usize..offsets[row + 1] as usize]\n\
+             }\n\n",
+        );
+    }
 
     // --- serial entry point -------------------------------------------------
     let (dispatch_sig, dispatch_serial_args, seed_param) = if par_mode {
@@ -1452,11 +1519,28 @@ fn push_columns_api(
         );
         for column in columns {
             let name = column.field_name();
-            let _ = writeln!(
-                code,
-                "        cols.{name}.extend_from_slice(&part.{name});\n\
-                 \x20       append_bitmap(&mut cols.{name}_valid, cols.rows, &part.{name}_valid, part.rows);"
-            );
+            if column.ty == ColumnType::Str {
+                // String chunks: data buffers concatenate, offsets rebase by
+                // the merged data length (skipping each part's leading 0).
+                let _ = writeln!(
+                    code,
+                    "        let {name}_base = cols.{name}_data.len();\n\
+                     \x20       assert!(\n\
+                     \x20           {name}_base + part.{name}_data.len() <= i32::MAX as usize,\n\
+                     \x20           \"string column '{name}' exceeds the 2 GiB Arrow i32-offset limit\"\n\
+                     \x20       );\n\
+                     \x20       cols.{name}_data.extend_from_slice(&part.{name}_data);\n\
+                     \x20       cols.{name}_offsets\n\
+                     \x20           .extend(part.{name}_offsets[1..].iter().map(|&o| o + {name}_base as i32));\n\
+                     \x20       append_bitmap(&mut cols.{name}_valid, cols.rows, &part.{name}_valid, part.rows);"
+                );
+            } else {
+                let _ = writeln!(
+                    code,
+                    "        cols.{name}.extend_from_slice(&part.{name});\n\
+                     \x20       append_bitmap(&mut cols.{name}_valid, cols.rows, &part.{name}_valid, part.rows);"
+                );
+            }
         }
         code.push_str(
             "        cols.rows += part.rows;\n\
@@ -1488,6 +1572,9 @@ fn push_columns_api(
     }
     if any_f64 {
         code.push_str(FLOAT_CELL_TPL);
+    }
+    if any_str {
+        code.push_str(&append_clean_fn(dialect));
     }
     // Quoted dialects get a raw-span wrapper per numeric type: the
     // unquoted common case parses in place without constructing a Cow,
@@ -1818,6 +1905,76 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; @K
 }
 
 "#;
+
+/// The dialect-specific appending cleaner for string columns: same
+/// semantics as `clean`, but writing into the column's data buffer so the
+/// unquoted common case is a single `extend_from_slice` and no
+/// intermediate allocation ever happens.
+fn append_clean_fn(dialect: &crate::formats::Dialect) -> String {
+    use crate::formats::Escape;
+    match (dialect.quote, dialect.escape) {
+        (None, _) => r#"/// No quote convention in this dialect: cells append verbatim.
+#[inline]
+fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
+    out.extend_from_slice(raw);
+}
+
+"#
+        .to_string(),
+        (Some(q), Escape::None) => format!(
+            r#"/// Append `raw` cleaned: outer quotes stripped, doubled quotes
+/// collapsed. Unquoted cells are one memcpy.
+fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
+    const Q: u8 = {q}u8;
+    if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
+        let inner = &raw[1..raw.len() - 1];
+        let mut i = 0;
+        while i < inner.len() {{
+            out.push(inner[i]);
+            if inner[i] == Q && i + 1 < inner.len() && inner[i + 1] == Q {{
+                i += 2;
+            }} else {{
+                i += 1;
+            }}
+        }}
+    }} else {{
+        out.extend_from_slice(raw);
+    }}
+}}
+
+"#
+        ),
+        (Some(q), Escape::Backslash(e)) => format!(
+            r#"/// Append `raw` cleaned: outer quotes stripped, backslash escapes
+/// resolved (`\x` -> `x`). Escape-free cells are one memcpy.
+fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
+    const Q: u8 = {q}u8;
+    const E: u8 = {e}u8;
+    let body = if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
+        &raw[1..raw.len() - 1]
+    }} else {{
+        raw
+    }};
+    if !body.contains(&E) {{
+        out.extend_from_slice(body);
+        return;
+    }}
+    let mut i = 0;
+    while i < body.len() {{
+        if body[i] == E && i + 1 < body.len() {{
+            out.push(body[i + 1]);
+            i += 2;
+        }} else {{
+            out.push(body[i]);
+            i += 1;
+        }}
+    }}
+}}
+
+"#
+        ),
+    }
+}
 
 /// The dialect-specific field-cleaning function for the span API.
 fn clean_fn(dialect: &crate::formats::Dialect) -> String {

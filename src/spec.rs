@@ -130,9 +130,10 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
                 Some("i64") => ColumnType::I64,
                 Some("f64") => ColumnType::F64,
                 Some("bytes") => ColumnType::Bytes,
+                Some("string") => ColumnType::Str,
                 Some(other) => {
                     return Err(format!(
-                        "columns[{i}]: invalid 'type' value '{other}' (must be 'i64', 'f64', or 'bytes')"
+                        "columns[{i}]: invalid 'type' value '{other}' (must be 'i64', 'f64', 'bytes', or 'string')"
                     ))
                 }
                 None => {

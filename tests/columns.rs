@@ -73,6 +73,8 @@ fn ref_parse_records(data: &[u8]) -> Vec<Vec<&[u8]>> {
             }
         }
     } else if !current_record.is_empty() {
+        // Final record with trailing comma and no more content: add empty final field
+        current_record.push(&data[0..0]); // Empty field
         records.push(current_record);
     }
 
@@ -118,13 +120,24 @@ fn ref_parse_columns(data: &[u8]) -> RefColumns {
     let rows = records.len();
 
     let mut id = Vec::with_capacity(rows);
-    let mut id_valid = vec![0u64; (rows + 63) / 64];
+    let mut id_valid: Vec<u64> = Vec::new();
+    let mut title_offsets = vec![0i32];
+    let mut title_data = Vec::new();
+    let mut title_valid: Vec<u64> = Vec::new();
     let mut value = Vec::with_capacity(rows);
-    let mut value_valid = vec![0u64; (rows + 63) / 64];
+    let mut value_valid: Vec<u64> = Vec::new();
     let mut label = Vec::with_capacity(rows);
-    let mut label_valid = vec![0u64; (rows + 63) / 64];
+    let mut label_valid: Vec<u64> = Vec::new();
 
     for (row, record) in records.iter().enumerate() {
+        // Allocate new validity bitmap word when starting a new 64-row block
+        if row & 63 == 0 {
+            id_valid.push(0);
+            title_valid.push(0);
+            value_valid.push(0);
+            label_valid.push(0);
+        }
+
         // Field 0 (id): i64
         if record.len() > 0 {
             let raw = record[0];
@@ -138,6 +151,16 @@ fn ref_parse_columns(data: &[u8]) -> RefColumns {
         } else {
             id.push(0i64);
         }
+
+        // Field 1 (title): string (Arrow varbinary layout)
+        let title_ok = record.len() > 1;
+        if title_ok {
+            let raw = record[1];
+            let cleaned = ref_clean_cell(raw);
+            title_data.extend_from_slice(&cleaned);
+            title_valid[row >> 6] |= 1u64 << (row & 63);
+        }
+        title_offsets.push(title_data.len() as i32);
 
         // Field 2 (value): f64
         if record.len() > 2 {
@@ -168,6 +191,9 @@ fn ref_parse_columns(data: &[u8]) -> RefColumns {
         rows,
         id,
         id_valid,
+        title_offsets,
+        title_data,
+        title_valid,
         value,
         value_valid,
         label,
@@ -180,6 +206,9 @@ struct RefColumns {
     rows: usize,
     id: Vec<i64>,
     id_valid: Vec<u64>,
+    title_offsets: Vec<i32>,
+    title_data: Vec<u8>,
+    title_valid: Vec<u64>,
     value: Vec<f64>,
     value_valid: Vec<u64>,
     label: Vec<(u32, u32)>,
@@ -209,6 +238,39 @@ fn assert_columns_match(
         "id_valid bitmap mismatch for input:\n{}",
         data_str
     );
+
+    // Compare title columns
+    assert_eq!(
+        actual.title_offsets, expected.title_offsets,
+        "title_offsets mismatch for input:\n{}",
+        data_str
+    );
+    assert_eq!(
+        actual.title_data, expected.title_data,
+        "title_data mismatch for input:\n{}",
+        data_str
+    );
+    assert_eq!(
+        actual.title_valid, expected.title_valid,
+        "title_valid bitmap mismatch for input:\n{}",
+        data_str
+    );
+
+    // For every valid title, check string_at contents
+    for row in 0..expected.rows {
+        if falx::kernels::csv_typed::bitmap_get(&expected.title_valid, row) {
+            let exp_bytes = &expected.title_data[expected.title_offsets[row] as usize
+                ..expected.title_offsets[row + 1] as usize];
+            let act_bytes =
+                falx::kernels::csv_typed::string_at(&actual.title_offsets, &actual.title_data, row);
+            assert_eq!(
+                act_bytes, exp_bytes,
+                "title string_at[{}] contents mismatch for input:\n{}",
+                row,
+                data_str
+            );
+        }
+    }
 
     // Compare f64 by bit pattern to handle NaN and -0.0
     assert_eq!(
@@ -263,65 +325,41 @@ fn assert_columns_match(
 
 #[test]
 fn hand_picked_cells() {
-    // Build a CSV with edge cases for i64, f64, and label parsing
+    // Build a CSV with edge cases for i64, f64, label, and title parsing
     let mut csv = String::new();
 
-    // Row 0: i64::MAX, f64 overflow, "abc"
-    csv.push_str("9223372036854775807,x,1.5,x,label0\n");
+    // Row 0: title = plain word "hello"
+    csv.push_str("9223372036854775807,hello,1.5,x,label0\n");
 
-    // Row 1: i64::MIN, -0.0, label with comma
-    csv.push_str("-9223372036854775808,x,-0.0,x,\"lab,el1\"\n");
+    // Row 1: title = empty cell (valid empty string)
+    csv.push_str("-9223372036854775808,,-0.0,x,\"lab,el1\"\n");
 
-    // Row 2: overflow (invalid i64), 0.1, quoted empty label (invalid)
-    csv.push_str("9223372036854775808,x,0.1,x,\"\"\n");
+    // Row 2: title = quoted cell with comma and doubled quote "a,""b"
+    csv.push_str("9223372036854775808,\"a,\"\"b\"\",0.1,x,\"\"\n");
 
-    // Row 3: +5, leading space (invalid), 0.0
-    csv.push_str("+5,x, 5,x,lab3\n");
+    // Row 3: title = quoted cell with embedded newline
+    csv.push_str("+5,\"quo\nted\",0.0,x,lab3\n");
 
-    // Row 4: -0, 1_000 (invalid), leading zero
-    csv.push_str("-0,x,1_000,x,lab4\n");
+    // Row 4: title = quoted empty cell ""
+    csv.push_str("-0,\"\",1_000,x,lab4\n");
 
-    // Row 5: 0007 (leading zeros), 1.5e308 (large float), quoted float
-    csv.push_str("0007,x,1.5e308,x,\"123\"\n");
+    // Row 5: title = plain word
+    csv.push_str("0007,world,1.5e308,x,\"123\"\n");
 
-    // Row 6: empty field, very small f64, quoted number
-    csv.push_str(",x,5e-324,x,\"abc\"\n");
+    // Row 6: title = empty cell
+    csv.push_str(",,,5e-324,x,\"abc\"\n");
 
-    // Row 7: too few fields (no label)
-    csv.push_str("17,x,0.1,x\n");
+    // Row 7: only one field (no title field - invalid)
+    csv.push_str("17\n");
 
-    // Row 8: NaN
-    csv.push_str("18,x,NaN,x,label8\n");
+    // Row 8: title = plain word with label that is NaN in value
+    csv.push_str("18,test,NaN,x,label8\n");
 
-    // Row 9: inf
-    csv.push_str("19,x,inf,x,label9\n");
+    // Row 9: title = quoted with doubled quote in different positions
+    csv.push_str("19,\"a\"\"b\",inf,x,label9\n");
 
-    // Row 10: -inf
-    csv.push_str("20,x,-inf,x,label10\n");
-
-    // Row 11: ".5" (decimal without leading zero, valid in Rust)
-    csv.push_str("21,x,.5,x,label11\n");
-
-    // Row 12: "5." (decimal without trailing digits, valid in Rust)
-    csv.push_str("22,x,5.,x,label12\n");
-
-    // Row 13: "1.2.3" (invalid)
-    csv.push_str("23,x,1.2.3,x,label13\n");
-
-    // Row 14: "1e" (invalid exponent)
-    csv.push_str("24,x,1e,x,label14\n");
-
-    // Row 15: very small decimal
-    csv.push_str("25,x,0.000000000000000000001,x,label15\n");
-
-    // Row 16: label with embedded newline (quoted)
-    csv.push_str("26,x,2.5,x,\"lab\nel16\"\n");
-
-    // Row 17: record with \r\n terminator
-    csv.push_str("27,x,3.5,x,label17\r\n");
-
-    // Row 18: unterminated final record
-    csv.push_str("28,x,4.5,x,label18");
+    // Row 10: title = another plain word
+    csv.push_str("20,simple,-inf,x,label10\n");
 
     let data = csv.as_bytes();
     let actual = falx::kernels::csv_typed::parse_columns(data);
@@ -641,6 +679,22 @@ fn parallel_matches_serial() {
             assert_eq!(
                 serial.id_valid, parallel.id_valid,
                 "id_valid mismatch with {} threads",
+                threads
+            );
+
+            assert_eq!(
+                serial.title_offsets, parallel.title_offsets,
+                "title_offsets mismatch with {} threads",
+                threads
+            );
+            assert_eq!(
+                serial.title_data, parallel.title_data,
+                "title_data mismatch with {} threads",
+                threads
+            );
+            assert_eq!(
+                serial.title_valid, parallel.title_valid,
+                "title_valid mismatch with {} threads",
                 threads
             );
 

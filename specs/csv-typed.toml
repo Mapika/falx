@@ -11,6 +11,11 @@ type = "i64"
 name = "id"
 
 [[columns]]
+index = 1
+type = "string"
+name = "title"
+
+[[columns]]
 index = 2
 type = "f64"
 name = "value"

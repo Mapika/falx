@@ -1,0 +1,22 @@
+# worldcitiespop-shaped CSV projecting City as a cleaned string column
+# (Arrow varbinary layout) alongside the two coordinate columns: matches
+# the checked-in `csv_geo_text` kernel.
+name = "csv_geo_text"
+structural = [",", "\n"]
+quote = "\""
+escape = "doubled"
+
+[[columns]]
+index = 1
+type = "string"
+name = "city"
+
+[[columns]]
+index = 5
+type = "f64"
+name = "latitude"
+
+[[columns]]
+index = 6
+type = "f64"
+name = "longitude"
