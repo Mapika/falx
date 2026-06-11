@@ -451,50 +451,117 @@ pub struct Nested<'a> {
 
 /// Index `data` and match nesting brackets into a navigable tape.
 /// Brackets inside quoted regions are inert and never reach the tape.
+/// Fused: per-block masks stream from the kernel straight into the
+/// bracket matcher; no intermediate position vector is materialized.
 pub fn parse_nested(data: &[u8]) -> Nested<'_> {
-    let mut idx = Vec::new();
-    index_structurals(data, &mut idx);
-    let mut tape: Vec<u64> = Vec::with_capacity(idx.len());
-    let mut stack: Vec<u32> = Vec::new();
-    let mut error = None;
-    for &pos in &idx {
-        match data[pos as usize] {
-            b'{' | b'[' => {
-                stack.push(tape.len() as u32);
-                tape.push(((u32::MAX as u64) << 32) | pos as u64);
-            }
-            b @ (b'}' | b']') => {
-                let open = match stack.pop() {
-                    Some(i) if close_of((tape[i as usize] as u32) as usize, data) == b => i,
-                    _ => {
-                        error = Some(NestError::UnmatchedClose(pos));
-                        break;
-                    }
-                };
-                let close = tape.len() as u32;
-                tape[open as usize] = ((close as u64) << 32) | (tape[open as usize] as u32) as u64;
-                tape.push(((open as u64) << 32) | pos as u64);
-            }
-            _ => tape.push(pos as u64),
-        }
-    }
+    parse_nested_into(data, Nested { data: &[], tape: Vec::new(), error: None })
+}
+
+/// Like [`parse_nested`], recycling the tape allocation of a previous
+/// parse (its contents are discarded). Steady-state callers avoid paying
+/// the allocation — and, more important at GiB/s, the soft page faults of
+/// a fresh tape — on every document batch.
+pub fn parse_nested_into<'a>(data: &'a [u8], recycle: Nested<'_>) -> Nested<'a> {
+    let mut tape = recycle.tape;
+    tape.clear();
+    let mut stack: Vec<u64> = Vec::with_capacity(64);
+    let mut error = nested_tape(data, &mut tape, &mut stack);
     // Edition-agnostic single condition: generated files compile under the
     // consumer's edition, so no let-chains.
-    if let (None, Some(&innermost)) = (error, stack.last()) {
-        error = Some(NestError::UnclosedOpen(tape[innermost as usize] as u32));
+    if let (None, Some(&top)) = (error, stack.last()) {
+        error = Some(NestError::UnclosedOpen(tape[(top >> 8) as usize] as u32));
     }
     Nested { data, tape, error }
 }
 
-/// The close byte that matches the open bracket at `pos`. Returns 0 for a
-/// non-open byte, which can never equal a close byte that reaches the
-/// caller's comparison, so a corrupt position degrades to a match failure.
-fn close_of(pos: usize, data: &[u8]) -> u8 {
-    match data[pos] {
-        b'{' => b'}',
-        b'[' => b']',
-        _ => 0,
+fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<NestError> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::nested_tape(data, tape, stack) };
     }
+    fallback::nested_tape(data, tape, stack)
+}
+
+/// Consume one block's structural masks in one ordered pass. The masks
+/// classify each event without touching input bytes — separators (the
+/// majority) are a mask test and a sequential store; only opens read their
+/// byte, for pair identity. Stack entries pack (open's tape index << 8) |
+/// expected close byte, so a pop validates with a single compare and no
+/// dependent loads. Entries go through raw pointers after one reserve per
+/// block; per-push capacity checks would otherwise dominate the event cost.
+#[inline]
+fn push_nested(
+    data: &[u8],
+    mut mask: u64,
+    opens: u64,
+    closes: u64,
+    base: u32,
+    tape: &mut Vec<u64>,
+    stack: &mut Vec<u64>,
+) -> Option<NestError> {
+    let events = mask.count_ones() as usize;
+    tape.reserve(events);
+    stack.reserve(events);
+    let tape_ptr = tape.as_mut_ptr();
+    let stack_ptr = stack.as_mut_ptr();
+    let mut tlen = tape.len();
+    let mut slen = stack.len();
+    let mut error = None;
+    let brackets = opens | closes;
+    while mask != 0 {
+        let lowest = mask & mask.wrapping_neg();
+        let pos = base + mask.trailing_zeros();
+        mask &= mask - 1;
+        if lowest & brackets == 0 {
+            // SAFETY: tlen stays below the reserved bound (one entry per
+            // event); same for every tape/stack write below.
+            unsafe { *tape_ptr.add(tlen) = pos as u64 };
+            tlen += 1;
+        } else if lowest & opens != 0 {
+            // SAFETY: a set structural bit always indexes a live input
+            // byte (drivers mask off tail padding).
+            unsafe {
+                let close = match *data.get_unchecked(pos as usize) {
+                    b'{' => b'}',
+                    b'[' => b']',
+                    _ => 0,
+                };
+                *stack_ptr.add(slen) = ((tlen as u64) << 8) | close as u64;
+                slen += 1;
+                *tape_ptr.add(tlen) = ((u32::MAX as u64) << 32) | pos as u64;
+            }
+            tlen += 1;
+        } else {
+            if slen == 0 {
+                error = Some(NestError::UnmatchedClose(pos));
+                break;
+            }
+            slen -= 1;
+            // SAFETY: slen indexes a live stack entry; the patched open
+            // slot is an earlier, already-written tape entry.
+            unsafe {
+                let top = *stack_ptr.add(slen);
+                if top as u8 != *data.get_unchecked(pos as usize) {
+                    error = Some(NestError::UnmatchedClose(pos));
+                    break;
+                }
+                let open = (top >> 8) as usize;
+                *tape_ptr.add(open) =
+                    ((tlen as u64) << 32) | (*tape_ptr.add(open) as u32) as u64;
+                *tape_ptr.add(tlen) = ((open as u64) << 32) | pos as u64;
+            }
+            tlen += 1;
+        }
+    }
+    // SAFETY: tlen/slen count initialized entries within reserved capacity.
+    unsafe {
+        tape.set_len(tlen);
+        stack.set_len(slen);
+    }
+    error
 }
 
 /// Trim ASCII whitespace from both ends of `data[start..end]`, as offsets.
@@ -727,6 +794,34 @@ pub mod fallback {
         }
     }
 
+    /// Fused driver for [`crate::parse_nested`]: per-block masks feed the
+    /// bracket matcher directly. Returns the first matching error, if any.
+    pub fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<super::NestError> {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let (mask, opens, closes) = step_nested(block, &mut carries);
+            if let Some(err) = super::push_nested(data, mask, opens, closes, offset as u32, tape, stack) {
+                return Some(err);
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let (mask, opens, closes) = step_nested(&block, &mut carries);
+            let live = (1u64 << rem) - 1;
+            if let Some(err) =
+                super::push_nested(data, mask & live, opens & live, closes & live, offset as u32, tape, stack)
+            {
+                return Some(err);
+            }
+        }
+        None
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
@@ -775,6 +870,40 @@ pub mod fallback {
         let v22 = !v21;
         let v23 = v1 & v22;
         (v23, v23 & v0)
+    }
+
+    /// `step` twin for the fused nested driver: (structural, open-bracket,
+    /// close-bracket) masks. Lines are pruned to this return's needs.
+    #[inline]
+    fn step_nested(block: &[u8; 64], carries: &mut [u64; 4]) -> (u64, u64, u64) {
+        let v1 = eq_mask(block, 44u8) | eq_mask(block, 58u8) | eq_mask(block, 91u8) | eq_mask(block, 93u8) | eq_mask(block, 123u8) | eq_mask(block, 125u8); // class ",:[]{}"
+        let v2 = eq_mask(block, 34u8); // class "\""
+        let v3 = eq_mask(block, 92u8); // class "\\"
+        let v4 = { let shifted = (v3 << 1) | carries[0]; carries[0] = v3 >> 63; shifted };
+        let v5 = !v4;
+        let v6 = v3 & v5;
+        let v7 = 0x5555555555555555u64;
+        let v8 = 0xaaaaaaaaaaaaaaaau64;
+        let v9 = !v3;
+        let v10 = v6 & v7;
+        let v11 = { let (partial, c1) = v3.overflowing_add(v10); let (sum, c2) = partial.overflowing_add(carries[1]); carries[1] = (c1 | c2) as u64; sum };
+        let v12 = v11 & v9;
+        let v13 = v12 & v8;
+        let v14 = v6 & v8;
+        let v15 = { let (partial, c1) = v3.overflowing_add(v14); let (sum, c2) = partial.overflowing_add(carries[2]); carries[2] = (c1 | c2) as u64; sum };
+        let v16 = v15 & v9;
+        let v17 = v16 & v7;
+        let v18 = v13 | v17;
+        let v19 = !v18;
+        let v20 = v2 & v19;
+        let v21 = { let parity = prefix_xor(v20) ^ carries[3]; carries[3] = ((parity as i64) >> 63) as u64; parity };
+        let v22 = !v21;
+        let v23 = v1 & v22;
+        let v24 = eq_mask(block, 91u8) | eq_mask(block, 123u8); // class "[{"
+        let v25 = eq_mask(block, 93u8) | eq_mask(block, 125u8); // class "]}"
+        let v26 = v24 & v23;
+        let v27 = v25 & v23;
+        (v23, v26, v27)
     }
 
     #[inline]
@@ -887,6 +1016,48 @@ mod avx2 {
         }
     }
 
+    /// Fused nested-tape driver; see the fallback twin for semantics.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<super::NestError> {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, o0, c0) = unsafe { step_nested(data.as_ptr().add(offset), &mut carries) };
+            if let Some(err) = super::push_nested(data, m0, o0, c0, offset as u32, tape, stack) {
+                return Some(err);
+            }
+            let (m1, o1, c1) = unsafe { step_nested(data.as_ptr().add(offset + 64), &mut carries) };
+            if let Some(err) = super::push_nested(data, m1, o1, c1, (offset + 64) as u32, tape, stack) {
+                return Some(err);
+            }
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, opens, closes) = unsafe { step_nested(data.as_ptr().add(offset), &mut carries) };
+            if let Some(err) = super::push_nested(data, mask, opens, closes, offset as u32, tape, stack) {
+                return Some(err);
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, opens, closes) = unsafe { step_nested(block.as_ptr(), &mut carries) };
+            let live = (1u64 << rem) - 1;
+            if let Some(err) =
+                super::push_nested(data, mask & live, opens & live, closes & live, offset as u32, tape, stack)
+            {
+                return Some(err);
+            }
+        }
+        None
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
@@ -945,6 +1116,46 @@ mod avx2 {
         let v22 = !v21;
         let v23 = v1 & v22;
         (v23, v23 & v0)
+    }
+
+    /// `step` twin for the fused nested driver; see the fallback twin.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    unsafe fn step_nested(ptr: *const u8, carries: &mut [u64; 4]) -> (u64, u64, u64) {
+        // SAFETY: caller guarantees 64 readable bytes at `ptr`.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_loadu_si256(ptr as *const __m256i),
+                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
+            )
+        };
+        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v2 = eq_mask(lo, hi, 34u8); // class "\""
+        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v4 = { let shifted = (v3 << 1) | carries[0]; carries[0] = v3 >> 63; shifted };
+        let v5 = !v4;
+        let v6 = v3 & v5;
+        let v7 = 0x5555555555555555u64;
+        let v8 = 0xaaaaaaaaaaaaaaaau64;
+        let v9 = !v3;
+        let v10 = v6 & v7;
+        let v11 = { let (partial, c1) = v3.overflowing_add(v10); let (sum, c2) = partial.overflowing_add(carries[1]); carries[1] = (c1 | c2) as u64; sum };
+        let v12 = v11 & v9;
+        let v13 = v12 & v8;
+        let v14 = v6 & v8;
+        let v15 = { let (partial, c1) = v3.overflowing_add(v14); let (sum, c2) = partial.overflowing_add(carries[2]); carries[2] = (c1 | c2) as u64; sum };
+        let v16 = v15 & v9;
+        let v17 = v16 & v7;
+        let v18 = v13 | v17;
+        let v19 = !v18;
+        let v20 = v2 & v19;
+        let v21 = { let parity = prefix_xor(v20) ^ carries[3]; carries[3] = ((parity as i64) >> 63) as u64; parity };
+        let v22 = !v21;
+        let v23 = v1 & v22;
+        let v24 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
+        let v25 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
+        let v26 = v24 & v23;
+        let v27 = v25 & v23;
+        (v23, v26, v27)
     }
 
     #[target_feature(enable = "avx2")]

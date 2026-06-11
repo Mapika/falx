@@ -295,3 +295,38 @@ fn json_spec_matches_checked_in_kernel() {
     .unwrap();
     assert_eq!(emitted, checked_in);
 }
+
+/// The scalar fallback driver must produce the identical tape and error as
+/// the dispatched (AVX2) path — including across many-block inputs.
+#[test]
+fn fallback_driver_matches_dispatch() {
+    let mut rng = Rng(0x5A5A_5A5A_1234_4321);
+    for round in 0..50 {
+        let value = gen_value(&mut rng, 5);
+        let mut text = serde_json::to_string(&value).unwrap();
+        if round % 5 == 0 {
+            // Many-block input: repeat as top-level documents.
+            text = vec![text.as_str(); 200].join("\n");
+        }
+        let doc = json::parse_nested(text.as_bytes());
+        let mut tape = Vec::new();
+        let mut stack = Vec::new();
+        let err = json::fallback::nested_tape(text.as_bytes(), &mut tape, &mut stack);
+        assert_eq!(err, doc.error, "round {round}: error mismatch");
+        assert_eq!(doc.tape(), &tape[..], "round {round}: tape mismatch");
+    }
+    for bad in [&b"{\"a\": [1, 2}"[..], b"[[", b"]"] {
+        let doc = json::parse_nested(bad);
+        let mut tape = Vec::new();
+        let mut stack = Vec::new();
+        // The driver reports unmatched closes; unclosed opens are derived
+        // from the leftover stack, exactly as parse_nested does.
+        let err = json::fallback::nested_tape(bad, &mut tape, &mut stack).or_else(|| {
+            stack
+                .last()
+                .map(|&top| json::NestError::UnclosedOpen(tape[(top >> 8) as usize] as u32))
+        });
+        assert_eq!(err, doc.error);
+        assert_eq!(doc.tape(), &tape[..]);
+    }
+}

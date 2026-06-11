@@ -140,6 +140,12 @@ pub struct DelimitedParts {
     /// Raw `\n` class node (pre quote-masking); ANDed with the output stream
     /// it marks record ends.
     pub terminators: NodeId,
+    /// Live open-bracket and close-bracket streams (bracket classes ANDed
+    /// with the output, so quote/comment masking is inherited) when the
+    /// dialect declares nesting pairs. Splitting brackets out of the
+    /// structural stream is what lets the nested-tape matcher treat the
+    /// majority class — separators — branchlessly.
+    pub nest: Option<(NodeId, NodeId)>,
 }
 
 /// Build the structural-indexing graph for a dialect: the output stream
@@ -204,7 +210,19 @@ pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
         }
     };
     g.set_output(output);
-    DelimitedParts { graph: g, terminators }
+
+    let nest = if dialect.nesting.is_empty() {
+        None
+    } else {
+        let opens: Vec<u8> = dialect.nesting.iter().map(|&(open, _)| open).collect();
+        let closes: Vec<u8> = dialect.nesting.iter().map(|&(_, close)| close).collect();
+        let open_class = g.class(CharClass::from_bytes(&opens));
+        let close_class = g.class(CharClass::from_bytes(&closes));
+        let live_opens = g.and(open_class, output);
+        let live_closes = g.and(close_class, output);
+        Some((live_opens, live_closes))
+    };
+    DelimitedParts { graph: g, terminators, nest }
 }
 
 /// The structural-indexing graph alone (see [`delimited_parts`]).

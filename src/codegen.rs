@@ -249,7 +249,7 @@ pub fn emit_parser_with_columns(
     emit_with(
         &parts.graph,
         format_name,
-        Some((dialect, parts.terminators)),
+        Some((dialect, parts.terminators, parts.nest)),
         columns,
     )
 }
@@ -257,10 +257,15 @@ pub fn emit_parser_with_columns(
 fn emit_with(
     graph: &Graph,
     format_name: &str,
-    parser: Option<(&crate::formats::Dialect, crate::ir::NodeId)>,
+    parser: Option<(
+        &crate::formats::Dialect,
+        crate::ir::NodeId,
+        Option<(crate::ir::NodeId, crate::ir::NodeId)>,
+    )>,
     columns: &[Column],
 ) -> Result<String, CodegenError> {
-    let dialect = parser.map(|(d, _)| d);
+    let dialect = parser.map(|(d, _, _)| d);
+    let nest = parser.and_then(|(_, _, n)| n);
     let output = graph.output();
 
     // Assign carry slots to stateful nodes, recording each slot's initial
@@ -340,8 +345,18 @@ fn emit_with(
     let step_ret_ty = if parser.is_some() { "(u64, u64)" } else { "u64" };
     let sel = if parser.is_some() { ".0" } else { "" };
     let step_ret = match parser {
-        Some((_, term)) => format!("(v{out}, v{out} & v{term})", out = output.0, term = term.0),
+        Some((_, term, _)) => format!("(v{out}, v{out} & v{term})", out = output.0, term = term.0),
         None => format!("v{}", output.0),
+    };
+    // Per-variant return roots: each emitted step variant prunes the graph
+    // to the nodes its own return tuple actually needs.
+    let step_roots: Vec<crate::ir::NodeId> = match parser {
+        Some((_, term, _)) => vec![output, term],
+        None => vec![output],
+    };
+    let nested_roots: Vec<crate::ir::NodeId> = match nest {
+        Some((opens, closes)) => vec![output, opens, closes],
+        None => Vec::new(),
     };
 
     // Parallel indexing (emitted for doubled-quote/no-escape dialects):
@@ -760,6 +775,94 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         String::new()
     };
 
+    // Fused nested-tape drivers (emitted when the dialect declares bracket
+    // pairs): blocks stream straight from step() into the bracket matcher,
+    // no intermediate position vector. The matcher itself (push_nested) is
+    // emitted once at the file root by push_nested_api.
+    let nested_mode = matches!(dialect, Some(d) if !d.nesting.is_empty());
+    let fallback_nested = if nested_mode {
+        format!(
+            r#"
+    /// Fused driver for [`crate::parse_nested`]: per-block masks feed the
+    /// bracket matcher directly. Returns the first matching error, if any.
+    pub fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<super::NestError> {{
+{carry_decl}        let mut offset = 0usize;
+        while offset + 64 <= data.len() {{
+            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
+            let (mask, opens, closes) = step_nested(block{carry_arg});
+            if let Some(err) = super::push_nested(data, mask, opens, closes, offset as u32, tape, stack) {{
+                return Some(err);
+            }}
+            offset += 64;
+        }}
+        let rem = data.len() - offset;
+        if rem > 0 {{
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let (mask, opens, closes) = step_nested(&block{carry_arg});
+            let live = (1u64 << rem) - 1;
+            if let Some(err) =
+                super::push_nested(data, mask & live, opens & live, closes & live, offset as u32, tape, stack)
+            {{
+                return Some(err);
+            }}
+        }}
+        None
+    }}
+"#
+        )
+    } else {
+        String::new()
+    };
+    let avx2_nested = if nested_mode {
+        format!(
+            r#"
+    /// Fused nested-tape driver; see the fallback twin for semantics.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<super::NestError> {{
+{carry_decl}        let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {{
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, o0, c0) = unsafe {{ step_nested(data.as_ptr().add(offset){carry_arg}) }};
+            if let Some(err) = super::push_nested(data, m0, o0, c0, offset as u32, tape, stack) {{
+                return Some(err);
+            }}
+            let (m1, o1, c1) = unsafe {{ step_nested(data.as_ptr().add(offset + 64){carry_arg}) }};
+            if let Some(err) = super::push_nested(data, m1, o1, c1, (offset + 64) as u32, tape, stack) {{
+                return Some(err);
+            }}
+            offset += 128;
+        }}
+        while offset + 64 <= data.len() {{
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, opens, closes) = unsafe {{ step_nested(data.as_ptr().add(offset){carry_arg}) }};
+            if let Some(err) = super::push_nested(data, mask, opens, closes, offset as u32, tape, stack) {{
+                return Some(err);
+            }}
+            offset += 64;
+        }}
+        let rem = data.len() - offset;
+        if rem > 0 {{
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, opens, closes) = unsafe {{ step_nested(block.as_ptr(){carry_arg}) }};
+            let live = (1u64 << rem) - 1;
+            if let Some(err) =
+                super::push_nested(data, mask & live, opens & live, closes & live, offset as u32, tape, stack)
+            {{
+                return Some(err);
+            }}
+        }}
+        None
+    }}
+"#
+        )
+    } else {
+        String::new()
+    };
+
     let parser_doc = if dialect.is_some() {
         "//\n// Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,\n\
          // with dialect-aware quote stripping and escape resolution.\n"
@@ -827,13 +930,27 @@ pub mod fallback {{
             push_indexes(mask, offset as u32, out);
         }}
     }}
-{fallback_tape}{fallback_seeded}{fallback_tape_seeded}{fallback_partial}{fallback_cells}
+{fallback_tape}{fallback_nested}{fallback_seeded}{fallback_tape_seeded}{fallback_partial}{fallback_cells}
     #[inline]
     fn step(block: &[u8; 64]{carry_param}) -> {step_ret_ty} {{
 "#
     );
-    emit_step_body(&mut code, graph, &carry_slot, Flavor::Fallback);
+    emit_step_body(&mut code, graph, &carry_slot, Flavor::Fallback, &step_roots);
     let _ = write!(code, "        {step_ret}\n    }}\n");
+    if let Some((opens, closes)) = nest {
+        let _ = write!(
+            code,
+            "\n    /// `step` twin for the fused nested driver: (structural, open-bracket,\n    \
+             /// close-bracket) masks. Lines are pruned to this return's needs.\n    \
+             #[inline]\n    fn step_nested(block: &[u8; 64]{carry_param}) -> (u64, u64, u64) {{\n"
+        );
+        emit_step_body(&mut code, graph, &carry_slot, Flavor::Fallback, &nested_roots);
+        let _ = write!(
+            code,
+            "        (v{}, v{}, v{})\n    }}\n",
+            output.0, opens.0, closes.0
+        );
+    }
 
     if uses_regions {
         code.push_str(REGIONS_HELPER);
@@ -937,7 +1054,7 @@ mod avx2 {{
         }}
     }}
 
-{avx2_tape}{avx2_seeded}{avx2_tape_seeded}{avx2_partial}{avx2_cells}
+{avx2_tape}{avx2_nested}{avx2_seeded}{avx2_tape_seeded}{avx2_partial}{avx2_cells}
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
@@ -949,8 +1066,26 @@ mod avx2 {{
         }};
 "#
     );
-    emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx2);
+    emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx2, &step_roots);
     let _ = write!(code, "        {step_ret}\n    }}\n");
+    if let Some((opens, closes)) = nest {
+        let _ = write!(
+            code,
+            "\n    /// `step` twin for the fused nested driver; see the fallback twin.\n    \
+             #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n    \
+             unsafe fn step_nested(ptr: *const u8{carry_param}) -> (u64, u64, u64) {{\n        \
+             // SAFETY: caller guarantees 64 readable bytes at `ptr`.\n        \
+             let (lo, hi) = unsafe {{\n            (\n                \
+             _mm256_loadu_si256(ptr as *const __m256i),\n                \
+             _mm256_loadu_si256(ptr.add(32) as *const __m256i),\n            )\n        }};\n"
+        );
+        emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx2, &nested_roots);
+        let _ = write!(
+            code,
+            "        (v{}, v{}, v{})\n    }}\n",
+            output.0, opens.0, closes.0
+        );
+    }
 
     if uses_regions {
         code.push_str(REGIONS_HELPER);
@@ -2329,14 +2464,55 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
     }
 }
 
-/// Emit one `let vN = ...;` line per node. Shared between kernels except for
-/// the `Class` byte-comparison primitive.
-fn emit_step_body(code: &mut String, graph: &Graph, carry_slot: &[usize], flavor: Flavor) {
+/// Nodes reachable from `roots` through operand edges: a step variant only
+/// emits the lines its return tuple needs, keeping every variant
+/// warning-free even though variants share one graph.
+fn live_nodes(graph: &Graph, roots: &[crate::ir::NodeId]) -> Vec<bool> {
+    let mut live = vec![false; graph.nodes().len()];
+    let mut work: Vec<u32> = roots.iter().map(|r| r.0).collect();
+    while let Some(i) = work.pop() {
+        if live[i as usize] {
+            continue;
+        }
+        live[i as usize] = true;
+        match graph.nodes()[i as usize] {
+            Op::Class(_) | Op::Const(_) => {}
+            Op::Not(a)
+            | Op::ShiftLeft1(a)
+            | Op::ShiftLeft1Seeded(a)
+            | Op::PrefixXor(a) => work.push(a.0),
+            Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Add(a, b) => {
+                work.push(a.0);
+                work.push(b.0);
+            }
+            Op::Regions(a, b, c) => {
+                work.push(a.0);
+                work.push(b.0);
+                work.push(c.0);
+            }
+        }
+    }
+    live
+}
+
+/// Emit one `let vN = ...;` line per node reachable from `roots`. Shared
+/// between kernels except for the `Class` byte-comparison primitive.
+fn emit_step_body(
+    code: &mut String,
+    graph: &Graph,
+    carry_slot: &[usize],
+    flavor: Flavor,
+    roots: &[crate::ir::NodeId],
+) {
+    let live = live_nodes(graph, roots);
     let class_args = match flavor {
         Flavor::Avx2 => "lo, hi",
         Flavor::Fallback => "block",
     };
     for (i, op) in graph.nodes().iter().enumerate() {
+        if !live[i] {
+            continue;
+        }
         let line = match *op {
             Op::Class(class) => {
                 let n = class.members().count();
@@ -2445,16 +2621,21 @@ fn push_nested_api(code: &mut String, dialect: &crate::formats::Dialect) {
         .map(|&(open, _)| byte_lit(open))
         .collect::<Vec<_>>()
         .join(" | ");
-    let close_pat = dialect
+    // One match arm per pair: pushing the expected close byte at open time
+    // is what lets the pop validate without re-reading input or tape. The
+    // catch-all is unreachable (the opens mask covers only open bytes) but
+    // keeps the match exhaustive; 0 never equals a close byte.
+    let expected_close_arms = dialect
         .nesting
         .iter()
-        .map(|&(_, close)| byte_lit(close))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let close_arms = dialect
-        .nesting
-        .iter()
-        .map(|&(open, close)| format!("        {} => {},\n", byte_lit(open), byte_lit(close)))
+        .map(|&(open, close)| {
+            format!(
+                "                    {} => {},\n",
+                byte_lit(open),
+                byte_lit(close)
+            )
+        })
+        .chain(std::iter::once("                    _ => 0,\n".to_string()))
         .collect::<String>();
 
     const TEMPLATE: &str = r##"/// How bracket matching failed. Positions are byte offsets into the input.
@@ -2482,48 +2663,114 @@ pub struct Nested<'a> {
 
 /// Index `data` and match nesting brackets into a navigable tape.
 /// Brackets inside quoted regions are inert and never reach the tape.
+/// Fused: per-block masks stream from the kernel straight into the
+/// bracket matcher; no intermediate position vector is materialized.
 pub fn parse_nested(data: &[u8]) -> Nested<'_> {
-    let mut idx = Vec::new();
-    index_structurals(data, &mut idx);
-    let mut tape: Vec<u64> = Vec::with_capacity(idx.len());
-    let mut stack: Vec<u32> = Vec::new();
-    let mut error = None;
-    for &pos in &idx {
-        match data[pos as usize] {
-            __OPEN_PAT__ => {
-                stack.push(tape.len() as u32);
-                tape.push(((u32::MAX as u64) << 32) | pos as u64);
-            }
-            b @ (__CLOSE_PAT__) => {
-                let open = match stack.pop() {
-                    Some(i) if close_of((tape[i as usize] as u32) as usize, data) == b => i,
-                    _ => {
-                        error = Some(NestError::UnmatchedClose(pos));
-                        break;
-                    }
-                };
-                let close = tape.len() as u32;
-                tape[open as usize] = ((close as u64) << 32) | (tape[open as usize] as u32) as u64;
-                tape.push(((open as u64) << 32) | pos as u64);
-            }
-            _ => tape.push(pos as u64),
-        }
-    }
+    parse_nested_into(data, Nested { data: &[], tape: Vec::new(), error: None })
+}
+
+/// Like [`parse_nested`], recycling the tape allocation of a previous
+/// parse (its contents are discarded). Steady-state callers avoid paying
+/// the allocation — and, more important at GiB/s, the soft page faults of
+/// a fresh tape — on every document batch.
+pub fn parse_nested_into<'a>(data: &'a [u8], recycle: Nested<'_>) -> Nested<'a> {
+    let mut tape = recycle.tape;
+    tape.clear();
+    let mut stack: Vec<u64> = Vec::with_capacity(64);
+    let mut error = nested_tape(data, &mut tape, &mut stack);
     // Edition-agnostic single condition: generated files compile under the
     // consumer's edition, so no let-chains.
-    if let (None, Some(&innermost)) = (error, stack.last()) {
-        error = Some(NestError::UnclosedOpen(tape[innermost as usize] as u32));
+    if let (None, Some(&top)) = (error, stack.last()) {
+        error = Some(NestError::UnclosedOpen(tape[(top >> 8) as usize] as u32));
     }
     Nested { data, tape, error }
 }
 
-/// The close byte that matches the open bracket at `pos`. Returns 0 for a
-/// non-open byte, which can never equal a close byte that reaches the
-/// caller's comparison, so a corrupt position degrades to a match failure.
-fn close_of(pos: usize, data: &[u8]) -> u8 {
-    match data[pos] {
-__CLOSE_ARMS__        _ => 0,
+fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<NestError> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::nested_tape(data, tape, stack) };
     }
+    fallback::nested_tape(data, tape, stack)
+}
+
+/// Consume one block's structural masks in one ordered pass. The masks
+/// classify each event without touching input bytes — separators (the
+/// majority) are a mask test and a sequential store; only opens read their
+/// byte, for pair identity. Stack entries pack (open's tape index << 8) |
+/// expected close byte, so a pop validates with a single compare and no
+/// dependent loads. Entries go through raw pointers after one reserve per
+/// block; per-push capacity checks would otherwise dominate the event cost.
+#[inline]
+fn push_nested(
+    data: &[u8],
+    mut mask: u64,
+    opens: u64,
+    closes: u64,
+    base: u32,
+    tape: &mut Vec<u64>,
+    stack: &mut Vec<u64>,
+) -> Option<NestError> {
+    let events = mask.count_ones() as usize;
+    tape.reserve(events);
+    stack.reserve(events);
+    let tape_ptr = tape.as_mut_ptr();
+    let stack_ptr = stack.as_mut_ptr();
+    let mut tlen = tape.len();
+    let mut slen = stack.len();
+    let mut error = None;
+    let brackets = opens | closes;
+    while mask != 0 {
+        let lowest = mask & mask.wrapping_neg();
+        let pos = base + mask.trailing_zeros();
+        mask &= mask - 1;
+        if lowest & brackets == 0 {
+            // SAFETY: tlen stays below the reserved bound (one entry per
+            // event); same for every tape/stack write below.
+            unsafe { *tape_ptr.add(tlen) = pos as u64 };
+            tlen += 1;
+        } else if lowest & opens != 0 {
+            // SAFETY: a set structural bit always indexes a live input
+            // byte (drivers mask off tail padding).
+            unsafe {
+                let close = match *data.get_unchecked(pos as usize) {
+__EXPECTED_CLOSE_ARMS__                };
+                *stack_ptr.add(slen) = ((tlen as u64) << 8) | close as u64;
+                slen += 1;
+                *tape_ptr.add(tlen) = ((u32::MAX as u64) << 32) | pos as u64;
+            }
+            tlen += 1;
+        } else {
+            if slen == 0 {
+                error = Some(NestError::UnmatchedClose(pos));
+                break;
+            }
+            slen -= 1;
+            // SAFETY: slen indexes a live stack entry; the patched open
+            // slot is an earlier, already-written tape entry.
+            unsafe {
+                let top = *stack_ptr.add(slen);
+                if top as u8 != *data.get_unchecked(pos as usize) {
+                    error = Some(NestError::UnmatchedClose(pos));
+                    break;
+                }
+                let open = (top >> 8) as usize;
+                *tape_ptr.add(open) =
+                    ((tlen as u64) << 32) | (*tape_ptr.add(open) as u32) as u64;
+                *tape_ptr.add(tlen) = ((open as u64) << 32) | pos as u64;
+            }
+            tlen += 1;
+        }
+    }
+    // SAFETY: tlen/slen count initialized entries within reserved capacity.
+    unsafe {
+        tape.set_len(tlen);
+        stack.set_len(slen);
+    }
+    error
 }
 
 /// Trim ASCII whitespace from both ends of `data[start..end]`, as offsets.
@@ -2704,7 +2951,6 @@ impl<'a, 'p> Iterator for Items<'a, 'p> {
     code.push_str(
         &TEMPLATE
             .replace("__OPEN_PAT__", &open_pat)
-            .replace("__CLOSE_PAT__", &close_pat)
-            .replace("__CLOSE_ARMS__", &close_arms),
+            .replace("__EXPECTED_CLOSE_ARMS__", &expected_close_arms),
     );
 }
