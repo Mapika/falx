@@ -10,6 +10,7 @@ pub mod csv_geo;
 pub mod csv_geo_text;
 pub mod csv_typed;
 pub mod logfmt;
+pub mod multi;
 pub mod ndjson;
 pub mod tsv;
 
@@ -22,6 +23,8 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
         ("tsv", formats::tsv_dialect(), vec![]),
         ("logfmt", formats::logfmt_dialect(), vec![]),
         ("ndjson", formats::ndjson_dialect(), vec![]),
+        // 9 structural bytes: classified via PSHUFB nibble tables.
+        ("multi", formats::multi_dialect(), vec![]),
         // Typed projection demo: non-adjacent indexes, one column of every
         // type, so tests exercise skipped fields between requested ones.
         (

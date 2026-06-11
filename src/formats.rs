@@ -64,6 +64,19 @@ pub fn logfmt_dialect() -> Dialect {
     }
 }
 
+/// A deliberately separator-rich dialect (10 structural bytes, 9 of them
+/// separators): exercises the shuffle-based nibble classifier, which
+/// kicks in for classes too large for compare-based classification.
+pub fn multi_dialect() -> Dialect {
+    Dialect {
+        structural: vec![
+            b',', b';', b'|', b'\t', b':', b' ', b'/', b'=', b'&', b'\n',
+        ],
+        quote: Some(b'"'),
+        escape: Escape::None,
+    }
+}
+
 /// NDJSON framing: newlines outside JSON strings delimit records. (Framing
 /// only — splitting a stream into documents; not a JSON value parser.)
 pub fn ndjson_dialect() -> Dialect {

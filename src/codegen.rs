@@ -29,9 +29,49 @@ impl std::fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-/// Largest class emitted as an OR of byte compares; bigger classes need the
-/// (future) shuffle-based classifier.
+/// Largest class emitted as an OR of byte compares; bigger classes go
+/// through the shuffle-based nibble classifier instead.
 const MAX_CLASS_BYTES: usize = 8;
+
+/// Decompose a character class into PSHUFB nibble tables: byte `b` is a
+/// member iff `lo_table[b & 15] & hi_table[b >> 4] != 0`.
+///
+/// Each of the 16 hi-nibble rows of the 16x16 membership grid is a set of
+/// lo nibbles; rows sharing the same set share one table bit, so the
+/// decomposition is exact whenever the class has at most 8 *distinct*
+/// non-empty row patterns (any class built from ASCII separators easily
+/// qualifies). Returns None when it does not.
+fn nibble_tables(class: &crate::ir::CharClass) -> Option<([u8; 16], [u8; 16])> {
+    let mut rows = [0u16; 16];
+    for byte in class.members() {
+        rows[(byte >> 4) as usize] |= 1 << (byte & 15);
+    }
+    let mut lo = [0u8; 16];
+    let mut hi = [0u8; 16];
+    let mut patterns: Vec<u16> = Vec::new();
+    for (h, &row) in rows.iter().enumerate() {
+        if row == 0 {
+            continue;
+        }
+        let bit = match patterns.iter().position(|&p| p == row) {
+            Some(i) => i,
+            None => {
+                patterns.push(row);
+                patterns.len() - 1
+            }
+        };
+        if bit >= 8 {
+            return None;
+        }
+        hi[h] |= 1 << bit;
+        for l in 0..16 {
+            if row & (1 << l) != 0 {
+                lo[l] |= 1 << bit;
+            }
+        }
+    }
+    Some((lo, hi))
+}
 
 /// The cell type of a projected column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,7 +236,12 @@ fn emit_with(
         }
     }
 
-    let uses_class = graph.nodes().iter().any(|op| matches!(op, Op::Class(_)));
+    let uses_eq_class = graph.nodes().iter().any(
+        |op| matches!(op, Op::Class(c) if c.members().count() <= MAX_CLASS_BYTES),
+    );
+    let uses_table_class = graph.nodes().iter().any(
+        |op| matches!(op, Op::Class(c) if c.members().count() > MAX_CLASS_BYTES),
+    );
     let uses_prefix_xor = graph
         .nodes()
         .iter()
@@ -205,10 +250,11 @@ fn emit_with(
     for op in graph.nodes() {
         if let Op::Class(class) = op {
             let n = class.members().count();
-            if n > MAX_CLASS_BYTES {
+            if n > MAX_CLASS_BYTES && nibble_tables(class).is_none() {
                 return Err(CodegenError(format!(
-                    "character class with {n} bytes exceeds the compare-based \
-                     limit of {MAX_CLASS_BYTES}"
+                    "character class with {n} bytes has more than 8 distinct \
+                     hi-nibble row patterns and cannot be decomposed into \
+                     PSHUFB tables"
                 )));
             }
         }
@@ -723,7 +769,7 @@ pub mod fallback {{
     emit_step_body(&mut code, graph, &carry_slot, Flavor::Fallback);
     let _ = write!(code, "        {step_ret}\n    }}\n");
 
-    if uses_class {
+    if uses_eq_class {
         code.push_str(
             r#"
     #[inline]
@@ -732,6 +778,24 @@ pub mod fallback {{
         let mut i = 0;
         while i < 64 {
             mask |= ((block[i] == byte) as u64) << i;
+            i += 1;
+        }
+        mask
+    }
+"#,
+        );
+    }
+    if uses_table_class {
+        code.push_str(
+            r#"
+    /// Membership test against a 256-bit class bitmap, one bit per byte.
+    #[inline]
+    fn table_mask(block: &[u8; 64], table: &[u64; 4]) -> u64 {
+        let mut mask = 0u64;
+        let mut i = 0;
+        while i < 64 {
+            let b = block[i];
+            mask |= ((table[(b >> 6) as usize] >> (b & 63)) & 1) << i;
             i += 1;
         }
         mask
@@ -819,7 +883,7 @@ mod avx2 {{
     emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx2);
     let _ = write!(code, "        {step_ret}\n    }}\n");
 
-    if uses_class {
+    if uses_eq_class {
         code.push_str(
             r#"
     #[target_feature(enable = "avx2")]
@@ -827,6 +891,29 @@ mod avx2 {{
         let needle = _mm256_set1_epi8(byte as i8);
         let lo_bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, needle)) as u32 as u64;
         let hi_bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, needle)) as u32 as u64;
+        lo_bits | (hi_bits << 32)
+    }
+"#,
+        );
+    }
+    if uses_table_class {
+        code.push_str(
+            r#"
+    /// Shuffle-based classification (simdjson): byte b is a member iff
+    /// lo_tbl[b & 15] & hi_tbl[b >> 4] != 0. Two PSHUFBs and an AND per
+    /// 32-byte half, regardless of class size.
+    #[target_feature(enable = "avx2")]
+    fn table_mask(lo: __m256i, hi: __m256i, lo_tbl: __m256i, hi_tbl: __m256i) -> u64 {
+        let nib = _mm256_set1_epi8(0x0F);
+        let lo_lo = _mm256_shuffle_epi8(lo_tbl, _mm256_and_si256(lo, nib));
+        let lo_hi = _mm256_shuffle_epi8(hi_tbl, _mm256_and_si256(_mm256_srli_epi16::<4>(lo), nib));
+        let hi_lo = _mm256_shuffle_epi8(lo_tbl, _mm256_and_si256(hi, nib));
+        let hi_hi = _mm256_shuffle_epi8(hi_tbl, _mm256_and_si256(_mm256_srli_epi16::<4>(hi), nib));
+        let zero = _mm256_setzero_si256();
+        let lo_z = _mm256_cmpeq_epi8(_mm256_and_si256(lo_lo, lo_hi), zero);
+        let hi_z = _mm256_cmpeq_epi8(_mm256_and_si256(hi_lo, hi_hi), zero);
+        let lo_bits = !(_mm256_movemask_epi8(lo_z) as u32) as u64;
+        let hi_bits = !(_mm256_movemask_epi8(hi_z) as u32) as u64;
         lo_bits | (hi_bits << 32)
     }
 "#,
@@ -2052,12 +2139,45 @@ fn emit_step_body(code: &mut String, graph: &Graph, carry_slot: &[usize], flavor
     for (i, op) in graph.nodes().iter().enumerate() {
         let line = match *op {
             Op::Class(class) => {
-                let compares: Vec<String> = class
-                    .members()
-                    .map(|b| format!("eq_mask({class_args}, {b}u8)"))
-                    .collect();
-                let label: String = class.members().map(|b| b.escape_ascii().to_string()).collect();
-                format!("let v{i} = {}; // class \"{label}\"", compares.join(" | "))
+                let n = class.members().count();
+                let label: String = if n > 16 {
+                    format!("{n} bytes")
+                } else {
+                    class.members().map(|b| b.escape_ascii().to_string()).collect()
+                };
+                if n <= MAX_CLASS_BYTES {
+                    let compares: Vec<String> = class
+                        .members()
+                        .map(|b| format!("eq_mask({class_args}, {b}u8)"))
+                        .collect();
+                    format!("let v{i} = {}; // class \"{label}\"", compares.join(" | "))
+                } else {
+                    match flavor {
+                        Flavor::Fallback => {
+                            let words = class.words();
+                            format!(
+                                "let v{i} = table_mask(block, &[{:#018x}, {:#018x}, {:#018x}, {:#018x}]); // class \"{label}\"",
+                                words[0], words[1], words[2], words[3]
+                            )
+                        }
+                        Flavor::Avx2 => {
+                            let (lo_tbl, hi_tbl) = nibble_tables(&class)
+                                .expect("validated before emission");
+                            let setr = |t: [u8; 16]| -> String {
+                                t.iter()
+                                    .chain(t.iter())
+                                    .map(|&v| format!("{v}u8 as i8"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            format!(
+                                "let v{i} = {{ let lo_tbl = _mm256_setr_epi8({}); let hi_tbl = _mm256_setr_epi8({}); table_mask(lo, hi, lo_tbl, hi_tbl) }}; // class \"{label}\"",
+                                setr(lo_tbl),
+                                setr(hi_tbl)
+                            )
+                        }
+                    }
+                }
             }
             Op::Const(pattern) => format!("let v{i} = {pattern:#018x}u64;"),
             Op::Not(a) => format!("let v{i} = !v{};", a.0),

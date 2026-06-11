@@ -1,0 +1,7 @@
+# Separator-rich demo dialect: ten structural bytes, which is past the
+# compare-based classification limit — the generated kernel classifies via
+# PSHUFB nibble lookup tables instead. Matches the checked-in `multi` kernel.
+name = "multi"
+structural = [",", ";", "|", "\t", ":", " ", "/", "=", "&", "\n"]
+quote = "\""
+escape = "doubled"

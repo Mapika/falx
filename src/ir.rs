@@ -48,6 +48,12 @@ impl CharClass {
         self.bits[(byte >> 6) as usize] & (1 << (byte & 63)) != 0
     }
 
+    /// The class as a 256-bit membership bitmap (word `b >> 6`, bit
+    /// `b & 63`) — the scalar lookup-table representation.
+    pub const fn words(&self) -> [u64; 4] {
+        self.bits
+    }
+
     pub fn members(&self) -> impl Iterator<Item = u8> + '_ {
         (0..=255u8).filter(|&byte| self.contains(byte))
     }

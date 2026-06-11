@@ -46,6 +46,7 @@ fn generated_kernels_differential() {
         ("tsv", formats::tsv_dialect()),
         ("logfmt", formats::logfmt_dialect()),
         ("ndjson", formats::ndjson_dialect()),
+        ("multi", formats::multi_dialect()),
     ];
 
     let mut rng = Rng(0xDEAD_BEEF_CAFE_BABE);
@@ -94,6 +95,7 @@ fn generated_kernels_differential() {
                 &"tsv" => falx::kernels::tsv::index_structurals(&data, &mut dispatched),
                 &"logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
                 &"ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
+                &"multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
                 _ => panic!("unknown format: {}", name),
             }
 
@@ -104,6 +106,7 @@ fn generated_kernels_differential() {
                 &"tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
                 &"logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
                 &"ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
+                &"multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
                 _ => panic!("unknown format: {}", name),
             }
 
@@ -130,6 +133,7 @@ fn generated_kernels_long_input() {
         ("tsv", formats::tsv_dialect()),
         ("logfmt", formats::logfmt_dialect()),
         ("ndjson", formats::ndjson_dialect()),
+        ("multi", formats::multi_dialect()),
     ];
 
     let mut rng = Rng(0xCAFE_BABE_DEAD_BEEF);
@@ -176,6 +180,7 @@ fn generated_kernels_long_input() {
             &"tsv" => falx::kernels::tsv::index_structurals(&data, &mut dispatched),
             &"logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
             &"ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
+            &"multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
             _ => panic!("unknown format: {}", name),
         }
 
@@ -186,6 +191,7 @@ fn generated_kernels_long_input() {
             &"tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
             &"logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
             &"ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
+            &"multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
             _ => panic!("unknown format: {}", name),
         }
 
@@ -194,27 +200,37 @@ fn generated_kernels_long_input() {
     }
 }
 
-/// Test 4: Codegen rejects oversized character classes.
-/// Verifies that emit() returns Err when a character class exceeds MAX_CLASS_BYTES.
+/// Test 4: Large classes go through the shuffle classifier; only classes
+/// that cannot be decomposed into PSHUFB nibble tables are rejected.
 #[test]
-fn codegen_rejects_oversized_class() {
-    // Create a graph with a character class larger than 8 bytes.
-    // MAX_CLASS_BYTES is 8, so we use 9 bytes.
+fn codegen_classifies_large_classes() {
+    // 10 digits: trivially decomposable (one hi-nibble row), must emit.
     let mut g = Graph::new();
-    let large_class = g.class(CharClass::from_bytes(b"0123456789")); // 10 bytes
-    g.set_output(large_class);
-
-    let result = codegen::emit(&g, "oversized_test");
-
+    let digits = g.class(CharClass::from_bytes(b"0123456789"));
+    g.set_output(digits);
+    let code = codegen::emit(&g, "digit_class_test").expect("digit class should emit");
     assert!(
-        result.is_err(),
-        "codegen should reject a character class with 10 bytes (exceeds MAX_CLASS_BYTES of 8)"
+        code.contains("table_mask"),
+        "a 10-byte class should use the shuffle/table classifier"
     );
 
-    let err = result.unwrap_err();
+    // Pathological class: 9 hi-nibble rows with 9 *distinct* lo-nibble
+    // sets (row h holds lo nibbles 0..=h) — needs 9 table bits, which
+    // PSHUFB's 8-bit lanes cannot encode.
+    let mut bytes = Vec::new();
+    for h in 0u8..9 {
+        for l in 0..=h {
+            bytes.push(h * 16 + l);
+        }
+    }
+    let mut g = Graph::new();
+    let undecomposable = g.class(CharClass::from_bytes(&bytes));
+    g.set_output(undecomposable);
+    let err = codegen::emit(&g, "undecomposable_test")
+        .expect_err("9 distinct row patterns should be rejected");
     assert!(
-        err.to_string().contains("exceeds the compare-based limit"),
-        "error message should mention exceeding the compare-based limit, got: {}",
+        err.to_string().contains("distinct"),
+        "error should explain the row-pattern limit, got: {}",
         err
     );
 }
