@@ -245,4 +245,4 @@ cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 
 ## License
 
-MIT OR Apache-2.0.
+MIT.
