@@ -277,6 +277,21 @@ fn main() {
         }
         total
     });
+    // Steady state: recycle the tape buffers across runs, as a per-batch
+    // caller would. Fresh ~40 MB tapes cost soft page faults every parse.
+    let mut recycled = Some(falx::kernels::csv::parse(&data));
+    let falx_fields_warm = measure(|| {
+        let parsed = falx::kernels::csv::parse_into(&data, recycled.take().expect("recycled"));
+        let mut total = 0usize;
+        for record in parsed.records() {
+            for field in record.fields() {
+                total += field.len();
+            }
+        }
+        recycled = Some(parsed);
+        total
+    });
+    assert_eq!(falx_fields.work, falx_fields_warm.work);
     let csv_fields = measure(|| {
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(false)
@@ -360,6 +375,10 @@ fn main() {
         Row {
             label: "falx parse+fields",
             m: falx_fields,
+        },
+        Row {
+            label: "falx parse_into+fields (recycled tape)",
+            m: falx_fields_warm,
         },
         Row {
             label: parallel_label,

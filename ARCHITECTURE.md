@@ -128,6 +128,18 @@ O(1), using a stack-based builder on the heap (no recursion). This is a
 pure tape stage on top of stage-1 indexing, exactly like simdjson's
 two-stage design — no new IR ops were needed.
 
+The matcher is fused: per-block masks feed it straight out of a `step_nested`
+kernel twin returning (structural, open-bracket, close-bracket) masks — the
+bracket classes are ordinary IR nodes ANDed with the output stream, so quote
+masking is inherited, and each emitted step variant prunes graph nodes its
+return tuple does not need. Separators classify by mask test without reading
+input bytes; stack entries pack (open's tape index << 8) | expected close
+byte so a pop validates with one compare; tape entries are written through
+raw pointers after one reserve per block. `parse_nested_into` recycles the
+tape allocation of a previous parse — at GiB/s, soft page faults on a fresh
+multi-megabyte tape are the single largest cost (measured 1.4 vs 2.8 GiB/s
+on 64 MiB), and the span API's `parse_into` exists for the same reason.
+
 `Nested` carries an `error: Option<NestError>` with `UnmatchedClose(pos)` /
 `UnclosedOpen(pos)`. Building stops at the first unmatched close; navigation
 over an errored tape is best-effort and never panics.

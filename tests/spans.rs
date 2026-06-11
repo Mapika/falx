@@ -522,3 +522,32 @@ fn streaming_compaction_large_input() {
         }
     }
 }
+
+/// Buffer-recycling parses must be indistinguishable from fresh parses,
+/// including when the recycled buffers came from a larger input.
+#[test]
+fn parse_into_matches_parse() {
+    use falx::kernels::{csv, json};
+    let big = "a,b,\"c,c\"\nd,e,f\n".repeat(500);
+    let small = "x,\"y\"\"y\",z\n1,2,3";
+    for data in [big.as_str(), small] {
+        let fresh = csv::parse(data.as_bytes());
+        // Recycle through a parse of the *other* input first, so capacity
+        // and stale contents differ from the fresh case.
+        let other = csv::parse(big.as_bytes());
+        let recycled = csv::parse_into(data.as_bytes(), other);
+        let collect = |p: &csv::Parsed| -> Vec<Vec<Vec<u8>>> {
+            p.records()
+                .map(|r| r.fields().map(|f| f.into_owned()).collect())
+                .collect()
+        };
+        assert_eq!(collect(&fresh), collect(&recycled));
+    }
+
+    let doc_text = r#"{"a": [1, {"b": "c}d"}], "e": []}"#;
+    let fresh = json::parse_nested(doc_text.as_bytes());
+    let other = json::parse_nested(b"[[1,2,3],[4,5,6]]");
+    let recycled = json::parse_nested_into(doc_text.as_bytes(), other);
+    assert_eq!(fresh.error, recycled.error);
+    assert_eq!(fresh.tape(), recycled.tape());
+}

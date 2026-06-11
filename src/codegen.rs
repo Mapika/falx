@@ -254,14 +254,19 @@ pub fn emit_parser_with_columns(
     )
 }
 
+/// Parser-mode emission inputs: the dialect, its record-terminator node,
+/// and — when the dialect declares nesting — the live open/close bracket
+/// stream nodes.
+type ParserParts<'d> = (
+    &'d crate::formats::Dialect,
+    crate::ir::NodeId,
+    Option<(crate::ir::NodeId, crate::ir::NodeId)>,
+);
+
 fn emit_with(
     graph: &Graph,
     format_name: &str,
-    parser: Option<(
-        &crate::formats::Dialect,
-        crate::ir::NodeId,
-        Option<(crate::ir::NodeId, crate::ir::NodeId)>,
-    )>,
+    parser: Option<ParserParts<'_>>,
     columns: &[Column],
 ) -> Result<String, CodegenError> {
     let dialect = parser.map(|(d, _, _)| d);
@@ -1247,6 +1252,19 @@ pub fn parse(data: &[u8]) -> Parsed<'_> {
     Parsed { data, seps, ends }
 }
 
+/// Like [`parse`], recycling the tape allocations of a previous parse (its
+/// contents are discarded). At GiB/s the soft page faults of fresh tape
+/// buffers are a measurable share of a parse; steady-state callers — one
+/// parse per batch, file, or request — avoid them entirely.
+pub fn parse_into<'a>(data: &'a [u8], recycle: Parsed<'_>) -> Parsed<'a> {
+    let mut seps = recycle.seps;
+    let mut ends = recycle.ends;
+    seps.clear();
+    ends.clear();
+    index_tape(data, &mut seps, &mut ends);
+    Parsed { data, seps, ends }
+}
+
 /// A structural tape over borrowed input: separator positions plus record
 /// ends carrying cumulative separator counts, so record iteration is O(1)
 /// per record and never rescans the input.
@@ -1435,12 +1453,23 @@ pub struct Fields<'p> {
 impl<'p> Iterator for Fields<'p> {
     type Item = std::borrow::Cow<'p, [u8]>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_sep < self.seps.len() {
-            let to = self.seps[self.next_sep] as usize;
-            self.next_sep += 1;
-            let span = &self.data[self.from..to];
-            self.from = to + 1;
+            // SAFETY: next_sep was just bounds-checked, and tape invariants
+            // make the derived span valid: separator positions are strictly
+            // increasing offsets into `data`, and `from` is either the
+            // record start or one past the previous separator, so
+            // from <= to < data.len() always holds. Fields walking is the
+            // per-field hot path; the redundant checks measurably dominate
+            // it for short fields.
+            let span = unsafe {
+                let to = *self.seps.get_unchecked(self.next_sep) as usize;
+                self.next_sep += 1;
+                let span = self.data.get_unchecked(self.from..to);
+                self.from = to + 1;
+                span
+            };
             Some(clean(span))
         } else if !self.done {
             self.done = true;
@@ -2401,6 +2430,7 @@ fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
 /// The dialect-specific field-cleaning function for the span API.
 fn clean_fn(dialect: &crate::formats::Dialect) -> String {
     use crate::formats::Escape;
+    let swar = SWAR_CONTAINS;
     match (dialect.quote, dialect.escape) {
         (None, _) => r#"/// No quote convention in this dialect: fields are returned verbatim.
 fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
@@ -2409,12 +2439,16 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 "#
         .to_string(),
         (Some(q), Escape::None) => format!(
-            r#"/// Strip surrounding quotes and collapse doubled escape quotes.
+            r#"/// Strip surrounding quotes and collapse doubled escape quotes. In a
+/// valid doubled-quote field every interior quote is half of a pair, so
+/// "contains the quote byte" is the collapse test; a malformed stray
+/// quote merely takes the copying path and comes out byte-identical.
+#[inline]
 fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
     const Q: u8 = {q}u8;
     if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
         let inner = &raw[1..raw.len() - 1];
-        if !inner.windows(2).any(|w| w[0] == Q && w[1] == Q) {{
+        if !contains_byte(inner, Q) {{
             return std::borrow::Cow::Borrowed(inner);
         }}
         let mut out = Vec::with_capacity(inner.len());
@@ -2431,10 +2465,11 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
     }}
     std::borrow::Cow::Borrowed(raw)
 }}
-"#
+{swar}"#
         ),
         (Some(q), Escape::Backslash(e)) => format!(
             r#"/// Strip surrounding quotes and resolve backslash escapes (`\x` -> `x`).
+#[inline]
 fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
     const Q: u8 = {q}u8;
     const E: u8 = {e}u8;
@@ -2443,7 +2478,7 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
     }} else {{
         raw
     }};
-    if !body.contains(&E) {{
+    if !contains_byte(body, E) {{
         return std::borrow::Cow::Borrowed(body);
     }}
     let mut out = Vec::with_capacity(body.len());
@@ -2459,10 +2494,30 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {{
     }}
     std::borrow::Cow::Owned(out)
 }}
-"#
+{swar}"#
         ),
     }
 }
+
+/// SWAR byte search emitted next to `clean` (std-only memchr): the
+/// has-zero-byte trick on XORed 8-byte chunks, byte-order agnostic.
+const SWAR_CONTAINS: &str = r#"
+/// SWAR byte search, 8 bytes per step (std-only stand-in for memchr).
+#[inline]
+fn contains_byte(hay: &[u8], needle: u8) -> bool {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let pat = (needle as u64).wrapping_mul(LO);
+    let mut chunks = hay.chunks_exact(8);
+    for chunk in &mut chunks {
+        let x = u64::from_le_bytes(chunk.try_into().unwrap()) ^ pat;
+        if x.wrapping_sub(LO) & !x & HI != 0 {
+            return true;
+        }
+    }
+    chunks.remainder().contains(&needle)
+}
+"#;
 
 /// Nodes reachable from `roots` through operand edges: a step variant only
 /// emits the lines its return tuple needs, keeping every variant

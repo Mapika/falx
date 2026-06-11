@@ -60,10 +60,17 @@ sides, byte-identical output — is:
 
 | | throughput | speedup |
 |---|---|---|
-| falx `parse()` + field iteration | 0.97 GiB/s | 2.1x |
-| falx `parse_par()` + parallel fields (16 threads) | **4.80 GiB/s** | **10.3x** |
-| falx `stream()` incremental, 64 KiB feeds | 1.29 GiB/s | 2.8x |
-| csv crate `byte_records()` | 0.46 GiB/s | 1.0x |
+| falx `parse()` + field iteration | 0.93 GiB/s | 2.1x |
+| falx `parse_into()` + fields, recycled tape buffers | 1.39 GiB/s | 3.2x |
+| falx `parse_par()` + parallel fields (16 threads) | **4.27 GiB/s** | **9.8x** |
+| falx `stream()` incremental, 64 KiB feeds | 1.47 GiB/s | 3.4x |
+| csv crate `byte_records()` | 0.44 GiB/s | 1.0x |
+
+The recycled-tape row is the steady-state number: at GiB/s, the soft page
+faults of allocating ~40 MB of fresh tape per parse are a measurable share
+of the run, so batch callers should hand the previous parse back via
+`parse_into` (streaming reuses its buffers internally, which is why it
+matches). All rows above are from one session on the same machine.
 
 On real data (worldcitiespop.csv, 145 MB, the csv crate's canonical
 benchmark file): indexing 2.49 GiB/s, single-threaded field iteration
@@ -128,9 +135,16 @@ same machine, byte-identical NDJSON, document counts matching exactly:
 | | throughput |
 |---|---|
 | falx NDJSON framing kernel | **6.61 GiB/s** |
+| falx JSON nested tape (`parse_nested_into`, recycled) | **2.84 GiB/s** |
 | simdjson `iterate_many`, count documents | 2.75 GiB/s |
 | simdjson `iterate_many`, read one field per doc | 2.48 GiB/s |
+| falx JSON nested tape, fresh allocation per call | 1.40 GiB/s |
 | simd-json (Rust port), full tape per document | 0.41 GiB/s |
+
+The nested rows are the M7 bracket-matched tape (structure only — matched
+brackets and separator positions, values sliced lazily), built fused from
+the kernel's masks with no intermediate position vector; serde_json parses
+the same stream of documents at 0.30 GiB/s.
 
 Caveat, stated plainly: simdjson parses document internals while falx
 frames records and slices fields lazily — the gap is what skipping
@@ -268,9 +282,9 @@ cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 - M7 (done): nested structure — specs declare bracket pairs, generated parsers
   add a matched-bracket nested tape with O(1) container skips and a navigation
   API; JSON structural parsing differentially tested against serde_json
-- Next: faster span walking (the scalar record/field layer now dominates
-  end-to-end time), SIMD-accelerated bracket matching (the nested tape's
-  scalar pass dominates `parse_nested`), configurable record terminators
+- Next: per-field clean/Cow cost (the remaining span-layer headroom,
+  ~2.5 ns/field), parallel nested-tape construction (parenthesis-matching
+  reduction), configurable record terminators
   ([#3](https://github.com/Mapika/falx/issues/3), in progress), ARM NEON
   backend, e-graph simplification of format graphs
 

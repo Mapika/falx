@@ -141,6 +141,19 @@ pub fn parse(data: &[u8]) -> Parsed<'_> {
     Parsed { data, seps, ends }
 }
 
+/// Like [`parse`], recycling the tape allocations of a previous parse (its
+/// contents are discarded). At GiB/s the soft page faults of fresh tape
+/// buffers are a measurable share of a parse; steady-state callers — one
+/// parse per batch, file, or request — avoid them entirely.
+pub fn parse_into<'a>(data: &'a [u8], recycle: Parsed<'_>) -> Parsed<'a> {
+    let mut seps = recycle.seps;
+    let mut ends = recycle.ends;
+    seps.clear();
+    ends.clear();
+    index_tape(data, &mut seps, &mut ends);
+    Parsed { data, seps, ends }
+}
+
 /// A structural tape over borrowed input: separator positions plus record
 /// ends carrying cumulative separator counts, so record iteration is O(1)
 /// per record and never rescans the input.
@@ -329,12 +342,23 @@ pub struct Fields<'p> {
 impl<'p> Iterator for Fields<'p> {
     type Item = std::borrow::Cow<'p, [u8]>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_sep < self.seps.len() {
-            let to = self.seps[self.next_sep] as usize;
-            self.next_sep += 1;
-            let span = &self.data[self.from..to];
-            self.from = to + 1;
+            // SAFETY: next_sep was just bounds-checked, and tape invariants
+            // make the derived span valid: separator positions are strictly
+            // increasing offsets into `data`, and `from` is either the
+            // record start or one past the previous separator, so
+            // from <= to < data.len() always holds. Fields walking is the
+            // per-field hot path; the redundant checks measurably dominate
+            // it for short fields.
+            let span = unsafe {
+                let to = *self.seps.get_unchecked(self.next_sep) as usize;
+                self.next_sep += 1;
+                let span = self.data.get_unchecked(self.from..to);
+                self.from = to + 1;
+                span
+            };
             Some(clean(span))
         } else if !self.done {
             self.done = true;
