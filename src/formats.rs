@@ -238,36 +238,38 @@ pub fn csv() -> Graph {
 /// Stream marking every byte preceded by an odd-length run of the escape
 /// byte — i.e. the positions an escape actually applies to.
 ///
-/// This is the simdjson odd-backslash-run algorithm. Run starts are split by
-/// position parity (even/odd bit constants); adding the run mask to its
-/// starts makes a carry ripple to the bit just past each run, and whether
-/// that landing bit's parity *changed* tells whether the run length was odd.
-/// `ShiftLeft1` and `Add` carries make runs spanning 64-byte blocks work
-/// unchanged.
+/// Same semantics as the classic simdjson odd-backslash-run algorithm, in
+/// a 9-node form DISCOVERED by `crate::synth`'s cost-weighted automatic
+/// abstraction search (`examples/synth_demo.rs`, "from scratch" rung),
+/// differentially verified against the hand derivation AND proven
+/// equivalent to the serial escape machine for all inputs by product-
+/// automaton reachability (`synth::prove`). It needs two carried states
+/// where the hand derivation needed three, and no run-start computation
+/// at all.
+///
+/// How it works: `marked` covers, within each escape run, the start bit
+/// when the run starts even plus every in-run odd position — so for an
+/// even-started run, `EVEN + marked` collides at the start bit and the
+/// carry rides the run's contiguous coverage to the landing byte, while
+/// an odd-started run interleaves with EVEN and launches no carry. At a
+/// landing position `p` the sum is therefore `EVEN[p]`, flipped iff the
+/// run started even — which is exactly "the run length was odd", since
+/// landing parity = start parity XOR length parity. Positions that are
+/// not landings read garbage from the sum (including a stray carry one
+/// past an even-length run) and are masked off by `follows`, the landing
+/// set. `ShiftLeft1` and `Add` carries make runs spanning 64-byte blocks
+/// work unchanged.
 fn escaped_positions(g: &mut Graph, escape_byte: u8) -> NodeId {
     const EVEN: u64 = 0x5555_5555_5555_5555;
 
-    let backslashes = g.class_byte(escape_byte);
-    let shifted = g.shift_left1(backslashes);
-    let not_shifted = g.not(shifted);
-    let starts = g.and(backslashes, not_shifted);
+    let escapes = g.class_byte(escape_byte);
+    let not_escapes = g.not(escapes);
+    let shifted = g.shift_left1(escapes);
+    let follows = g.and(not_escapes, shifted);
 
     let even_positions = g.constant(EVEN);
-    let odd_positions = g.constant(!EVEN);
-    let not_backslashes = g.not(backslashes);
-
-    // Runs starting on even positions: the bit just past the run (the first
-    // non-backslash) lands on an odd position iff the run length was odd.
-    let even_starts = g.and(starts, even_positions);
-    let even_carries = g.add(backslashes, even_starts);
-    let even_run_ends = g.and(even_carries, not_backslashes);
-    let odd_len_from_even = g.and(even_run_ends, odd_positions);
-
-    // Runs starting on odd positions: symmetric.
-    let odd_starts = g.and(starts, odd_positions);
-    let odd_carries = g.add(backslashes, odd_starts);
-    let odd_run_ends = g.and(odd_carries, not_backslashes);
-    let odd_len_from_odd = g.and(odd_run_ends, even_positions);
-
-    g.or(odd_len_from_even, odd_len_from_odd)
+    let phase = g.xor(even_positions, shifted);
+    let marked = g.and(escapes, phase);
+    let sums = g.add(even_positions, marked);
+    g.and(follows, sums)
 }

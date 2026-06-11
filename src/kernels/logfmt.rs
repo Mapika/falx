@@ -10,7 +10,7 @@
 
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
-const CARRY_INIT: [u64; 4] = [0, 0, 0, 0];
+const CARRY_INIT: [u64; 3] = [0, 0, 0];
 
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
@@ -292,7 +292,7 @@ pub struct StreamParser {
     emitted: usize,
     emitted_seps: usize,
     record_start: usize,
-    carries: [u64; 4],
+    carries: [u64; 3],
 }
 
 /// Create a [`StreamParser`].
@@ -400,7 +400,7 @@ impl StreamParser {
     }
 }
 
-fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 3], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -412,7 +412,7 @@ fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 4], base: u32, s
     fallback::index_tape_partial(data, carries, base, seps, ends);
 }
 
-fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 3], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -525,7 +525,7 @@ pub mod fallback {
 
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
-    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 3], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
@@ -538,40 +538,33 @@ pub mod fallback {
 
     /// Index one final zero-padded block (end-of-stream only); `live`
     /// masks off the padding bits.
-    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 3], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
         let (mask, term) = step(block, carries);
         push_tape(mask & live, term & live, base, seps, ends);
     }
 
     #[inline]
-    fn step(block: &[u8; 64], carries: &mut [u64; 4]) -> (u64, u64) {
+    fn step(block: &[u8; 64], carries: &mut [u64; 3]) -> (u64, u64) {
         let v0 = eq_mask(block, 10u8); // class "\n"
         let v1 = eq_mask(block, 32u8) | eq_mask(block, 61u8); // class " ="
         let v2 = v1 | v0;
         let v3 = eq_mask(block, 34u8); // class "\""
         let v4 = eq_mask(block, 92u8); // class "\\"
-        let v5 = { let shifted = (v4 << 1) | carries[0]; carries[0] = v4 >> 63; shifted };
-        let v6 = !v5;
-        let v7 = v4 & v6;
+        let v5 = !v4;
+        let v6 = { let shifted = (v4 << 1) | carries[0]; carries[0] = v4 >> 63; shifted };
+        let v7 = v5 & v6;
         let v8 = 0x5555555555555555u64;
-        let v9 = 0xaaaaaaaaaaaaaaaau64;
-        let v10 = !v4;
-        let v11 = v7 & v8;
-        let v12 = { let (partial, c1) = v4.overflowing_add(v11); let (sum, c2) = partial.overflowing_add(carries[1]); carries[1] = (c1 | c2) as u64; sum };
-        let v13 = v12 & v10;
-        let v14 = v13 & v9;
-        let v15 = v7 & v9;
-        let v16 = { let (partial, c1) = v4.overflowing_add(v15); let (sum, c2) = partial.overflowing_add(carries[2]); carries[2] = (c1 | c2) as u64; sum };
-        let v17 = v16 & v10;
-        let v18 = v17 & v8;
-        let v19 = v14 | v18;
-        let v20 = !v19;
-        let v21 = v3 & v20;
-        let v22 = { let parity = prefix_xor(v21) ^ carries[3]; carries[3] = ((parity as i64) >> 63) as u64; parity };
-        let v23 = !v22;
-        let v24 = v2 & v23;
-        (v24, v24 & v0)
+        let v9 = v8 ^ v6;
+        let v10 = v4 & v9;
+        let v11 = { let (partial, c1) = v8.overflowing_add(v10); let (sum, c2) = partial.overflowing_add(carries[1]); carries[1] = (c1 | c2) as u64; sum };
+        let v12 = v7 & v11;
+        let v13 = !v12;
+        let v14 = v3 & v13;
+        let v15 = { let parity = prefix_xor(v14) ^ carries[2]; carries[2] = ((parity as i64) >> 63) as u64; parity };
+        let v16 = !v15;
+        let v17 = v2 & v16;
+        (v17, v17 & v0)
     }
 
     #[inline]
@@ -687,7 +680,7 @@ mod avx2 {
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 3], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
@@ -701,7 +694,7 @@ mod avx2 {
     /// Index one final zero-padded block (end-of-stream only); `live`
     /// masks off the padding bits.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 4], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 3], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
         // SAFETY: block is a readable 64-byte buffer.
         let (mask, term) = unsafe { step(block.as_ptr(), carries) };
@@ -709,7 +702,7 @@ mod avx2 {
     }
 
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    unsafe fn step(ptr: *const u8, carries: &mut [u64; 4]) -> (u64, u64) {
+    unsafe fn step(ptr: *const u8, carries: &mut [u64; 3]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
         let (lo, hi) = unsafe {
             (
@@ -722,27 +715,20 @@ mod avx2 {
         let v2 = v1 | v0;
         let v3 = eq_mask(lo, hi, 34u8); // class "\""
         let v4 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v5 = { let shifted = (v4 << 1) | carries[0]; carries[0] = v4 >> 63; shifted };
-        let v6 = !v5;
-        let v7 = v4 & v6;
+        let v5 = !v4;
+        let v6 = { let shifted = (v4 << 1) | carries[0]; carries[0] = v4 >> 63; shifted };
+        let v7 = v5 & v6;
         let v8 = 0x5555555555555555u64;
-        let v9 = 0xaaaaaaaaaaaaaaaau64;
-        let v10 = !v4;
-        let v11 = v7 & v8;
-        let v12 = { let (partial, c1) = v4.overflowing_add(v11); let (sum, c2) = partial.overflowing_add(carries[1]); carries[1] = (c1 | c2) as u64; sum };
-        let v13 = v12 & v10;
-        let v14 = v13 & v9;
-        let v15 = v7 & v9;
-        let v16 = { let (partial, c1) = v4.overflowing_add(v15); let (sum, c2) = partial.overflowing_add(carries[2]); carries[2] = (c1 | c2) as u64; sum };
-        let v17 = v16 & v10;
-        let v18 = v17 & v8;
-        let v19 = v14 | v18;
-        let v20 = !v19;
-        let v21 = v3 & v20;
-        let v22 = { let parity = prefix_xor(v21) ^ carries[3]; carries[3] = ((parity as i64) >> 63) as u64; parity };
-        let v23 = !v22;
-        let v24 = v2 & v23;
-        (v24, v24 & v0)
+        let v9 = v8 ^ v6;
+        let v10 = v4 & v9;
+        let v11 = { let (partial, c1) = v8.overflowing_add(v10); let (sum, c2) = partial.overflowing_add(carries[1]); carries[1] = (c1 | c2) as u64; sum };
+        let v12 = v7 & v11;
+        let v13 = !v12;
+        let v14 = v3 & v13;
+        let v15 = { let parity = prefix_xor(v14) ^ carries[2]; carries[2] = ((parity as i64) >> 63) as u64; parity };
+        let v16 = !v15;
+        let v17 = v2 & v16;
+        (v17, v17 & v0)
     }
 
     #[target_feature(enable = "avx2")]
