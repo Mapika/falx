@@ -625,7 +625,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
     if let Some(dialect) = dialect {
         push_span_api(&mut code, dialect, carry_count);
         if !columns.is_empty() {
-            push_columns_api(&mut code, columns, par_mode);
+            push_columns_api(&mut code, dialect, columns, par_mode);
         }
     }
 
@@ -1058,7 +1058,12 @@ impl<'p> Iterator for Fields<'p> {
 /// values Vec plus an Arrow-style validity bitmap per declared column,
 /// filled by walking the structural tape so unrequested fields are never
 /// read, cleaned, or copied.
-fn push_columns_api(code: &mut String, columns: &[Column], par_mode: bool) {
+fn push_columns_api(
+    code: &mut String,
+    dialect: &crate::formats::Dialect,
+    columns: &[Column],
+    par_mode: bool,
+) {
     let any_i64 = columns.iter().any(|c| c.ty == ColumnType::I64);
     let any_f64 = columns.iter().any(|c| c.ty == ColumnType::F64);
     let any_bytes = columns.iter().any(|c| c.ty == ColumnType::Bytes);
@@ -1128,38 +1133,34 @@ fn push_columns_api(code: &mut String, columns: &[Column], par_mode: bool) {
         let _ = writeln!(code, "            self.{}_valid.push(0);", column.field_name());
     }
     code.push_str("        }\n");
+    // Branchless row conversion: every column unconditionally pushes a
+    // value (placeholder where invalid) and ORs its validity bit, so the
+    // only data-dependent branches left are inside cell parsing itself.
     for column in columns {
         let name = column.field_name();
         let idx = column.index;
         let body = match column.ty {
             ColumnType::I64 | ColumnType::F64 => {
+                // The *_field wrappers skip Cow construction for unquoted
+                // cells (the overwhelming majority).
                 let parser = if column.ty == ColumnType::I64 {
-                    "parse_i64_cell"
+                    if dialect.quote.is_some() { "parse_i64_field" } else { "parse_i64_cell" }
+                } else if dialect.quote.is_some() {
+                    "parse_f64_field"
                 } else {
                     "parse_f64_cell"
                 };
                 let zero = column.zero();
                 format!(
-                    "        match record.field_raw({idx}).map(clean) {{\n\
-                     \x20           Some(cell) => match {parser}(&cell) {{\n\
-                     \x20               Some(v) => {{\n\
-                     \x20                   self.{name}.push(v);\n\
-                     \x20                   self.{name}_valid[row >> 6] |= 1 << (row & 63);\n\
-                     \x20               }}\n\
-                     \x20               None => self.{name}.push({zero}),\n\
-                     \x20           }},\n\
-                     \x20           None => self.{name}.push({zero}),\n\
-                     \x20       }}\n"
+                    "        let v = record.field_raw({idx}).and_then({parser});\n\
+                     \x20       self.{name}.push(v.unwrap_or({zero}));\n\
+                     \x20       self.{name}_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);\n"
                 )
             }
             ColumnType::Bytes => format!(
-                "        match record.field_span({idx}) {{\n\
-                 \x20           Some((from, to)) if from != to => {{\n\
-                 \x20               self.{name}.push((from, to));\n\
-                 \x20               self.{name}_valid[row >> 6] |= 1 << (row & 63);\n\
-                 \x20           }}\n\
-                 \x20           _ => self.{name}.push((0, 0)),\n\
-                 \x20       }}\n"
+                "        let s = record.field_span({idx}).filter(|&(from, to)| from != to);\n\
+                 \x20       self.{name}.push(s.unwrap_or((0, 0)));\n\
+                 \x20       self.{name}_valid[row >> 6] |= (s.is_some() as u64) << (row & 63);\n"
             ),
         };
         code.push_str(&body);
@@ -1270,6 +1271,33 @@ fn push_columns_api(code: &mut String, columns: &[Column], par_mode: bool) {
     }
     if any_f64 {
         code.push_str(FLOAT_CELL_TPL);
+    }
+    // Quoted dialects get a raw-span wrapper per numeric type: the
+    // unquoted common case parses in place without constructing a Cow,
+    // quoted cells are cleaned first. (Quoteless dialects call the cell
+    // parsers directly.)
+    if let Some(q) = dialect.quote {
+        for (cond, ty, parser) in [
+            (any_i64, "i64", "parse_i64_cell"),
+            (any_f64, "f64", "parse_f64_cell"),
+        ] {
+            if cond {
+                let _ = write!(
+                    code,
+                    "/// Parse a numeric cell from its raw field span; only quoted\n\
+                     /// cells pay for cleaning.\n\
+                     #[inline]\n\
+                     fn {parser_field}(raw: &[u8]) -> Option<{ty}> {{\n\
+                     \x20   if raw.first() == Some(&{q}u8) {{\n\
+                     \x20       {parser}(&clean(raw))\n\
+                     \x20   }} else {{\n\
+                     \x20       {parser}(raw)\n\
+                     \x20   }}\n\
+                     }}\n\n",
+                    parser_field = parser.replace("_cell", "_field"),
+                );
+            }
+        }
     }
 }
 

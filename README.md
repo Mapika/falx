@@ -86,10 +86,10 @@ are the honest figure):
 
 | | 64 MiB synthetic | worldcitiespop.csv (144 MiB) |
 |---|---|---|
-| falx `parse_columns` | 0.82 GiB/s | 0.98 GiB/s |
-| falx `parse_columns_par` (16 threads) | **1.45 GiB/s** | **1.94 GiB/s** |
-| csv crate + `str::parse` | 0.41 GiB/s | 0.53 GiB/s |
-| arrow-csv (projection enabled) | 0.49 GiB/s | 0.62 GiB/s |
+| falx `parse_columns` | 0.80 GiB/s | 1.04 GiB/s |
+| falx `parse_columns_par` (16 threads) | **1.40 GiB/s** | **1.89 GiB/s** |
+| csv crate + `str::parse` | 0.42 GiB/s | 0.52 GiB/s |
+| arrow-csv (projection enabled) | 0.49 GiB/s | 0.59 GiB/s |
 
 All four contenders agree exactly on valid-row counts and value checksums
 (`cargo run --release --example bench_columns`). The output layout *is*
@@ -100,10 +100,13 @@ Caveats, stated plainly: arrow-csv is benchmarked with projection enabled
 (its like-for-like configuration) but still materializes through its own
 record reader; the parallel speedup tops out near 2x here because the
 structural tape build is already memory-bandwidth-bound on this machine
-(stage breakdown: on worldcitiespop, 60 ms of the 144 ms serial total is
-tape construction, and 16 hyperthreads lose to 8 cores). Float conversion
-costs ~12 ns/cell via the Clinger fast path; SWAR digit scanning
-([#8](https://github.com/Mapika/falx/issues/8)) is the known headroom.
+(stage breakdown: on worldcitiespop, ~61 ms of the 136 ms serial total is
+tape construction, and 16 hyperthreads lose to 8 cores). Float parsing
+runs ~8 ns/cell at the scalar frontier — SWAR digit scanning was
+prototyped and measured slower on real short-mantissa data (closed
+[#8](https://github.com/Mapika/falx/issues/8) has the numbers); the
+remaining structural headroom is a projection-fused tape driver
+([#10](https://github.com/Mapika/falx/issues/10)).
 
 ### Versus the real simdjson (C++)
 

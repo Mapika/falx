@@ -579,26 +579,12 @@ impl<'a> Columns<'a> {
             self.latitude_valid.push(0);
             self.longitude_valid.push(0);
         }
-        match record.field_raw(5).map(clean) {
-            Some(cell) => match parse_f64_cell(&cell) {
-                Some(v) => {
-                    self.latitude.push(v);
-                    self.latitude_valid[row >> 6] |= 1 << (row & 63);
-                }
-                None => self.latitude.push(0.0),
-            },
-            None => self.latitude.push(0.0),
-        }
-        match record.field_raw(6).map(clean) {
-            Some(cell) => match parse_f64_cell(&cell) {
-                Some(v) => {
-                    self.longitude.push(v);
-                    self.longitude_valid[row >> 6] |= 1 << (row & 63);
-                }
-                None => self.longitude.push(0.0),
-            },
-            None => self.longitude.push(0.0),
-        }
+        let v = record.field_raw(5).and_then(parse_f64_field);
+        self.latitude.push(v.unwrap_or(0.0));
+        self.latitude_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
+        let v = record.field_raw(6).and_then(parse_f64_field);
+        self.longitude.push(v.unwrap_or(0.0));
+        self.longitude_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
         self.rows = row + 1;
     }
 }
@@ -766,6 +752,17 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
 #[cold]
 fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
     std::str::from_utf8(s).ok()?.parse::<f64>().ok()
+}
+
+/// Parse a numeric cell from its raw field span; only quoted
+/// cells pay for cleaning.
+#[inline]
+fn parse_f64_field(raw: &[u8]) -> Option<f64> {
+    if raw.first() == Some(&34u8) {
+        parse_f64_cell(&clean(raw))
+    } else {
+        parse_f64_cell(raw)
+    }
 }
 
 /// Portable kernel, public so the dispatch-bypassed path stays testable.

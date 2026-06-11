@@ -592,33 +592,15 @@ impl<'a> Columns<'a> {
             self.value_valid.push(0);
             self.label_valid.push(0);
         }
-        match record.field_raw(0).map(clean) {
-            Some(cell) => match parse_i64_cell(&cell) {
-                Some(v) => {
-                    self.id.push(v);
-                    self.id_valid[row >> 6] |= 1 << (row & 63);
-                }
-                None => self.id.push(0),
-            },
-            None => self.id.push(0),
-        }
-        match record.field_raw(2).map(clean) {
-            Some(cell) => match parse_f64_cell(&cell) {
-                Some(v) => {
-                    self.value.push(v);
-                    self.value_valid[row >> 6] |= 1 << (row & 63);
-                }
-                None => self.value.push(0.0),
-            },
-            None => self.value.push(0.0),
-        }
-        match record.field_span(4) {
-            Some((from, to)) if from != to => {
-                self.label.push((from, to));
-                self.label_valid[row >> 6] |= 1 << (row & 63);
-            }
-            _ => self.label.push((0, 0)),
-        }
+        let v = record.field_raw(0).and_then(parse_i64_field);
+        self.id.push(v.unwrap_or(0));
+        self.id_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
+        let v = record.field_raw(2).and_then(parse_f64_field);
+        self.value.push(v.unwrap_or(0.0));
+        self.value_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
+        let s = record.field_span(4).filter(|&(from, to)| from != to);
+        self.label.push(s.unwrap_or((0, 0)));
+        self.label_valid[row >> 6] |= (s.is_some() as u64) << (row & 63);
         self.rows = row + 1;
     }
 }
@@ -851,6 +833,28 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
 #[cold]
 fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
     std::str::from_utf8(s).ok()?.parse::<f64>().ok()
+}
+
+/// Parse a numeric cell from its raw field span; only quoted
+/// cells pay for cleaning.
+#[inline]
+fn parse_i64_field(raw: &[u8]) -> Option<i64> {
+    if raw.first() == Some(&34u8) {
+        parse_i64_cell(&clean(raw))
+    } else {
+        parse_i64_cell(raw)
+    }
+}
+
+/// Parse a numeric cell from its raw field span; only quoted
+/// cells pay for cleaning.
+#[inline]
+fn parse_f64_field(raw: &[u8]) -> Option<f64> {
+    if raw.first() == Some(&34u8) {
+        parse_f64_cell(&clean(raw))
+    } else {
+        parse_f64_cell(raw)
+    }
 }
 
 /// Portable kernel, public so the dispatch-bypassed path stays testable.
