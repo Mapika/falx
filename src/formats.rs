@@ -180,6 +180,13 @@ pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
         match dialect.escape {
             Escape::None => quotes,
             Escape::Backslash(escape_byte) => {
+                // The escaped stream is only meaningful at non-escape
+                // bytes; ANDing with the quote class is what discharges
+                // that contract, so the two bytes must differ.
+                assert_ne!(
+                    quote, escape_byte,
+                    "quote and escape byte must differ for backslash escaping"
+                );
                 let escaped = escaped_positions(&mut g, escape_byte);
                 let not_escaped = g.not(escaped);
                 g.and(quotes, not_escaped)
@@ -236,40 +243,37 @@ pub fn csv() -> Graph {
 }
 
 /// Stream marking every byte preceded by an odd-length run of the escape
-/// byte — i.e. the positions an escape actually applies to.
+/// byte — i.e. the positions an escape actually applies to — VALID ONLY
+/// AT NON-ESCAPE POSITIONS. At escape bytes themselves the stream is
+/// unspecified; the sole consumer ANDs it (negated) with the quote class,
+/// and a quote is never an escape byte (asserted by the caller).
 ///
-/// Same semantics as the classic simdjson odd-backslash-run algorithm, in
-/// a 9-node form DISCOVERED by `crate::synth`'s cost-weighted automatic
-/// abstraction search (`examples/synth_demo.rs`, "from scratch" rung),
-/// differentially verified against the hand derivation AND proven
-/// equivalent to the serial escape machine for all inputs by product-
-/// automaton reachability (`synth::prove`). It needs two carried states
-/// where the hand derivation needed three, and no run-start computation
-/// at all.
+/// This is a 6-node don't-care form DISCOVERED by `crate::synth` when the
+/// spec constrains only the positions the consumer reads
+/// (`examples/synth_demo.rs`, don't-care rung), and PROVEN exact at every
+/// non-escape position by product-automaton reachability — the test
+/// `dont_care_escape_form_is_exact_on_non_escape_bytes` proves
+/// `Not(escapes) & form` equal to the serial escape machine for all
+/// inputs, which licenses any non-escape-byte consumer. The previous
+/// synthesized form needed 9 nodes (and the original hand derivation 16)
+/// because exact equality everywhere forces a landing-set gate; with the
+/// don't-care the gate disappears entirely.
 ///
-/// How it works: `marked` covers, within each escape run, the start bit
-/// when the run starts even plus every in-run odd position — so for an
-/// even-started run, `EVEN + marked` collides at the start bit and the
-/// carry rides the run's contiguous coverage to the landing byte, while
-/// an odd-started run interleaves with EVEN and launches no carry. At a
-/// landing position `p` the sum is therefore `EVEN[p]`, flipped iff the
-/// run started even — which is exactly "the run length was odd", since
-/// landing parity = start parity XOR length parity. Positions that are
-/// not landings read garbage from the sum (including a stray carry one
-/// past an even-length run) and are masked off by `follows`, the landing
-/// set. `ShiftLeft1` and `Add` carries make runs spanning 64-byte blocks
-/// work unchanged.
+/// How it works: `Xor(escapes, EVEN)` clears even-position bits inside
+/// escape runs and sets them at even non-escape positions; adding EVEN
+/// back makes each escape run either collide-and-carry or interleave
+/// depending on its start parity, so the borrow ripple delivers run-length
+/// parity to the byte just past every run, where the final XOR against
+/// EVEN (via the complement) extracts it. Bits at escape positions are
+/// arithmetic debris — don't-cares by contract. The `Add` carry makes runs
+/// spanning 64-byte blocks work unchanged.
 fn escaped_positions(g: &mut Graph, escape_byte: u8) -> NodeId {
     const EVEN: u64 = 0x5555_5555_5555_5555;
 
     let escapes = g.class_byte(escape_byte);
-    let not_escapes = g.not(escapes);
-    let shifted = g.shift_left1(escapes);
-    let follows = g.and(not_escapes, shifted);
-
     let even_positions = g.constant(EVEN);
-    let phase = g.xor(even_positions, shifted);
-    let marked = g.and(escapes, phase);
-    let sums = g.add(even_positions, marked);
-    g.and(follows, sums)
+    let phase = g.xor(escapes, even_positions);
+    let sums = g.add(even_positions, phase);
+    let inverted = g.not(sums);
+    g.xor(even_positions, inverted)
 }

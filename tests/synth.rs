@@ -282,3 +282,30 @@ fn from_scratch_discovery_stays_green() {
         }
     }
 }
+
+/// The 6-node don't-care escape form is exact at EVERY non-escape
+/// position, not just quote bytes: masking it by `Not(B)` must equal the
+/// serial escape machine for all inputs. This is the proof that makes it
+/// safe as `escaped_positions` for any consumer that reads non-escape
+/// bytes (the quote class, whatever the quote byte is).
+#[test]
+fn dont_care_escape_form_is_exact_on_non_escape_bytes() {
+    let mut g = Graph::new();
+    let b = g.class_byte(b'\\');
+    let not_b = g.not(b);
+    let even = g.constant(EVEN);
+    let x = g.xor(b, even);
+    let sum = g.add(even, x);
+    let inv = g.not(sum);
+    let form = g.xor(even, inv);
+    let masked = g.and(not_b, form);
+    g.set_output(masked);
+    let step = |state: u32, byte: u8| -> (u32, bool) {
+        if byte == b'\\' { (state ^ 1, false) } else { (0, state == 1) }
+    };
+    match prove(&g, &Fsm { initial: 0, step: &step }) {
+        ProveOutcome::Proven(proof) => assert!(proof.product_states <= 1024),
+        ProveOutcome::Refuted(witness) => panic!("refuted by {witness:?}"),
+        ProveOutcome::Aborted { explored } => panic!("aborted at {explored}"),
+    }
+}
