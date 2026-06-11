@@ -5,6 +5,7 @@
 
 use falx::ir::Graph;
 use falx::synth::{
+    Order,
     AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, Outcome, ProveOutcome, Spec,
     prove, synthesize, synthesize_auto,
 };
@@ -127,11 +128,12 @@ fn assisted_escape_rediscovery_stays_green() {
         &escape_corpus,
         &Spec::exact(&escaped_reference),
         &Budget {
-            max_tree_size: 9,
+            max_level: 9,
             max_candidates: 50_000_000,
             max_bank: 2_000_000,
-            settle_sizes: 0,
+            settle_levels: 0,
             cost: CostModel::avx2(),
+        order: Order::TreeSize,
             progress: false,
         },
     );
@@ -146,7 +148,7 @@ fn assisted_escape_rediscovery_stays_green() {
         Outcome::NotFound(stats) => {
             panic!(
                 "synthesizer failed: exhausted to tree size {}, {} candidates, {} bank terms",
-                stats.completed_size, stats.candidates, stats.bank_unique
+                stats.completed_level, stats.candidates, stats.bank_unique
             );
         }
     }
@@ -194,11 +196,12 @@ fn found_escape_kernel_is_proven() {
         &escape_corpus,
         &Spec::exact(&escaped_reference),
         &Budget {
-            max_tree_size: 9,
+            max_level: 9,
             max_candidates: 50_000_000,
             max_bank: 2_000_000,
-            settle_sizes: 0,
+            settle_levels: 0,
             cost: CostModel::avx2(),
+        order: Order::TreeSize,
             progress: false,
         },
     );
@@ -259,11 +262,12 @@ fn from_scratch_discovery_stays_green() {
         &AutoBudget {
             rounds: 4,
             per_round: Budget {
-                max_tree_size: 9,
+                max_level: 9,
                 max_candidates: 250_000_000,
                 max_bank: 4_000_000,
-                settle_sizes: 1,
+                settle_levels: 1,
                 cost: CostModel::avx2(),
+        order: Order::TreeSize,
                 progress: false,
             },
             promotions: 8,

@@ -12,8 +12,8 @@
 use falx::interp;
 use falx::ir::Graph;
 use falx::synth::{
-    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, Outcome, ProveOutcome,
-    Solution, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
+    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, Order, Outcome,
+    ProveOutcome, Solution, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
 };
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
@@ -80,13 +80,14 @@ fn mask_ref(data: &[u8], mut f: impl FnMut(u8) -> bool) -> Vec<u64> {
     masks
 }
 
-fn budget(max_tree_size: usize, max_candidates: u64, progress: bool) -> Budget {
+fn budget(max_level: usize, max_candidates: u64, progress: bool) -> Budget {
     Budget {
-        max_tree_size,
+        max_level,
         max_candidates,
         max_bank: 4_000_000,
-        settle_sizes: 1,
+        settle_levels: 1,
         cost: CostModel::avx2(),
+        order: Order::TreeSize,
         progress,
     }
 }
@@ -121,8 +122,8 @@ fn report(name: &str, spec: &str, outcome: Outcome) -> Option<Solution> {
         }
         Outcome::NotFound(stats) => {
             println!(
-                "  NOT FOUND through tree size {} — {} candidates, {} distinct terms, {:.1}s",
-                stats.completed_size,
+                "  NOT FOUND through level {} — {} candidates, {} distinct terms, {:.1}s",
+                stats.completed_level,
                 stats.candidates,
                 stats.bank_unique,
                 stats.elapsed_ms as f64 / 1000.0,
@@ -447,11 +448,12 @@ fn main() {
     let auto = AutoBudget {
         rounds: 4,
         per_round: Budget {
-            max_tree_size: 9,
+            max_level: 9,
             max_candidates: 250_000_000,
             max_bank: 4_000_000,
-            settle_sizes: 1,
+            settle_levels: 1,
             cost: CostModel::avx2(),
+            order: Order::TreeSize,
             progress: false,
         },
         promotions: 8,
@@ -469,9 +471,9 @@ fn main() {
     };
     for r in &reports {
         println!(
-            "  round {}: exhausted at tree size {} ({} candidates, {} distinct terms, {:.1}s); promoted:",
+            "  round {}: exhausted at level {} ({} candidates, {} distinct terms, {:.1}s); promoted:",
             r.round,
-            r.stats.completed_size,
+            r.stats.completed_level,
             r.stats.candidates,
             r.stats.bank_unique,
             r.stats.elapsed_ms as f64 / 1000.0,
@@ -508,6 +510,8 @@ fn main() {
     println!("  The only consumer of this stream is `quotes & !escaped`, so the spec");
     println!("  now constrains it at '\"' bytes ONLY; everywhere else is a free bit.");
     println!("  Don't-cares admit smaller circuits than any exact-equality form.");
+    println!("  This rung runs COST-ORDERED (Dijkstra over tree cost): cheap forms");
+    println!("  surface first, expensive subtrees are implicitly deprioritized.");
     let care_outcome = synthesize(
         &[
             Leaf::class("B", b"\\"),
@@ -517,7 +521,15 @@ fn main() {
         ],
         &escape_corpus,
         &Spec::with_care(&escaped_reference, &|data| mask_ref(data, |b| b == b'"')),
-        &budget(10, 600_000_000, false),
+        &Budget {
+            max_level: 14,
+            max_candidates: 50_000_000,
+            max_bank: 2_000_000,
+            settle_levels: 2,
+            cost: CostModel::avx2(),
+            order: Order::Cost,
+            progress: false,
+        },
     );
     if let Some(sol) = report("escaped positions, quote-only care (continued)", "as above", care_outcome)
     {

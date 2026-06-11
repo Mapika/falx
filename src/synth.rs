@@ -139,25 +139,94 @@ pub fn graph_cost(graph: &Graph, model: &CostModel) -> u32 {
         .sum()
 }
 
-/// Search limits. Enumeration is exhaustive in expression-tree size until a
-/// limit trips, so a [`Outcome::NotFound`] reports exactly how far the
-/// frontier got.
+/// What "level" means during enumeration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// Levels are expression-tree node counts: classic size-ordered
+    /// bottom-up enumeration.
+    TreeSize,
+    /// Levels are expression-tree COSTS under the budget's cost model:
+    /// Dijkstra-style enumeration. Cheap forms surface first and expensive
+    /// subtrees (PrefixXor-heavy) are implicitly deprioritized, so the
+    /// first verified match is already minimal in tree cost (graph cost
+    /// can still improve through sharing — keep a small settle window).
+    Cost,
+}
+
+/// Search limits. Enumeration is exhaustive in levels (tree size or tree
+/// cost, per `order`) until a limit trips, so a [`Outcome::NotFound`]
+/// reports exactly how far the frontier got.
 pub struct Budget {
-    /// Largest expression tree (leaves + ops, sharing not counted) to try.
-    pub max_tree_size: usize,
+    /// Largest level to enumerate: tree node count for
+    /// [`Order::TreeSize`], tree cost for [`Order::Cost`].
+    pub max_level: usize,
     /// Total candidate evaluations across the whole search.
     pub max_candidates: u64,
     /// Cap on behaviorally-distinct terms kept in the bank.
     pub max_bank: usize,
     /// After the first verified match, keep enumerating this many further
-    /// tree sizes collecting cheaper equivalents (0 = finish the current
-    /// size only). The first match is rarely the cheapest: the search
-    /// returns the best by `cost`.
-    pub settle_sizes: usize,
-    /// Cost model that ranks equivalent solutions.
+    /// levels collecting cheaper equivalents (0 = finish the current
+    /// level only).
+    pub settle_levels: usize,
+    /// Cost model that ranks equivalent solutions (and defines levels
+    /// under [`Order::Cost`]).
     pub cost: CostModel,
-    /// Print per-size search statistics to stderr.
+    /// Enumeration order.
+    pub order: Order,
+    /// Print per-level search statistics to stderr.
     pub progress: bool,
+}
+
+fn un_weight(op: UnOp, order: Order, model: &CostModel) -> usize {
+    match order {
+        Order::TreeSize => 1,
+        Order::Cost => match op {
+            UnOp::Not => model.bitwise as usize,
+            UnOp::Shl | UnOp::ShlSeed => model.shift as usize,
+            UnOp::PXor => model.prefix_xor as usize,
+        },
+    }
+}
+
+fn bin_weight(op: BinOp, order: Order, model: &CostModel) -> usize {
+    match order {
+        Order::TreeSize => 1,
+        Order::Cost => match op {
+            BinOp::And | BinOp::Or | BinOp::Xor => model.bitwise as usize,
+            BinOp::Add => model.add as usize,
+        },
+    }
+}
+
+fn leaf_level(leaf: &Leaf, order: Order, model: &CostModel) -> usize {
+    match order {
+        Order::TreeSize => 1,
+        Order::Cost => match &leaf.kind {
+            LeafKind::Class(_) => model.class as usize,
+            LeafKind::Const(_) => model.constant as usize,
+            LeafKind::Derived(graph) => graph_cost(graph, model) as usize,
+        },
+    }
+}
+
+/// Tree cost of a template body with the hole free (the weight its
+/// application adds on top of the child's level).
+fn ttree_weight(body: &TTree, leaves: &[Leaf], order: Order, model: &CostModel) -> usize {
+    match order {
+        Order::TreeSize => 1,
+        Order::Cost => match body {
+            TTree::Hole => 0,
+            TTree::Leaf(li) => leaf_level(&leaves[*li as usize], order, model),
+            TTree::Un(op, a) => {
+                un_weight(*op, order, model) + ttree_weight(a, leaves, order, model)
+            }
+            TTree::Bin(op, a, b) => {
+                bin_weight(*op, order, model)
+                    + ttree_weight(a, leaves, order, model)
+                    + ttree_weight(b, leaves, order, model)
+            }
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -166,8 +235,9 @@ pub struct Stats {
     pub candidates: u64,
     /// Behaviorally distinct terms banked.
     pub bank_unique: usize,
-    /// Largest tree size whose enumeration ran to completion.
-    pub completed_size: usize,
+    /// Largest level (tree size or tree cost, per the budget's order)
+    /// whose enumeration ran to completion.
+    pub completed_level: usize,
     /// CEGIS restarts (corpus extensions from verification failures).
     pub restarts: usize,
     /// The bank hit its cap: enumeration continued over the frozen bank
@@ -291,7 +361,7 @@ pub fn synthesize_multi(
     let stats = Stats {
         candidates: solutions.iter().map(|sol| sol.stats.candidates).sum(),
         bank_unique: solutions.iter().map(|sol| sol.stats.bank_unique).max().unwrap_or(0),
-        completed_size: solutions.iter().map(|sol| sol.stats.completed_size).min().unwrap_or(0),
+        completed_level: solutions.iter().map(|sol| sol.stats.completed_level).min().unwrap_or(0),
         restarts: solutions.iter().map(|sol| sol.stats.restarts).sum(),
         bank_saturated: solutions.iter().any(|sol| sol.stats.bank_saturated),
         elapsed_ms: solutions.iter().map(|sol| sol.stats.elapsed_ms).sum(),
@@ -936,7 +1006,28 @@ impl Hasher for FoldHasher {
 type SeenMap = HashMap<u128, (), BuildHasherDefault<FoldHasher>>;
 type LocalSeen = std::collections::HashSet<u128, BuildHasherDefault<FoldHasher>>;
 
-/// One thread's share of a size's candidate stream.
+/// One unit of parallel work: an operator applied over a stripe of the
+/// bank. Rows carry their operator because per-op level weights select
+/// different child levels under [`Order::Cost`].
+#[derive(Clone, Copy)]
+enum Row {
+    /// (op, left child level, left child index); right children span the
+    /// complementary level.
+    Bin(BinOp, usize, usize),
+    Un(UnOp, usize),
+    Tpl(u16, usize),
+}
+
+/// True expression-tree size of a term whose children are banked.
+fn term_size(bank: &[Entry], term: &Term) -> u16 {
+    match *term {
+        Term::Leaf(_) => 1,
+        Term::Un(_, a) | Term::Tpl(_, a) => 1 + bank[a as usize].size,
+        Term::Bin(_, a, b) => 1 + bank[a as usize].size + bank[b as usize].size,
+    }
+}
+
+/// One thread's share of a level's candidate stream.
 #[derive(Default)]
 struct ShardOut {
     count: u64,
@@ -1008,10 +1099,13 @@ struct Search<'a> {
     spec: &'a Spec<'a>,
     budget: &'a Budget,
     templates: &'a [Template],
+    /// Level weight each template application adds (precomputed per order).
+    template_weights: Vec<usize>,
     bank: Vec<Entry>,
     /// Arena of eval vectors, one corpus-length stripe per banked term.
     evals: Vec<u64>,
-    by_size: Vec<Vec<u32>>,
+    /// Banked terms grouped by level (tree size or tree cost, per order).
+    by_level: Vec<Vec<u32>>,
     seen: SeenMap,
     candidates: &'a mut u64,
     restarts: usize,
@@ -1073,9 +1167,13 @@ fn attempt(
         care,
         spec,
         budget,
+        template_weights: templates
+            .iter()
+            .map(|tpl| ttree_weight(&tpl.body, leaves, budget.order, &budget.cost))
+            .collect(),
         bank: Vec::new(),
         evals: Vec::new(),
-        by_size: vec![Vec::new(); budget.max_tree_size + 1],
+        by_level: vec![Vec::new(); budget.max_level + 1],
         seen: SeenMap::default(),
         candidates,
         restarts,
@@ -1118,51 +1216,90 @@ impl Search<'_> {
         let mut scratch = vec![0u64; self.corpus.total_blocks];
 
         for li in 0..self.leaves.len() {
+            let level = leaf_level(&self.leaves[li], self.budget.order, &self.budget.cost);
+            if level > self.budget.max_level {
+                continue; // Too expensive to ever appear in a solution.
+            }
             eval_leaf(&self.leaves[li], &self.corpus, &mut scratch);
-            if let Verdict::Stop(outcome) = self.consider(Term::Leaf(li as u16), &scratch, 1) {
+            if let Verdict::Stop(outcome) = self.consider(Term::Leaf(li as u16), &scratch, level)
+            {
                 return outcome;
             }
         }
-        self.progress(1);
 
-        for size in 2..=self.budget.max_tree_size {
-            if let Some(outcome) = self.enumerate_size(size, &mut scratch) {
+        for level in 1..=self.budget.max_level {
+            if let Some(outcome) = self.enumerate_level(level, &mut scratch) {
                 return outcome;
             }
-            self.progress(size);
-            // Settle: after the first verified match, finish settle_sizes
-            // further sizes hunting cheaper equivalents, then stop.
-            if let Some(found_size) = self.found_at
-                && size >= found_size + self.budget.settle_sizes
+            self.progress(level);
+            // Settle: after the first verified match, finish settle_levels
+            // further levels hunting cheaper equivalents, then stop.
+            if let Some(found_level) = self.found_at
+                && level >= found_level + self.budget.settle_levels
             {
                 break;
             }
         }
-        self.finish(self.budget.max_tree_size)
+        self.finish(self.budget.max_level)
     }
 
-    /// One whole tree size, enumerated in parallel: candidate rows are
+    /// One whole level, enumerated in parallel: candidate rows are
     /// sharded across threads, each shard evaluates/hashes/dedups against
     /// the FROZEN global map plus a local set, and a serial merge (in shard
     /// order, so bank layout stays deterministic) re-evaluates only the
     /// genuinely new terms into the arena. Shards never store eval vectors
     /// — only (hash, term) pairs — which is what keeps memory flat while
     /// the candidate stream is 10-50x larger than the survivor set.
-    fn enumerate_size(&mut self, size: usize, scratch: &mut [u64]) -> Option<RunOutcome> {
-        // Binary rows first, smallest left child first: deep right spines
-        // (common in real kernels) surface before the size completes.
-        let mut rows: Vec<(usize, usize)> = Vec::new(); // (s1, ii); s1 == 0 marks a unary row
+    ///
+    /// Rows carry their operator because under [`Order::Cost`] each op's
+    /// weight selects different child levels.
+    fn enumerate_level(&mut self, level: usize, scratch: &mut [u64]) -> Option<RunOutcome> {
+        let order = self.budget.order;
+        let model = self.budget.cost;
+        let mut rows: Vec<Row> = Vec::new();
         let mut weights: Vec<u64> = Vec::new();
-        for s1 in 1..=(size - 1) / 2 {
-            let s2 = size - 1 - s1;
-            for ii in 0..self.by_size[s1].len() {
-                rows.push((s1, ii));
-                weights.push(4 * self.by_size[s2].len() as u64);
+        // Binary rows, smallest left child first: deep right spines
+        // (common in real kernels) surface before the level completes.
+        for op in BIN_OPS {
+            let w = bin_weight(op, order, &model);
+            if w > level {
+                continue;
+            }
+            let rem = level - w;
+            for l1 in 0..=rem / 2 {
+                let l2 = rem - l1;
+                if l2 > self.budget.max_level {
+                    continue;
+                }
+                let n2 = self.by_level[l2].len() as u64;
+                if n2 == 0 {
+                    continue;
+                }
+                for ii in 0..self.by_level[l1].len() {
+                    rows.push(Row::Bin(op, l1, ii));
+                    weights.push(n2);
+                }
             }
         }
-        for ci in 0..self.by_size[size - 1].len() {
-            rows.push((0, ci));
-            weights.push(4);
+        for op in UN_OPS {
+            let w = un_weight(op, order, &model);
+            if w > level {
+                continue;
+            }
+            for ii in 0..self.by_level[level - w].len() {
+                rows.push(Row::Un(op, ii));
+                weights.push(1);
+            }
+        }
+        for ti in 0..self.templates.len() {
+            let w = self.template_weights[ti];
+            if w == 0 || w > level {
+                continue;
+            }
+            for ii in 0..self.by_level[level - w].len() {
+                rows.push(Row::Tpl(ti as u16, ii));
+                weights.push(1);
+            }
         }
 
         const BATCH: u64 = 2_000_000;
@@ -1176,18 +1313,18 @@ impl Search<'_> {
                 batch_weight += weights[end];
                 end += 1;
             }
-            let outs = self.evaluate_rows(size, &rows[row..end]);
+            let outs = self.evaluate_rows(level, &rows[row..end]);
             row = end;
 
             *self.candidates += outs.iter().map(|out| out.count).sum::<u64>();
             if *self.candidates > self.budget.max_candidates {
-                return Some(self.finish(size.saturating_sub(1)));
+                return Some(self.finish(level.saturating_sub(1)));
             }
             for out in &outs {
                 for &(hash, term) in &out.fresh {
                     // A full bank freezes admissions but NOT the search:
                     // deeper matches only need already-banked children, so
-                    // aborting here would throw away exactly the sizes
+                    // aborting here would throw away exactly the levels
                     // where solutions live.
                     if self.bank.len() >= self.budget.max_bank {
                         break;
@@ -1198,15 +1335,16 @@ impl Search<'_> {
                         slot.insert(());
                         eval_term(self.leaves, self.templates, &self.evals, &self.corpus, term, scratch);
                         let idx = self.bank.len() as u32;
-                        self.bank.push(Entry { term, size: size as u16 });
+                        let size = term_size(&self.bank, &term);
+                        self.bank.push(Entry { term, size });
                         self.evals.extend_from_slice(scratch);
-                        self.by_size[size].push(idx);
+                        self.by_level[level].push(idx);
                     }
                 }
             }
             for out in outs {
                 for term in out.matches {
-                    if let Some(witness) = self.handle_match(term, size) {
+                    if let Some(witness) = self.handle_match(term, level) {
                         return Some(RunOutcome::Counterexample(witness));
                     }
                 }
@@ -1217,18 +1355,21 @@ impl Search<'_> {
 
     /// Parallel phase: evaluate every candidate in the given rows. Returns
     /// one shard output per thread, in deterministic shard order.
-    fn evaluate_rows(&self, size: usize, rows: &[(usize, usize)]) -> Vec<ShardOut> {
+    fn evaluate_rows(&self, level: usize, rows: &[Row]) -> Vec<ShardOut> {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
         let total: u64 = rows.len() as u64;
         let per_shard = total.div_ceil(threads as u64).max(1) as usize;
+        let order = self.budget.order;
+        let model = self.budget.cost;
         let corpus = &self.corpus;
         let evals = &self.evals;
-        let by_size = &self.by_size;
+        let by_level = &self.by_level;
         let seen = &self.seen;
         let target = &self.target;
         let care = self.care.as_deref();
         let leaves = self.leaves;
         let templates = self.templates;
+        let template_weights = &self.template_weights;
         let eval_len = corpus.total_blocks;
         std::thread::scope(|scope| {
             let handles: Vec<_> = rows
@@ -1251,24 +1392,30 @@ impl Search<'_> {
                                 out.fresh.push((hash, term));
                             }
                         };
-                        for &(s1, ii) in chunk {
-                            if s1 == 0 {
-                                let child = by_size[size - 1][ii];
-                                for op in UN_OPS {
+                        for &row in chunk {
+                            match row {
+                                Row::Un(op, ii) => {
+                                    let child =
+                                        by_level[level - un_weight(op, order, &model)][ii];
                                     eval_un(op, eval_of(child), corpus, &mut scratch);
                                     emit(Term::Un(op, child), &scratch, &mut out);
                                 }
-                                for (ti, tpl) in templates.iter().enumerate() {
-                                    let applied =
-                                        eval_ttree(&tpl.body, leaves, corpus, eval_of(child));
-                                    emit(Term::Tpl(ti as u16, child), &applied, &mut out);
+                                Row::Tpl(ti, ii) => {
+                                    let child =
+                                        by_level[level - template_weights[ti as usize]][ii];
+                                    let applied = eval_ttree(
+                                        &templates[ti as usize].body,
+                                        leaves,
+                                        corpus,
+                                        eval_of(child),
+                                    );
+                                    emit(Term::Tpl(ti, child), &applied, &mut out);
                                 }
-                            } else {
-                                let s2 = size - 1 - s1;
-                                let i = by_size[s1][ii];
-                                let jj_start = if s1 == s2 { ii } else { 0 };
-                                for &j in &by_size[s2][jj_start..] {
-                                    for op in BIN_OPS {
+                                Row::Bin(op, l1, ii) => {
+                                    let l2 = level - bin_weight(op, order, &model) - l1;
+                                    let i = by_level[l1][ii];
+                                    let jj_start = if l1 == l2 { ii } else { 0 };
+                                    for &j in &by_level[l2][jj_start..] {
                                         eval_bin(op, eval_of(i), eval_of(j), corpus, &mut scratch);
                                         emit(Term::Bin(op, i, j), &scratch, &mut out);
                                     }
@@ -1285,8 +1432,8 @@ impl Search<'_> {
 
     /// Terminal outcome: the best verified solution if one exists (with
     /// alternates attached), otherwise exhaustion.
-    fn finish(&mut self, completed_size: usize) -> RunOutcome {
-        let stats = self.stats(completed_size);
+    fn finish(&mut self, completed_level: usize) -> RunOutcome {
+        let stats = self.stats(completed_level);
         match self.best.take() {
             Some(mut solution) => {
                 self.alternates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1298,13 +1445,13 @@ impl Search<'_> {
         }
     }
 
-    fn consider(&mut self, term: Term, eval: &[u64], size: usize) -> Verdict {
+    fn consider(&mut self, term: Term, eval: &[u64], level: usize) -> Verdict {
         *self.candidates += 1;
         if *self.candidates > self.budget.max_candidates {
-            return Verdict::Stop(self.finish(size.saturating_sub(1)));
+            return Verdict::Stop(self.finish(level.saturating_sub(1)));
         }
         if masked_eq(eval, &self.target, self.care.as_deref()) {
-            return match self.handle_match(term, size) {
+            return match self.handle_match(term, level) {
                 Some(witness) => Verdict::Stop(RunOutcome::Counterexample(witness)),
                 None => Verdict::Continue,
             };
@@ -1315,9 +1462,10 @@ impl Search<'_> {
         {
             slot.insert(());
             let idx = self.bank.len() as u32;
-            self.bank.push(Entry { term, size: size as u16 });
+            let size = term_size(&self.bank, &term);
+            self.bank.push(Entry { term, size });
             self.evals.extend_from_slice(eval);
-            self.by_size[size].push(idx);
+            self.by_level[level].push(idx);
         }
         Verdict::Continue
     }
@@ -1325,7 +1473,7 @@ impl Search<'_> {
     /// A candidate matched the corpus. Record it as an alternate; if it is
     /// cheaper than the current best, verify it and adopt it. Returns a
     /// counterexample witness if verification fails (CEGIS restart).
-    fn handle_match(&mut self, term: Term, size: usize) -> Option<Vec<u8>> {
+    fn handle_match(&mut self, term: Term, level: usize) -> Option<Vec<u8>> {
         let graph = term_graph(self.leaves, self.templates, &self.bank, &term);
         let cost = graph_cost(&graph, &self.budget.cost);
         let expr = term_expr(self.leaves, self.templates, &self.bank, &term);
@@ -1338,14 +1486,14 @@ impl Search<'_> {
         match self.verify(&graph) {
             Err(witness) => Some(witness),
             Ok(verified_inputs) => {
-                self.found_at.get_or_insert(size);
-                let stats = self.stats(size);
+                self.found_at.get_or_insert(level);
+                let stats = self.stats(level);
                 self.best = Some(Box::new(Solution {
                     expr,
                     dag_nodes: graph.nodes().len(),
                     cost,
                     graph,
-                    tree_size: size,
+                    tree_size: term_size(&self.bank, &term) as usize,
                     verified_inputs,
                     alternates: Vec::new(),
                     stats,
@@ -1399,21 +1547,21 @@ impl Search<'_> {
         bytes
     }
 
-    fn stats(&self, completed_size: usize) -> Stats {
+    fn stats(&self, completed_level: usize) -> Stats {
         Stats {
             candidates: *self.candidates,
             bank_unique: self.bank.len(),
             bank_saturated: self.bank.len() >= self.budget.max_bank,
-            completed_size,
+            completed_level,
             restarts: self.restarts,
             elapsed_ms: self.start.elapsed().as_millis(),
         }
     }
 
-    fn progress(&self, size: usize) {
+    fn progress(&self, level: usize) {
         if self.budget.progress {
             eprintln!(
-                "    size {size:2} complete: {} distinct terms, {} candidates, {:.1}s",
+                "    level {level:2} complete: {} distinct terms, {} candidates, {:.1}s",
                 self.bank.len(),
                 self.candidates,
                 self.start.elapsed().as_secs_f64()
@@ -1864,13 +2012,14 @@ fn random_input(alphabet: &[u8], rng: &mut Rng) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn budget(max_tree_size: usize) -> Budget {
+    fn budget(max_level: usize) -> Budget {
         Budget {
-            max_tree_size,
+            max_level,
             max_candidates: 2_000_000,
             max_bank: 200_000,
-            settle_sizes: 0,
+            settle_levels: 0,
             cost: CostModel::nodes(),
+            order: Order::TreeSize,
             progress: false,
         }
     }
@@ -1967,6 +2116,46 @@ mod tests {
                 assert!(reports.is_empty(), "no promotion round should have run");
             }
             AutoOutcome::NotFound(reports) => panic!("not found: {reports:?}"),
+        }
+    }
+
+    /// Cost-ordered enumeration must surface the cheapest care form
+    /// directly — no settling through expensive equivalents. The known
+    /// cheapest escape form under quote-only care costs 7 (avx2 model).
+    #[test]
+    fn cost_order_finds_cheapest_care_form_directly() {
+        let leaves =
+            [Leaf::class("B", b"\\"), Leaf::constant("EVEN", 0x5555_5555_5555_5555)];
+        let mut inputs = corpus(b"\\x\"", 0x1357_9BDF_2468_ACE0, 6, 2);
+        inputs.push(vec![b'\\'; 128]);
+        let reference = |data: &[u8]| {
+            let mut run_odd = false;
+            mask_ref(data, |b| {
+                if b == b'\\' {
+                    run_odd = !run_odd;
+                    false
+                } else {
+                    let out = run_odd;
+                    run_odd = false;
+                    out
+                }
+            })
+        };
+        let care = |data: &[u8]| mask_ref(data, |b| b == b'"');
+        let budget = Budget {
+            max_level: 9,
+            max_candidates: 20_000_000,
+            max_bank: 1_000_000,
+            settle_levels: 0,
+            cost: CostModel::avx2(),
+            order: Order::Cost,
+            progress: false,
+        };
+        match synthesize(&leaves, &inputs, &Spec::with_care(&reference, &care), &budget) {
+            Outcome::Found(sol) => {
+                assert!(sol.cost <= 7, "expected cost <= 7, got {} ({})", sol.cost, sol.expr);
+            }
+            Outcome::NotFound(stats) => panic!("not found: {stats:?}"),
         }
     }
 
@@ -2106,7 +2295,7 @@ mod tests {
         };
         match synthesize(&leaves, &corpus, &Spec::exact(&reference), &budget(5)) {
             Outcome::Found(sol) => panic!("impossible target was 'solved': {}", sol.expr),
-            Outcome::NotFound(stats) => assert_eq!(stats.completed_size, 5),
+            Outcome::NotFound(stats) => assert_eq!(stats.completed_level, 5),
         }
     }
 }
