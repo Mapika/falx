@@ -144,6 +144,20 @@ on 64 MiB), and the span API's `parse_into` exists for the same reason.
 `UnclosedOpen(pos)`. Building stops at the first unmatched close; navigation
 over an errored tape is best-effort and never panics.
 
+`parse_nested_par[_into]` parallelizes construction: a serial prepass
+replays the kernel (any dialect — exact carries, no parity tricks),
+snapshotting chunk-entry carries and counting each chunk's structural
+events, which are exactly its master-tape slots. Chunks then index and
+match concurrently, writing globally-indexed entries straight into
+disjoint ranges of one recycled master tape (no rebase or concatenation
+pass), recording closes with no local open as ordered residues. A serial
+merge — the classic parenthesis reduction — matches residues across
+chunks and patches partners; chunk-local mismatches or merge mismatches
+fall back to a serial parse so malformed inputs keep exact first-error
+truncation semantics. The prepass is the remaining serial pass; issue #6
+(parallel entry-state for backslash dialects) is the designed
+replacement and plugs into the same `nested_entries` seam.
+
 Navigation is through `Nested::items()` (top-level iteration) and `Node`
 (container or scalar span). `Node::items()` walks one nesting level with
 O(1)-skipping of nested containers. All separator bytes split items, so JSON

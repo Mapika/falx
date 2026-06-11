@@ -146,6 +146,18 @@ brackets and separator positions, values sliced lazily), built fused from
 the kernel's masks with no intermediate position vector; serde_json parses
 the same stream of documents at 0.30 GiB/s.
 
+A parallel builder exists (`parse_nested_par[_into]`): a serial prepass
+replays the kernel to hand each chunk its exact entry carries and tape
+slot range, chunks then write globally-indexed entries into disjoint
+ranges of one master tape, and the few brackets crossing chunk boundaries
+reconcile through an ordered residue merge. Stated plainly: on this WSL2
+machine it only ties serial (~3.4 GiB/s at x16) — dense nested parsing
+saturates memory bandwidth here, and the serial prepass caps sparse
+inputs. The prepass is the part
+[#6](https://github.com/Mapika/falx/issues/6) removes: with parallel
+entry-state reconstruction for backslash dialects, chunks seed themselves
+and the serial pass disappears.
+
 Caveat, stated plainly: simdjson parses document internals while falx
 frames records and slices fields lazily — the gap is what skipping
 in-document parsing buys on record-streaming workloads. The C++ benchmark
@@ -282,11 +294,12 @@ cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 - M7 (done): nested structure — specs declare bracket pairs, generated parsers
   add a matched-bracket nested tape with O(1) container skips and a navigation
   API; JSON structural parsing differentially tested against serde_json
-- Next: per-field clean/Cow cost (the remaining span-layer headroom,
-  ~2.5 ns/field), parallel nested-tape construction (parenthesis-matching
-  reduction), configurable record terminators
-  ([#3](https://github.com/Mapika/falx/issues/3), in progress), ARM NEON
-  backend, e-graph simplification of format graphs
+- Next: parallel entry-state for backslash dialects
+  ([#6](https://github.com/Mapika/falx/issues/6) — removes the parallel
+  nested builder's serial prepass), per-field clean/Cow cost (the
+  remaining span-layer headroom, ~2.5 ns/field), configurable record
+  terminators ([#3](https://github.com/Mapika/falx/issues/3), in
+  progress), ARM NEON backend, e-graph simplification of format graphs
 
 ## License
 

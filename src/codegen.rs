@@ -785,6 +785,94 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
     // no intermediate position vector. The matcher itself (push_nested) is
     // emitted once at the file root by push_nested_api.
     let nested_mode = matches!(dialect, Some(d) if !d.nesting.is_empty());
+    let entry_ty = format!("[u64; {carry_count}]");
+    let nested_seed_decl = if carry_count > 0 {
+        "        let mut carries = seed;\n"
+    } else {
+        "        let _ = seed;\n"
+    };
+    // The seeded driver and prepass are shared by both flavors modulo the
+    // step-call shape, like the other seeded kernels.
+    let entry_push = if carry_count > 0 {
+        "entries.push(carries);"
+    } else {
+        "entries.push([0u64; 0]);"
+    };
+    let nested_par_kernels = |step_call: &str, tail_step_call: &str, prepass_step: &str, prepass_tail: &str, attr: &str| {
+        format!(
+            r#"
+    /// Serial prepass for parallel nested parsing: replays the kernel over
+    /// the input, snapshotting the carries entering each interior chunk
+    /// boundary and counting each chunk's structural events — which is
+    /// exactly its master-tape slot count. Exact for any dialect, so the
+    /// parallel pass can write into disjoint master ranges directly.
+{attr}    pub fn nested_prepass(data: &[u8], bounds: &[usize], entries: &mut Vec<{entry_ty}>, counts: &mut Vec<usize>) {{
+{carry_decl}        let mut offset = 0usize;
+        let chunks = bounds.len() - 1;
+        for t in 0..chunks {{
+            let bound = bounds[t + 1];
+            let mut count = 0usize;
+            while offset + 64 <= bound {{
+                {prepass_step}
+                count += mask.count_ones() as usize;
+                offset += 64;
+            }}
+            // Only the final bound can be unaligned (== data.len()).
+            if offset < bound {{
+                let rem = bound - offset;
+                let mut block = [0u8; 64];
+                block[..rem].copy_from_slice(&data[offset..bound]);
+                {prepass_tail}
+                count += (mask & ((1u64 << rem) - 1)).count_ones() as usize;
+                offset = bound;
+            }}
+            counts.push(count);
+            if t + 1 < chunks {{
+                {entry_push}
+            }}
+        }}
+    }}
+
+    /// Seeded variant of `nested_tape` for parallel parsing: entry carries
+    /// come from the prepass, tape entries go directly into the master
+    /// buffer at this chunk's slot range with globally-indexed partners
+    /// (so no rebase or concat pass exists), and a close with no local
+    /// open is recorded into `pending` — its open lives in an earlier
+    /// chunk. Returns the first definite error and the entries written.
+    ///
+    /// # Safety
+    /// `master.add(tape_base + i)` must be valid for `i` up to this
+    /// chunk's prepass count, and that slot range must be owned
+    /// exclusively by this call.
+{attr}    pub unsafe fn nested_tape_seeded(data: &[u8], seed: {entry_ty}, pos_base: u32, master: *mut u64, tape_base: usize, stack: &mut Vec<u64>, pending: &mut Vec<u64>) -> (Option<super::NestError>, usize) {{
+{nested_seed_decl}        let mut offset = 0usize;
+        let mut tlen = 0usize;
+        while offset + 64 <= data.len() {{
+            {step_call}
+            // SAFETY: forwarded from the caller's contract.
+            let err = unsafe {{ super::push_nested_par(data, mask, opens, closes, offset as u32, pos_base, master, tape_base, &mut tlen, stack, pending) }};
+            if err.is_some() {{
+                return (err, tlen);
+            }}
+            offset += 64;
+        }}
+        let rem = data.len() - offset;
+        if rem > 0 {{
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            {tail_step_call}
+            let live = (1u64 << rem) - 1;
+            // SAFETY: forwarded from the caller's contract.
+            let err = unsafe {{ super::push_nested_par(data, mask & live, opens & live, closes & live, offset as u32, pos_base, master, tape_base, &mut tlen, stack, pending) }};
+            if err.is_some() {{
+                return (err, tlen);
+            }}
+        }}
+        (None, tlen)
+    }}
+"#
+        )
+    };
     let fallback_nested = if nested_mode {
         format!(
             r#"
@@ -815,6 +903,12 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         None
     }}
 "#
+        ) + &nested_par_kernels(
+            &format!("let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();\n            let (mask, opens, closes) = step_nested(block{carry_arg});"),
+            &format!("let (mask, opens, closes) = step_nested(&block{carry_arg});"),
+            &format!("let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();\n                let (mask, _) = step(block{carry_arg});"),
+            &format!("let (mask, _) = step(&block{carry_arg});"),
+            "",
         )
     } else {
         String::new()
@@ -863,6 +957,12 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         None
     }}
 "#
+        ) + &nested_par_kernels(
+            &format!("// SAFETY: the while guard keeps offset + 64 within data (interior\n                // bounds are 64-aligned and at most data.len()).\n                let (mask, opens, closes) = unsafe {{ step_nested(data.as_ptr().add(offset){carry_arg}) }};"),
+            &format!("// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n                let (mask, opens, closes) = unsafe {{ step_nested(block.as_ptr(){carry_arg}) }};"),
+            &format!("// SAFETY: the while guard keeps offset + 64 within data (interior\n                // bounds are 64-aligned and at most data.len()).\n                let (mask, _) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"),
+            &format!("// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n                let (mask, _) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"),
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
         )
     } else {
         String::new()
@@ -910,7 +1010,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
             push_columns_api(&mut code, dialect, columns, par_mode);
         }
         if !dialect.nesting.is_empty() {
-            push_nested_api(&mut code, dialect);
+            push_nested_api(&mut code, dialect, carry_count);
         }
     }
 
@@ -2662,7 +2762,7 @@ fn emit_step_body(
 ///
 /// The template is brace-heavy Rust, so dialect-specific fragments are
 /// substituted as placeholders rather than fighting `format!` escaping.
-fn push_nested_api(code: &mut String, dialect: &crate::formats::Dialect) {
+fn push_nested_api(code: &mut String, dialect: &crate::formats::Dialect, carry_count: usize) {
     fn byte_lit(b: u8) -> String {
         if b.is_ascii_graphic() && b != b'\'' && b != b'\\' {
             format!("b'{}'", b as char)
@@ -3007,5 +3107,259 @@ impl<'a, 'p> Iterator for Items<'a, 'p> {
         &TEMPLATE
             .replace("__OPEN_PAT__", &open_pat)
             .replace("__EXPECTED_CLOSE_ARMS__", &expected_close_arms),
+    );
+
+    const PAR_TEMPLATE: &str = r##"/// Like [`parse_nested`], built across `threads` chunks; see
+/// [`parse_nested_par_into`] for the steady-state variant.
+pub fn parse_nested_par(data: &[u8], threads: usize) -> Nested<'_> {
+    parse_nested_par_into(data, threads, Nested { data: &[], tape: Vec::new(), error: None })
+}
+
+/// Parallel [`parse_nested_into`]. A serial prepass replays the kernel,
+/// snapshotting chunk-entry carries (exact for any dialect — no parity
+/// tricks) and counting each chunk's tape slots; chunks then index and
+/// match brackets concurrently, writing globally-indexed entries straight
+/// into their disjoint ranges of the recycled master tape — no rebase or
+/// concatenation pass exists. The few brackets that cross chunk
+/// boundaries reconcile through an ordered residue merge (the classic
+/// parenthesis reduction). Output is identical to the serial path;
+/// malformed input falls back to serial so error and truncation
+/// semantics match exactly.
+pub fn parse_nested_par_into<'a>(
+    data: &'a [u8],
+    threads: usize,
+    recycle: Nested<'_>,
+) -> Nested<'a> {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse_nested_into(data, recycle);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    let mut entries: Vec<[u64; __K__]> = Vec::with_capacity(threads);
+    entries.push(__ENTRY_INIT__);
+    let mut counts: Vec<usize> = Vec::with_capacity(threads);
+    nested_prepass_dispatch(data, &bounds, &mut entries, &mut counts);
+    let mut bases: Vec<usize> = Vec::with_capacity(threads);
+    let mut total = 0usize;
+    for &count in &counts {
+        bases.push(total);
+        total += count;
+    }
+
+    let mut tape = recycle.tape;
+    tape.clear();
+    tape.reserve(total);
+    // Workers write through this address into disjoint slot ranges; the
+    // Vec itself is not touched again until after the scope.
+    let master_addr = tape.as_mut_ptr() as usize;
+    let results: Vec<(Option<NestError>, usize, Vec<u64>, Vec<u64>)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let slice = &data[bounds[t]..bounds[t + 1]];
+                    let seed = entries[t];
+                    let pos_base = bounds[t] as u32;
+                    let tape_base = bases[t];
+                    s.spawn(move || {
+                        let master = master_addr as *mut u64;
+                        let mut stack = Vec::with_capacity(64);
+                        let mut pending = Vec::new();
+                        // SAFETY: the prepass counted this chunk's slots
+                        // exactly, the master capacity covers the total,
+                        // and slot ranges are disjoint by prefix sum.
+                        let (err, written) = unsafe {
+                            nested_tape_seeded_dispatch(
+                                slice, seed, pos_base, master, tape_base,
+                                &mut stack, &mut pending,
+                            )
+                        };
+                        (err, written, stack, pending)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("nested parse thread ok")).collect()
+        });
+    let consistent = results
+        .iter()
+        .zip(&counts)
+        .all(|((err, written, _, _), &count)| err.is_none() && *written == count);
+    if !consistent {
+        // A chunk found a definite mismatch (wrong close against an open
+        // in the same chunk). Serial reproduces the exact first-error
+        // truncation semantics; correctness over speed on malformed input.
+        return parse_nested_into(data, Nested { data: &[], tape, error: None });
+    }
+    // SAFETY: every chunk wrote exactly its counted slots, so all `total`
+    // entries are initialized.
+    unsafe { tape.set_len(total) };
+
+    // Residue merge: each chunk's pending closes match opens left by
+    // earlier chunks, in order; leftover opens stack up for later chunks.
+    // All indexes are already global.
+    let mut gstack: Vec<u64> = Vec::new();
+    let mut mismatch = false;
+    'merge: for (_, _, opens, pending) in &results {
+        for &pend in pending {
+            let close_idx = (pend >> 32) as usize;
+            let close_pos = (pend as u32) as usize;
+            match gstack.pop() {
+                Some(top) if top as u8 == data[close_pos] => {
+                    let open_idx = (top >> 8) as usize;
+                    let open_pos = tape[open_idx] as u32;
+                    tape[open_idx] = ((close_idx as u64) << 32) | open_pos as u64;
+                    tape[close_idx] = ((open_idx as u64) << 32) | close_pos as u64;
+                }
+                _ => {
+                    mismatch = true;
+                    break 'merge;
+                }
+            }
+        }
+        gstack.extend_from_slice(opens);
+    }
+    if mismatch {
+        return parse_nested_into(data, Nested { data: &[], tape, error: None });
+    }
+    let error = gstack
+        .last()
+        .map(|&top| NestError::UnclosedOpen(tape[(top >> 8) as usize] as u32));
+    Nested { data, tape, error }
+}
+
+/// # Safety
+/// See `nested_tape_seeded`: the master slot range must be exclusively
+/// owned and sized by the prepass count.
+unsafe fn nested_tape_seeded_dispatch(
+    data: &[u8],
+    seed: [u64; __K__],
+    pos_base: u32,
+    master: *mut u64,
+    tape_base: usize,
+    stack: &mut Vec<u64>,
+    pending: &mut Vec<u64>,
+) -> (Option<NestError>, usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: features detected; slot contract forwarded to caller.
+        return unsafe {
+            avx2::nested_tape_seeded(data, seed, pos_base, master, tape_base, stack, pending)
+        };
+    }
+    // SAFETY: slot contract forwarded to the caller.
+    unsafe { fallback::nested_tape_seeded(data, seed, pos_base, master, tape_base, stack, pending) }
+}
+
+fn nested_prepass_dispatch(
+    data: &[u8],
+    bounds: &[usize],
+    entries: &mut Vec<[u64; __K__]>,
+    counts: &mut Vec<usize>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::nested_prepass(data, bounds, entries, counts) };
+        return;
+    }
+    fallback::nested_prepass(data, bounds, entries, counts);
+}
+
+/// `push_nested` twin for parallel chunks: byte reads are chunk-local
+/// (`offset` indexes the chunk slice, `pos_base + offset` is the global
+/// position), entries land in the master tape at `tape_base + tlen` with
+/// globally-indexed partners, and a close with no local open becomes a
+/// pending-residue entry rather than an error — its open lives in an
+/// earlier chunk.
+///
+/// # Safety
+/// The caller owns master slots `tape_base..tape_base + (this chunk's
+/// prepass count)`; `tlen` stays within that range by construction.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn push_nested_par(
+    data: &[u8],
+    mut mask: u64,
+    opens: u64,
+    closes: u64,
+    offset: u32,
+    pos_base: u32,
+    master: *mut u64,
+    tape_base: usize,
+    tlen: &mut usize,
+    stack: &mut Vec<u64>,
+    pending: &mut Vec<u64>,
+) -> Option<NestError> {
+    let events = mask.count_ones() as usize;
+    stack.reserve(events);
+    let stack_ptr = stack.as_mut_ptr();
+    let mut slen = stack.len();
+    let mut t = *tlen;
+    let mut error = None;
+    let brackets = opens | closes;
+    while mask != 0 {
+        let lowest = mask & mask.wrapping_neg();
+        let local = offset + mask.trailing_zeros();
+        let pos = pos_base + local;
+        mask &= mask - 1;
+        if lowest & brackets == 0 {
+            // SAFETY: tape_base + t stays in the owned slot range (one
+            // entry per structural event, prepass-counted); same for all
+            // master writes below.
+            unsafe { *master.add(tape_base + t) = pos as u64 };
+            t += 1;
+        } else if lowest & opens != 0 {
+            // SAFETY: as above; `local` indexes the chunk slice (drivers
+            // mask off tail padding), stack writes are reserved.
+            unsafe {
+                let close = match *data.get_unchecked(local as usize) {
+__EXPECTED_CLOSE_ARMS__                };
+                *stack_ptr.add(slen) = (((tape_base + t) as u64) << 8) | close as u64;
+                slen += 1;
+                *master.add(tape_base + t) = ((u32::MAX as u64) << 32) | pos as u64;
+            }
+            t += 1;
+        } else if slen == 0 {
+            pending.push((((tape_base + t) as u64) << 32) | pos as u64);
+            // SAFETY: as above; the partner stays pending until the merge.
+            unsafe { *master.add(tape_base + t) = ((u32::MAX as u64) << 32) | pos as u64 };
+            t += 1;
+        } else {
+            slen -= 1;
+            // SAFETY: as above; the patched open slot is an earlier entry
+            // this same chunk wrote (global indexes, own range).
+            unsafe {
+                let top = *stack_ptr.add(slen);
+                if top as u8 != *data.get_unchecked(local as usize) {
+                    error = Some(NestError::UnmatchedClose(pos));
+                    break;
+                }
+                let open = (top >> 8) as usize;
+                *master.add(open) =
+                    (((tape_base + t) as u64) << 32) | (*master.add(open) as u32) as u64;
+                *master.add(tape_base + t) = ((open as u64) << 32) | pos as u64;
+            }
+            t += 1;
+        }
+    }
+    *tlen = t;
+    // SAFETY: slen counts initialized entries within the reserve.
+    unsafe { stack.set_len(slen) };
+    error
+}
+
+"##;
+    let entry_init = if carry_count > 0 { "CARRY_INIT" } else { "[0u64; 0]" };
+    code.push_str(
+        &PAR_TEMPLATE
+            .replace("__EXPECTED_CLOSE_ARMS__", &expected_close_arms)
+            .replace("__ENTRY_INIT__", entry_init)
+            .replace("__K__", &carry_count.to_string()),
     );
 }

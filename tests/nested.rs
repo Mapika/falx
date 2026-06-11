@@ -330,3 +330,95 @@ fn fallback_driver_matches_dispatch() {
         assert_eq!(doc.tape(), &tape[..]);
     }
 }
+
+/// The parallel path must produce a byte-identical tape and equal error to
+/// serial for every thread count — entry carries (escapes and quote state
+/// crossing chunk boundaries) come from the carry-replay prepass.
+#[test]
+fn parallel_matches_serial() {
+    let mut rng = Rng(0x1357_9BDF_2468_ACE0);
+    for round in 0..15 {
+        let value = gen_value(&mut rng, 6);
+        let text = vec![serde_json::to_string(&value).unwrap(); 300].join(" \n");
+        let serial = json::parse_nested(text.as_bytes());
+        for threads in [1, 2, 3, 5, 8, 16] {
+            let par = json::parse_nested_par(text.as_bytes(), threads);
+            assert_eq!(par.error, serial.error, "round {round} threads {threads}");
+            assert_eq!(par.tape(), serial.tape(), "round {round} threads {threads}");
+        }
+    }
+}
+
+/// Containers spanning every chunk force the residue merge to do real
+/// work: almost every bracket is unmatched locally.
+#[test]
+fn parallel_cross_chunk_nesting() {
+    const N: usize = 50_000;
+    let mut text = String::with_capacity(N * 16);
+    text.push('[');
+    for i in 0..N {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str("[{\"k\": [1, 2]}]");
+    }
+    text.push(']');
+    let serial = json::parse_nested(text.as_bytes());
+    assert_eq!(serial.error, None);
+    for threads in [2, 4, 16] {
+        let par = json::parse_nested_par(text.as_bytes(), threads);
+        assert_eq!(par.error, None, "threads {threads}");
+        assert_eq!(par.tape(), serial.tape(), "threads {threads}");
+    }
+
+    // Pure depth: every chunk is all-residue, the merge stack peaks at N.
+    let mut deep = "[".repeat(200_000);
+    deep.push_str(&"]".repeat(200_000));
+    let serial = json::parse_nested(deep.as_bytes());
+    assert_eq!(serial.error, None);
+    for threads in [2, 7, 16] {
+        let par = json::parse_nested_par(deep.as_bytes(), threads);
+        assert_eq!(par.error, serial.error, "deep threads {threads}");
+        assert_eq!(par.tape(), serial.tape(), "deep threads {threads}");
+    }
+}
+
+/// Escape runs and quoted regions crossing chunk boundaries: the carry
+/// replay must hand each chunk the exact kernel state.
+#[test]
+fn parallel_boundary_state() {
+    // Long strings of backslashes and bracket-bearing text ensure quoted
+    // regions and escape runs straddle every chunk boundary at some
+    // thread count.
+    let unit = r#"{"a": "text [with] {brackets} and \\\\ runs \" inside", "b": [1]}"#;
+    let text = vec![unit; 4000].join("\n");
+    let serial = json::parse_nested(text.as_bytes());
+    assert_eq!(serial.error, None);
+    for threads in 2..=17 {
+        let par = json::parse_nested_par(text.as_bytes(), threads);
+        assert_eq!(par.error, None, "threads {threads}");
+        assert_eq!(par.tape(), serial.tape(), "threads {threads}");
+    }
+}
+
+/// Malformed input: the parallel path falls back to serial, so results
+/// must be exactly equal, including tape truncation at the error.
+#[test]
+fn parallel_malformed_matches_serial() {
+    let filler = "{\"k\": [1, 2, 3]} ".repeat(5_000);
+    let cases = [
+        format!("{filler}]{filler}"),                  // unmatched close mid-stream
+        format!("{filler}[ {filler}"),                 // unclosed open
+        format!("{filler}[1, 2}} {filler}"),           // kind mismatch
+        "]".to_string(),                               // tiny error input
+    ];
+    for (i, text) in cases.iter().enumerate() {
+        let serial = json::parse_nested(text.as_bytes());
+        assert!(serial.error.is_some(), "case {i} should be malformed");
+        for threads in [2, 8] {
+            let par = json::parse_nested_par(text.as_bytes(), threads);
+            assert_eq!(par.error, serial.error, "case {i} threads {threads}");
+            assert_eq!(par.tape(), serial.tape(), "case {i} threads {threads}");
+        }
+    }
+}
