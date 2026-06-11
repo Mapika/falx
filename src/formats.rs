@@ -35,6 +35,10 @@ pub struct Dialect {
     pub quote: Option<u8>,
     /// How quotes are escaped inside quoted regions.
     pub escape: Escape,
+    /// Comment byte: at line start (outside quotes) it makes the line
+    /// inert through its terminating newline. The newline stays a record
+    /// boundary; record walkers skip records that begin with this byte.
+    pub comment: Option<u8>,
 }
 
 /// RFC 4180 CSV: comma/newline structure, double-quote regions, `""` escapes.
@@ -43,6 +47,7 @@ pub fn csv_dialect() -> Dialect {
         structural: vec![b',', b'\n'],
         quote: Some(b'"'),
         escape: Escape::None,
+        comment: None,
     }
 }
 
@@ -52,6 +57,7 @@ pub fn tsv_dialect() -> Dialect {
         structural: vec![b'\t', b'\n'],
         quote: None,
         escape: Escape::None,
+        comment: None,
     }
 }
 
@@ -61,6 +67,7 @@ pub fn logfmt_dialect() -> Dialect {
         structural: vec![b' ', b'=', b'\n'],
         quote: Some(b'"'),
         escape: Escape::Backslash(b'\\'),
+        comment: None,
     }
 }
 
@@ -74,6 +81,18 @@ pub fn multi_dialect() -> Dialect {
         ],
         quote: Some(b'"'),
         escape: Escape::None,
+        comment: None,
+    }
+}
+
+/// CSV with `#` comment lines (the data-science CSV convention): a `#` at
+/// line start, outside quotes, makes the line inert through its newline.
+pub fn csv_hash_dialect() -> Dialect {
+    Dialect {
+        structural: vec![b',', b'\n'],
+        quote: Some(b'"'),
+        escape: Escape::None,
+        comment: Some(b'#'),
     }
 }
 
@@ -84,6 +103,7 @@ pub fn ndjson_dialect() -> Dialect {
         structural: vec![b'\n'],
         quote: Some(b'"'),
         escape: Escape::Backslash(b'\\'),
+        comment: None,
     }
 }
 
@@ -120,21 +140,41 @@ pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
         }
     };
 
-    let output = match dialect.quote {
-        None => candidates,
-        Some(quote) => {
-            let quotes = g.class_byte(quote);
-            let real_quotes = match dialect.escape {
-                Escape::None => quotes,
-                Escape::Backslash(escape_byte) => {
-                    let escaped = escaped_positions(&mut g, escape_byte);
-                    let not_escaped = g.not(escaped);
-                    g.and(quotes, not_escaped)
-                }
-            };
-            let inside = g.prefix_xor(real_quotes);
+    // Quote toggles with escapes resolved (None when the dialect has no
+    // quote convention; comment handling still needs a stream to feed the
+    // region resolver, so it gets a constant 0 there).
+    let real_quotes = dialect.quote.map(|quote| {
+        let quotes = g.class_byte(quote);
+        match dialect.escape {
+            Escape::None => quotes,
+            Escape::Backslash(escape_byte) => {
+                let escaped = escaped_positions(&mut g, escape_byte);
+                let not_escaped = g.not(escaped);
+                g.and(quotes, not_escaped)
+            }
+        }
+    });
+
+    let output = match (real_quotes, dialect.comment) {
+        (None, None) => candidates,
+        (Some(quotes), None) => {
+            // Pure parity: doubled-quote escapes self-cancel, bit-parallel.
+            let inside = g.prefix_xor(quotes);
             let outside = g.not(inside);
             g.and(candidates, outside)
+        }
+        (quotes, Some(comment)) => {
+            // Quotes and comments interleave (each makes the other inert),
+            // which parity cannot express: the sequential Regions op
+            // resolves both region kinds at once. A comment opens only at
+            // line start — position 0 counts via the seeded shift.
+            let quotes = quotes.unwrap_or_else(|| g.constant(0));
+            let line_start = g.shift_left1_seeded(terminators);
+            let comment_class = g.class_byte(comment);
+            let comment_starts = g.and(comment_class, line_start);
+            let inert = g.regions(quotes, comment_starts, terminators);
+            let keep = g.not(inert);
+            g.and(candidates, keep)
         }
     };
     g.set_output(output);

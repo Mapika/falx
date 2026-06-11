@@ -1,0 +1,18 @@
+# CSV with # comment lines: a comment byte at line start (outside quotes)
+# makes the line inert through its newline; record walkers skip such
+# records. Matches the checked-in `csv_hash` kernel.
+name = "csv_hash"
+structural = [",", "\n"]
+quote = "\""
+escape = "doubled"
+comment = "#"
+
+[[columns]]
+index = 0
+type = "string"
+name = "key"
+
+[[columns]]
+index = 1
+type = "i64"
+name = "amount"

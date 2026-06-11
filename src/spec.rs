@@ -27,10 +27,12 @@ pub struct Spec {
 /// - `quote` (string): Single-byte quote character (default: none).
 /// - `escape` (string): Escape style: "none", "doubled", or "backslash" (default: "none").
 /// - `escape_char` (string): Single-byte escape character for backslash mode (default: "\\").
+/// - `comment` (string): Single-byte line-start comment character; comment
+///   lines are skipped by record walkers (default: none).
 /// - `[[columns]]` (array of tables): Typed columns to project. Each entry
 ///   has `index` (integer, zero-based field index), `type` (string: "i64",
-///   "f64", or "bytes"), and optional `name` (string: generated field name,
-///   default `c{index}`).
+///   "f64", "string", or "bytes"), and optional `name` (string: generated
+///   field name, default `c{index}`).
 ///
 /// # Errors
 /// Returns descriptive error messages for missing required fields, type mismatches,
@@ -102,10 +104,27 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         }
     };
 
+    // Extract `comment` (optional, string, single byte).
+    let comment = match parsed.get("comment") {
+        Some(value) => {
+            let s = value.as_str().ok_or("'comment' must be a string")?;
+            let byte = parse_string_as_byte(s).map_err(|e| format!("'comment': {}", e))?;
+            if byte == b'\n' || byte == b'\r' {
+                return Err("'comment' must not be a line terminator".to_string());
+            }
+            if Some(byte) == quote {
+                return Err("'comment' must differ from 'quote'".to_string());
+            }
+            Some(byte)
+        }
+        None => None,
+    };
+
     let dialect = Dialect {
         structural,
         quote,
         escape,
+        comment,
     };
 
     // Extract `[[columns]]` (optional, array of tables).

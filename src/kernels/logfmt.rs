@@ -8,6 +8,10 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+/// Stream-start carry values; kernels and the stream parser all
+/// begin from this state.
+const CARRY_INIT: [u64; 4] = [0, 0, 0, 0];
+
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
@@ -107,10 +111,9 @@ pub struct Records<'p> {
     data_end: usize,
 }
 
-impl<'p> Iterator for Records<'p> {
-    type Item = Record<'p>;
-
-    fn next(&mut self) -> Option<Record<'p>> {
+impl<'p> Records<'p> {
+    /// Produce the next record in tape order, comment lines included.
+    fn next_raw(&mut self) -> Option<Record<'p>> {
         let start = self.byte_pos;
         let (end, seps) = if self.next_end < self.ends.len() {
             let entry = self.ends[self.next_end];
@@ -132,6 +135,14 @@ impl<'p> Iterator for Records<'p> {
             (self.data_end, seps)
         };
         Some(Record { data: self.data, start, end, seps })
+    }
+}
+
+impl<'p> Iterator for Records<'p> {
+    type Item = Record<'p>;
+
+    fn next(&mut self) -> Option<Record<'p>> {
+        self.next_raw()
     }
 }
 
@@ -270,7 +281,7 @@ pub fn stream() -> StreamParser {
         emitted: 0,
         emitted_seps: 0,
         record_start: 0,
-        carries: [0u64; 4],
+        carries: CARRY_INIT,
     }
 }
 
@@ -418,7 +429,7 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// Portable kernel, public so the dispatch-bypassed path stays testable.
 pub mod fallback {
     pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
-        let mut carries = [0u64; 4];
+        let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
@@ -440,7 +451,7 @@ pub mod fallback {
     /// positions into `seps`, record ends into `ends` encoded as
     /// (cumulative separator count << 32) | byte position.
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
-        let mut carries = [0u64; 4];
+        let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
@@ -559,7 +570,7 @@ mod avx2 {
 
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
-        let mut carries = [0u64; 4];
+        let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
         // Two blocks per iteration: amortizes loop control and lets the
         // second block's classification overlap the first block's extract.
@@ -591,7 +602,7 @@ mod avx2 {
     /// Record-aware indexing; see the fallback twin for the tape encoding.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
-        let mut carries = [0u64; 4];
+        let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
         // Two blocks per iteration (see index_structurals).
         while offset + 128 <= data.len() {

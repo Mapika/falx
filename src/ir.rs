@@ -91,6 +91,22 @@ pub enum Op {
     /// Bit i of the result is bit i-1 of the operand ("the previous byte
     /// matched"). Carries one bit across blocks.
     ShiftLeft1(NodeId),
+    /// Like [`Op::ShiftLeft1`] but the very first block's carried-in bit is
+    /// 1: the stream behaves as if preceded by one matching byte. Used to
+    /// make stream position 0 count as a line start.
+    ShiftLeft1Seeded(NodeId),
+    /// Sequential three-state region resolution for comment support:
+    /// given real-quote toggle bits, line-start comment-candidate bits,
+    /// and terminator bits, the result marks every byte inside a quoted
+    /// region (open quote included, close excluded — prefix-XOR
+    /// convention) or inside a comment (comment byte included, the
+    /// terminating newline excluded). Quote bits are inert inside
+    /// comments and candidate bits are inert inside quotes, which is the
+    /// interleaving no bit-parallel parity can express: this is the one
+    /// operation that propagates *within* a block, walking the set bits
+    /// of its inputs in position order (cheap: events are rare). Carries
+    /// the region state (normal/quote/comment) across blocks.
+    Regions(NodeId, NodeId, NodeId),
     /// Bit i is the XOR of operand bits 0..=i — running parity, the
     /// quote-context primitive. Carries one parity bit across blocks.
     PrefixXor(NodeId),
@@ -182,6 +198,18 @@ impl Graph {
     pub fn shift_left1(&mut self, a: NodeId) -> NodeId {
         self.check(a);
         self.push(Op::ShiftLeft1(a))
+    }
+
+    pub fn shift_left1_seeded(&mut self, a: NodeId) -> NodeId {
+        self.check(a);
+        self.push(Op::ShiftLeft1Seeded(a))
+    }
+
+    pub fn regions(&mut self, quotes: NodeId, comment_starts: NodeId, terminators: NodeId) -> NodeId {
+        self.check(quotes);
+        self.check(comment_starts);
+        self.check(terminators);
+        self.push(Op::Regions(quotes, comment_starts, terminators))
     }
 
     pub fn prefix_xor(&mut self, a: NodeId) -> NodeId {

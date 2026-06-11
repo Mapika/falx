@@ -16,16 +16,17 @@ All three executors (interp, codegen AVX2, codegen scalar) run the same blockwis
 
 ## The Bitstream IR
 
-Operations over 64-bit vectors with one bit per input byte, executed 64 bytes per block. The algebra has eight operations:
+Operations over 64-bit vectors with one bit per input byte, executed 64 bytes per block:
 
-- **Class(CharClass)**: Stateless. Bit i is set iff input byte i matches the character class (e.g., commas, quotes, newlines).
+- **Class(CharClass)**: Stateless. Bit i is set iff input byte i matches the character class (e.g., commas, quotes, newlines). Small classes compile to byte compares; classes past 8 members go through shuffle-based nibble lookup tables (PSHUFB) on the SIMD side and a 256-bit membership bitmap on the scalar side.
 - **Const(u64)**: A constant pattern repeated in every block (e.g., even/odd position masks for escape handling).
 - **Not(a), And(a,b), Or(a,b), Xor(a,b)**: Bitwise logic, all stateless.
-- **ShiftLeft1(a)**: Bit i of output is bit i-1 of operand ("the previous byte matched"). Carries one bit across blocks; used for lookahead like "escaped positions."
+- **ShiftLeft1(a)**: Bit i of output is bit i-1 of operand ("the previous byte matched"). Carries one bit across blocks; used for lookahead like "escaped positions." A seeded variant (`ShiftLeft1Seeded`) starts the stream with a carried-in 1, making position 0 count as "after a match" — how the first byte of a file gets line-start status.
 - **PrefixXor(a)**: Bit i is the XOR of operand bits 0..=i — running parity via log-step shifts. Carries one parity bit across blocks. Implements the quote-context trick and is the only arithmetic needed for doubled-quote (RFC 4180) escaping.
 - **Add(a,b)**: 64-bit binary addition with carry propagated across blocks. Used for odd/even run detection in backslash-escape handling (the simdjson algorithm).
+- **Regions(quotes, comment_starts, terminators)**: The one deliberate exception to bit-parallelism, added for comment lines. Quoted regions and comments interleave — each makes the other's openers inert — which no parity trick can express, so this op walks the set bits of its inputs in position order with a three-state (normal/quote/comment) machine, filling an "inert" mask between region open and close events. Cost is proportional to the number of quote/comment/newline *events* per block, not to bytes; the carried state is the 2-bit region. Quote-only dialects keep the pure `PrefixXor` path.
 
-Each op maps to one or two machine instructions. Stateful ops (`ShiftLeft1`, `PrefixXor`, `Add`) thread one or two bits of state between blocks—the entire kernel's memory. A graph is topologically sorted by construction; all evaluators run a single forward pass per block with no backtracking or allocation.
+Bit-parallel ops map to one or two machine instructions each. Stateful ops thread a few bits of state between blocks — the entire kernel's memory. A graph is topologically sorted by construction; all evaluators run a single forward pass per block with no backtracking or allocation.
 
 ## Generated Kernel Anatomy
 

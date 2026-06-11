@@ -164,13 +164,17 @@ implementations at runtime.
 
 A format spec compiles to a graph in a small **bitstream IR** (`src/ir.rs`):
 operations over bit vectors with one bit per input byte, executed 64 bytes
-per step. The whole algebra is seven ops — character-class membership,
-the four bitwise ops, `ShiftLeft1` ("previous byte matched", one carried
-bit), `PrefixXor` (running parity via carry-less multiply — the quote-context
-trick), and carry-propagating `Add` (odd/even run detection, the
-simdjson backslash-escape trick). Each op maps to one or two machine
-instructions; stateful ops carry a few bits across blocks, which is the
-kernel's entire memory — no lookback, no backtracking, no allocation.
+per step. The algebra is small — character-class membership (byte compares
+or PSHUFB nibble tables for big classes), the four bitwise ops,
+`ShiftLeft1` ("previous byte matched", one carried bit), `PrefixXor`
+(running parity via carry-less multiply — the quote-context trick),
+carry-propagating `Add` (odd/even run detection, the simdjson
+backslash-escape trick), and one deliberate exception to bit-parallelism:
+`Regions`, an event-walking three-state resolver that lets comment lines
+and quoted fields interleave exactly. Bit-parallel ops map to one or two
+machine instructions; stateful ops carry a few bits across blocks, which
+is the kernel's entire memory — no lookback, no backtracking, no
+allocation.
 
 Three executors share these semantics:
 
@@ -180,9 +184,13 @@ Three executors share these semantics:
   baseline
 
 Format specs (TOML, see `specs/`) currently describe the *delimited* family:
-a structural byte set, an optional quote byte, and an escape convention
-(RFC 4180 doubled quotes or JSON-style backslash). That one family already
-covers CSV dialects, TSV, logfmt, and NDJSON record framing.
+a structural byte set, an optional quote byte, an escape convention
+(RFC 4180 doubled quotes or JSON-style backslash), and an optional
+line-start comment byte (`comment = "#"` skips comment lines exactly,
+quotes-in-comments and comments-in-quotes included). That one family
+already covers CSV dialects (with or without `#` comments), TSV, logfmt,
+NDJSON record framing, and separator-rich formats with arbitrarily large
+structural byte sets.
 
 Generated parsers also include a streaming API for unbounded input (pipes,
 log tails, larger-than-RAM files): `stream()` accepts arbitrary chunks and

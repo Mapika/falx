@@ -226,15 +226,22 @@ fn emit_with(
     let dialect = parser.map(|(d, _)| d);
     let output = graph.output();
 
-    // Assign carry slots to stateful nodes.
+    // Assign carry slots to stateful nodes, recording each slot's initial
+    // value (seeded shifts start at 1, everything else at 0).
     let mut carry_slot = vec![usize::MAX; graph.nodes().len()];
-    let mut carry_count = 0usize;
+    let mut carry_init: Vec<u64> = Vec::new();
     for (i, op) in graph.nodes().iter().enumerate() {
-        if matches!(op, Op::ShiftLeft1(_) | Op::PrefixXor(_) | Op::Add(_, _)) {
-            carry_slot[i] = carry_count;
-            carry_count += 1;
+        let init = match op {
+            Op::ShiftLeft1(_) | Op::PrefixXor(_) | Op::Add(_, _) | Op::Regions(..) => Some(0),
+            Op::ShiftLeft1Seeded(_) => Some(1),
+            _ => None,
+        };
+        if let Some(init) = init {
+            carry_slot[i] = carry_init.len();
+            carry_init.push(init);
         }
     }
+    let carry_count = carry_init.len();
 
     let uses_eq_class = graph.nodes().iter().any(
         |op| matches!(op, Op::Class(c) if c.members().count() <= MAX_CLASS_BYTES),
@@ -246,6 +253,10 @@ fn emit_with(
         .nodes()
         .iter()
         .any(|op| matches!(op, Op::PrefixXor(_)));
+    let uses_regions = graph
+        .nodes()
+        .iter()
+        .any(|op| matches!(op, Op::Regions(..)));
 
     for op in graph.nodes() {
         if let Op::Class(class) = op {
@@ -261,8 +272,21 @@ fn emit_with(
     }
 
     // Pieces that differ depending on whether the graph carries state.
+    // CARRY_INIT (emitted at the file root) holds each slot's stream-start
+    // value: 0 for most carries, 1 for seeded shifts.
+    let carry_init_const = if carry_count > 0 {
+        let values: Vec<String> = carry_init.iter().map(|v| v.to_string()).collect();
+        format!(
+            "/// Stream-start carry values; kernels and the stream parser all\n\
+             /// begin from this state.\n\
+             const CARRY_INIT: [u64; {carry_count}] = [{}];\n\n",
+            values.join(", ")
+        )
+    } else {
+        String::new()
+    };
     let carry_decl = if carry_count > 0 {
-        format!("        let mut carries = [0u64; {carry_count}];\n")
+        "        let mut carries = super::CARRY_INIT;\n".to_string()
     } else {
         String::new()
     };
@@ -285,10 +309,12 @@ fn emit_with(
 
     // Parallel indexing (emitted for doubled-quote/no-escape dialects):
     // a chunk's entry state is one bit — the parity of quote bytes before
-    // it — so a counting prepass makes chunks independent.
+    // it — so a counting prepass makes chunks independent. Comment
+    // dialects carry region state no prepass can reconstruct, so they
+    // stay serial for now.
     let par_mode = matches!(
         dialect,
-        Some(d) if d.escape == crate::formats::Escape::None
+        Some(d) if d.escape == crate::formats::Escape::None && d.comment.is_none()
     );
     let seed_init = if carry_count == 1 {
         "        let mut carries = [seed];\n".to_string()
@@ -715,7 +741,7 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
 // the format's output bitstream (its structural positions). Self-contained:
 // depends only on std.
 {parser_doc}
-/// Index the structural positions of `data` into `out`.
+{carry_init_const}/// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
@@ -769,6 +795,9 @@ pub mod fallback {{
     emit_step_body(&mut code, graph, &carry_slot, Flavor::Fallback);
     let _ = write!(code, "        {step_ret}\n    }}\n");
 
+    if uses_regions {
+        code.push_str(REGIONS_HELPER);
+    }
     if uses_eq_class {
         code.push_str(
             r#"
@@ -883,6 +912,9 @@ mod avx2 {{
     emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx2);
     let _ = write!(code, "        {step_ret}\n    }}\n");
 
+    if uses_regions {
+        code.push_str(REGIONS_HELPER);
+    }
     if uses_eq_class {
         code.push_str(
             r#"
@@ -1003,8 +1035,23 @@ fn prepass_snippet(quote: Option<u8>) -> String {
 /// Emit the records/fields span API: lazy walking of the structural index
 /// into record and field spans, with dialect-specific field cleaning.
 fn push_span_api(code: &mut String, dialect: &crate::formats::Dialect, carry_count: usize) {
-    code.push_str(
-        r#"/// Record-aware tape indexing used by [`parse`].
+    // Comment dialects keep comment lines on the tape (their newline is a
+    // record boundary) and skip them lazily during iteration.
+    let next_body = match dialect.comment {
+        Some(c) => format!(
+            "        // Comment records stay on the tape as boundaries;\n\
+             \x20       // iteration skips them lazily here.\n\
+             \x20       loop {{\n\
+             \x20           let record = self.next_raw()?;\n\
+             \x20           if record.end > record.start && self.data[record.start] == {c}u8 {{\n\
+             \x20               continue;\n\
+             \x20           }}\n\
+             \x20           return Some(record);\n\
+             \x20       }}"
+        ),
+        None => "        self.next_raw()".to_string(),
+    };
+    let span_tpl = r#"/// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
@@ -1090,10 +1137,9 @@ pub struct Records<'p> {
     data_end: usize,
 }
 
-impl<'p> Iterator for Records<'p> {
-    type Item = Record<'p>;
-
-    fn next(&mut self) -> Option<Record<'p>> {
+impl<'p> Records<'p> {
+    /// Produce the next record in tape order, comment lines included.
+    fn next_raw(&mut self) -> Option<Record<'p>> {
         let start = self.byte_pos;
         let (end, seps) = if self.next_end < self.ends.len() {
             let entry = self.ends[self.next_end];
@@ -1115,6 +1161,14 @@ impl<'p> Iterator for Records<'p> {
             (self.data_end, seps)
         };
         Some(Record { data: self.data, start, end, seps })
+    }
+}
+
+impl<'p> Iterator for Records<'p> {
+    type Item = Record<'p>;
+
+    fn next(&mut self) -> Option<Record<'p>> {
+@NEXT_BODY@
     }
 }
 
@@ -1227,11 +1281,45 @@ impl<'p> Iterator for Fields<'p> {
     }
 }
 
-"#,
-    );
-    code.push_str(
-        &STREAM_TPL.replace("@K@", &carry_count.to_string()),
-    );
+"#;
+    code.push_str(&span_tpl.replace("@NEXT_BODY@", &next_body));
+    let mut stream = STREAM_TPL
+        .replace("@K@", &carry_count.to_string())
+        .replace(
+            "@CINIT@",
+            if carry_count > 0 { "CARRY_INIT" } else { "[0u64; 0]" },
+        );
+    if let Some(c) = dialect.comment {
+        // emit_ready: comment records advance the cursors without being
+        // delivered. The terminator byte at `end` is always in-bounds, so
+        // indexing buf[record_start] is too.
+        stream = stream.replace(
+            "            on_record(Record {
+                data: &self.buf,
+                start: self.record_start,
+                end,
+                seps: &self.seps[self.emitted_seps..cum],
+            });",
+            &format!(
+                "            // Comment lines remain boundaries but are not records.
+            if end == self.record_start || self.buf[self.record_start] != {c}u8 {{
+                on_record(Record {{
+                    data: &self.buf,
+                    start: self.record_start,
+                    end,
+                    seps: &self.seps[self.emitted_seps..cum],
+                }});
+            }}"
+            ),
+        );
+        stream = stream.replace(
+            "        if self.record_start < self.buf.len() {",
+            &format!(
+                "        if self.record_start < self.buf.len() && self.buf[self.record_start] != {c}u8 {{"
+            ),
+        );
+    }
+    code.push_str(&stream);
     code.push_str(&clean_fn(dialect));
     code.push('\n');
 }
@@ -1364,6 +1452,17 @@ fn push_columns_api(
     };
     let sep_arms = arms("p");
     let last_arms = arms("to");
+    // Comment dialects: a record beginning with the comment byte is not a
+    // row at all (mirrors the Records iterator's lazy skip).
+    let comment_guard = match dialect.comment {
+        Some(c) => format!(
+            "\x20       // Comment record: not a row.\n\
+             \x20       if end > self.record_start && data[self.record_start as usize] == {c}u8 {{\n\
+             \x20           return;\n\
+             \x20       }}\n"
+        ),
+        None => String::new(),
+    };
 
     let _ = write!(
         code,
@@ -1433,6 +1532,7 @@ fn push_columns_api(
          \x20   /// Emit the row terminated (exclusively) at `end`.\n\
          \x20   fn flush(&mut self, end: u32) {{\n\
          \x20       let data = self.cols.data;\n\
+         {comment_guard}\
          \x20       // Record-level trim of the `\\r` in `\\r\\n` terminators.\n\
          \x20       let to = if end > self.record_start && data[end as usize - 1] == b'\\r' {{\n\
          \x20           end - 1\n\
@@ -1845,6 +1945,66 @@ fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
 
 "#;
 
+/// The sequential region resolver emitted into both kernels when the
+/// graph contains a `Regions` node. Plain u64 bit math — the same text
+/// serves the scalar and AVX2 modules.
+const REGIONS_HELPER: &str = r#"
+    /// Three-state (normal/quote/comment) region resolution: walks the set
+    /// bits of its inputs in position order, filling the inert mask between
+    /// region open and close events. Quote bits are ignored inside comments
+    /// and comment candidates inside quotes — the interleaving bit-parallel
+    /// parity cannot express. `state` carries the region across blocks.
+    #[inline]
+    fn resolve_regions(q: u64, s: u64, n: u64, state: &mut u64) -> u64 {
+        const NORMAL: u64 = 0;
+        const QUOTE: u64 = 1;
+        const COMMENT: u64 = 2;
+        let mut inert = 0u64;
+        // A region continuing from the previous block fills from bit 0.
+        let mut run_start = 0u32;
+        let mut events = q | s | n;
+        while events != 0 {
+            let p = events.trailing_zeros();
+            let bit = 1u64 << p;
+            match *state {
+                QUOTE => {
+                    if q & bit != 0 {
+                        inert |= range_mask(run_start, p);
+                        *state = NORMAL;
+                    }
+                }
+                COMMENT => {
+                    if n & bit != 0 {
+                        inert |= range_mask(run_start, p);
+                        *state = NORMAL;
+                    }
+                }
+                _ => {
+                    if q & bit != 0 {
+                        *state = QUOTE;
+                        run_start = p;
+                    } else if s & bit != 0 {
+                        *state = COMMENT;
+                        run_start = p;
+                    }
+                }
+            }
+            events &= events - 1;
+        }
+        if *state != NORMAL {
+            inert |= range_mask(run_start, 64);
+        }
+        inert
+    }
+
+    /// Bits `[from, to)` set.
+    #[inline]
+    fn range_mask(from: u32, to: u32) -> u64 {
+        let hi = if to >= 64 { !0u64 } else { (1u64 << to) - 1 };
+        hi & !((1u64 << from) - 1)
+    }
+"#;
+
 /// Streaming parser template; `@K@` is the kernel carry count.
 const STREAM_TPL: &str = r#"/// Incremental parser for unbounded input: feed chunks, receive complete
 /// records via callback. Kernel carries persist across feeds, so quoted
@@ -1872,7 +2032,7 @@ pub fn stream() -> StreamParser {
         emitted: 0,
         emitted_seps: 0,
         record_start: 0,
-        carries: [0u64; @K@],
+        carries: @CINIT@,
     }
 }
 
@@ -2184,12 +2344,21 @@ fn emit_step_body(code: &mut String, graph: &Graph, carry_slot: &[usize], flavor
             Op::And(a, b) => format!("let v{i} = v{} & v{};", a.0, b.0),
             Op::Or(a, b) => format!("let v{i} = v{} | v{};", a.0, b.0),
             Op::Xor(a, b) => format!("let v{i} = v{} ^ v{};", a.0, b.0),
-            Op::ShiftLeft1(a) => {
+            Op::ShiftLeft1(a) | Op::ShiftLeft1Seeded(a) => {
                 let k = carry_slot[i];
                 format!(
                     "let v{i} = {{ let shifted = (v{a} << 1) | carries[{k}]; \
                      carries[{k}] = v{a} >> 63; shifted }};",
                     a = a.0
+                )
+            }
+            Op::Regions(q, s, n) => {
+                let k = carry_slot[i];
+                format!(
+                    "let v{i} = resolve_regions(v{q}, v{s}, v{n}, &mut carries[{k}]);",
+                    q = q.0,
+                    s = s.0,
+                    n = n.0
                 )
             }
             Op::PrefixXor(a) => {

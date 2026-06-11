@@ -143,6 +143,7 @@ fn alternative_dialects_differential() {
             structural: vec![*delimiter, b'\n'],
             quote: Some(*quote),
             escape: formats::Escape::None,
+            comment: None,
         });
 
         // Run 500 randomized tests.
@@ -204,6 +205,7 @@ fn backslash_escape_differential() {
                 &dialect.structural,
                 dialect.quote,
                 Some(escape_byte),
+                None,
                 &mut expected,
             );
             let mut output = Vec::new();

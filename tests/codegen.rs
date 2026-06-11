@@ -47,6 +47,7 @@ fn generated_kernels_differential() {
         ("logfmt", formats::logfmt_dialect()),
         ("ndjson", formats::ndjson_dialect()),
         ("multi", formats::multi_dialect()),
+        ("csv_hash", formats::csv_hash_dialect()),
     ];
 
     let mut rng = Rng(0xDEAD_BEEF_CAFE_BABE);
@@ -63,6 +64,10 @@ fn generated_kernels_differential() {
             alphabet.push(esc);
             alphabet.push(esc);
             alphabet.push(esc);
+        }
+        if let Some(c) = dialect.comment {
+            alphabet.push(c);
+            alphabet.push(c);
         }
         alphabet.extend_from_slice(b"xy");
 
@@ -85,6 +90,7 @@ fn generated_kernels_differential() {
                 &dialect.structural,
                 dialect.quote,
                 escape_byte,
+                dialect.comment,
                 &mut expected,
             );
 
@@ -96,6 +102,7 @@ fn generated_kernels_differential() {
                 &"logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
                 &"ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
                 &"multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
+                &"csv_hash" => falx::kernels::csv_hash::index_structurals(&data, &mut dispatched),
                 _ => panic!("unknown format: {}", name),
             }
 
@@ -107,6 +114,7 @@ fn generated_kernels_differential() {
                 &"logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
                 &"ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
                 &"multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
+                &"csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
                 _ => panic!("unknown format: {}", name),
             }
 
@@ -134,6 +142,7 @@ fn generated_kernels_long_input() {
         ("logfmt", formats::logfmt_dialect()),
         ("ndjson", formats::ndjson_dialect()),
         ("multi", formats::multi_dialect()),
+        ("csv_hash", formats::csv_hash_dialect()),
     ];
 
     let mut rng = Rng(0xCAFE_BABE_DEAD_BEEF);
@@ -150,6 +159,10 @@ fn generated_kernels_long_input() {
             alphabet.push(esc);
             alphabet.push(esc);
             alphabet.push(esc);
+        }
+        if let Some(c) = dialect.comment {
+            alphabet.push(c);
+            alphabet.push(c);
         }
         alphabet.extend_from_slice(b"xy");
 
@@ -170,6 +183,7 @@ fn generated_kernels_long_input() {
             &dialect.structural,
             dialect.quote,
             escape_byte,
+            dialect.comment,
             &mut expected,
         );
 
@@ -181,6 +195,7 @@ fn generated_kernels_long_input() {
             &"logfmt" => falx::kernels::logfmt::index_structurals(&data, &mut dispatched),
             &"ndjson" => falx::kernels::ndjson::index_structurals(&data, &mut dispatched),
             &"multi" => falx::kernels::multi::index_structurals(&data, &mut dispatched),
+            &"csv_hash" => falx::kernels::csv_hash::index_structurals(&data, &mut dispatched),
             _ => panic!("unknown format: {}", name),
         }
 
@@ -192,6 +207,7 @@ fn generated_kernels_long_input() {
             &"logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
             &"ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
             &"multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
+            &"csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
             _ => panic!("unknown format: {}", name),
         }
 

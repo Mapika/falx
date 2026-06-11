@@ -206,10 +206,9 @@ pub struct Records<'p> {
     data_end: usize,
 }
 
-impl<'p> Iterator for Records<'p> {
-    type Item = Record<'p>;
-
-    fn next(&mut self) -> Option<Record<'p>> {
+impl<'p> Records<'p> {
+    /// Produce the next record in tape order, comment lines included.
+    fn next_raw(&mut self) -> Option<Record<'p>> {
         let start = self.byte_pos;
         let (end, seps) = if self.next_end < self.ends.len() {
             let entry = self.ends[self.next_end];
@@ -231,6 +230,14 @@ impl<'p> Iterator for Records<'p> {
             (self.data_end, seps)
         };
         Some(Record { data: self.data, start, end, seps })
+    }
+}
+
+impl<'p> Iterator for Records<'p> {
+    type Item = Record<'p>;
+
+    fn next(&mut self) -> Option<Record<'p>> {
+        self.next_raw()
     }
 }
 

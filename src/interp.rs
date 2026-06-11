@@ -26,10 +26,17 @@ struct Machine<'g> {
 
 impl<'g> Machine<'g> {
     fn new(graph: &'g Graph) -> Self {
+        // Seeded shifts start with a carried-in 1 (stream position 0
+        // behaves as preceded by a match); everything else starts at 0.
+        let carries = graph
+            .nodes()
+            .iter()
+            .map(|op| matches!(op, Op::ShiftLeft1Seeded(_)) as u64)
+            .collect();
         Self {
             graph,
             values: vec![0; graph.nodes().len()],
-            carries: vec![0; graph.nodes().len()],
+            carries,
         }
     }
 
@@ -49,12 +56,18 @@ impl<'g> Machine<'g> {
                 Op::And(a, b) => self.values[a.0 as usize] & self.values[b.0 as usize],
                 Op::Or(a, b) => self.values[a.0 as usize] | self.values[b.0 as usize],
                 Op::Xor(a, b) => self.values[a.0 as usize] ^ self.values[b.0 as usize],
-                Op::ShiftLeft1(a) => {
+                Op::ShiftLeft1(a) | Op::ShiftLeft1Seeded(a) => {
                     let v = self.values[a.0 as usize];
                     let out = (v << 1) | self.carries[i];
                     self.carries[i] = v >> 63;
                     out
                 }
+                Op::Regions(q, s, n) => resolve_regions(
+                    self.values[q.0 as usize],
+                    self.values[s.0 as usize],
+                    self.values[n.0 as usize],
+                    &mut self.carries[i],
+                ),
                 Op::PrefixXor(a) => {
                     let parity = prefix_xor(self.values[a.0 as usize]) ^ self.carries[i];
                     self.carries[i] = ((parity as i64) >> 63) as u64;
@@ -71,6 +84,58 @@ impl<'g> Machine<'g> {
         }
         self.values[self.graph.output().0 as usize]
     }
+}
+
+/// Three-state region resolution for [`Op::Regions`]: walk the set bits
+/// of `q | s | n` in position order with a normal/quote/comment state
+/// machine, filling the inert mask between region open and close events.
+/// `state` is the carried region state (0 normal, 1 quote, 2 comment).
+fn resolve_regions(q: u64, s: u64, n: u64, state: &mut u64) -> u64 {
+    const NORMAL: u64 = 0;
+    const QUOTE: u64 = 1;
+    const COMMENT: u64 = 2;
+    let mut inert = 0u64;
+    // A region continuing from the previous block fills from bit 0.
+    let mut run_start = 0u32;
+    let mut events = q | s | n;
+    while events != 0 {
+        let p = events.trailing_zeros();
+        let bit = 1u64 << p;
+        match *state {
+            QUOTE => {
+                if q & bit != 0 {
+                    inert |= range_mask(run_start, p);
+                    *state = NORMAL;
+                }
+            }
+            COMMENT => {
+                if n & bit != 0 {
+                    inert |= range_mask(run_start, p);
+                    *state = NORMAL;
+                }
+            }
+            _ => {
+                if q & bit != 0 {
+                    *state = QUOTE;
+                    run_start = p;
+                } else if s & bit != 0 {
+                    *state = COMMENT;
+                    run_start = p;
+                }
+            }
+        }
+        events &= events - 1;
+    }
+    if *state != NORMAL {
+        inert |= range_mask(run_start, 64);
+    }
+    inert
+}
+
+/// Bits `[from, to)` set.
+fn range_mask(from: u32, to: u32) -> u64 {
+    let hi = if to >= 64 { !0u64 } else { (1u64 << to) - 1 };
+    hi & !((1u64 << from) - 1)
 }
 
 /// Bit i of the result is the XOR of bits 0..=i (log-step shift cascade; the
