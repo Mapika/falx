@@ -32,6 +32,7 @@ pub mod scalar;
 #[cfg(feature = "spec")]
 pub mod spec;
 pub mod synth;
+pub mod synth_formats;
 
 /// Append the byte offsets of all unquoted `,` and `\n` in `data` to `out`,
 /// using the fastest kernel this CPU supports.
