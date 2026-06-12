@@ -1357,14 +1357,13 @@ mod avx512 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 44u8); // class ","
-        let v2 = v1 | v0;
-        let v3 = eq_mask(lo, hi, 34u8); // class "\""
-        let v4 = { let parity = prefix_xor(v3) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v5 = !v4;
-        let v6 = v2 & v5;
-        (v6, v6 & v0)
+        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
+        let v2 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v3 = !v1;
+        let v4 = v2 & v3;
+        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
@@ -1598,14 +1597,13 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 44u8); // class ","
-        let v2 = v1 | v0;
-        let v3 = eq_mask(lo, hi, 34u8); // class "\""
-        let v4 = { let parity = prefix_xor(v3) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v5 = !v4;
-        let v6 = v2 & v5;
-        (v6, v6 & v0)
+        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
+        let v2 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v3 = !v1;
+        let v4 = v2 & v3;
+        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx2")]

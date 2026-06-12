@@ -185,7 +185,7 @@ For doubled-quote dialects (no backslash escapes, so quote parity is independent
 
 **Multi-output** (`synthesize_multi`): Specs are solved in order; each solved stream joins the next one's leaf library (named O0, O1, ...), merged into one shared-CSE graph. `shared_cost` vs `separate_cost` is the fusion win.
 
-The generator now has two graph sources. The default source is the manual `formats::delimited_parts()` builder. The opt-in `--synth weighted` source runs weighted multi-output synthesis with the AVX cost model and feeds the resulting `DelimitedParts` into the same native AVX-512/AVX2 backend. Comment-region formats remain manual until the synth/prover path grows support for the `Regions` behavior.
+The generator now has two graph sources. The default source runs weighted multi-output synthesis with the AVX2 cost model for supported dialects and feeds the resulting `DelimitedParts` into the same native AVX-512/AVX2 backend. Comment-region formats remain on the manual `formats::delimited_parts()` builder until the synth/prover path grows support for the `Regions` behavior; `--manual` forces the manual builder for every target.
 
 **Proof** (`prove`): Every IR op except `Regions` has an exact byte-serial form carrying at most one bit of state, so a graph IS a finite automaton over bytes (state = one bit per stateful node + position mod 64 for block constants). Equivalence against an explicit Fsm spec is product reachability — complete over all inputs, dependency-free. `byte_serial_masks` exposes the byte-serial executor, differentially pinned against the interpreter in unit tests; refutations return shortest witnesses via BFS parent links.
 

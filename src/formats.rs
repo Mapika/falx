@@ -85,9 +85,7 @@ pub fn logfmt_dialect() -> Dialect {
 /// kicks in for classes too large for compare-based classification.
 pub fn multi_dialect() -> Dialect {
     Dialect {
-        structural: vec![
-            b',', b';', b'|', b'\t', b':', b' ', b'/', b'=', b'&', b'\n',
-        ],
+        structural: vec![b',', b';', b'|', b'\t', b':', b' ', b'/', b'=', b'&', b'\n'],
         quote: Some(b'"'),
         escape: Escape::None,
         comment: None,
@@ -135,6 +133,7 @@ pub fn json_dialect() -> Dialect {
 
 /// A dialect graph plus the auxiliary node the code generator needs to emit
 /// record-aware tapes: which structural bytes are record terminators.
+#[derive(Clone)]
 pub struct DelimitedParts {
     pub graph: Graph,
     /// Raw `\n` class node (pre quote-masking); ANDed with the output stream
@@ -229,7 +228,11 @@ pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
         let live_closes = g.and(close_class, output);
         Some((live_opens, live_closes))
     };
-    DelimitedParts { graph: g, terminators, nest }
+    DelimitedParts {
+        graph: g,
+        terminators,
+        nest,
+    }
 }
 
 /// The structural-indexing graph alone (see [`delimited_parts`]).

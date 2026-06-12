@@ -2,14 +2,14 @@
 //! Run after changing the IR, codegen, or a format definition:
 //! `cargo run --example generate`
 //!
-//! To opt into weighted synthesized graphs for supported targets:
-//! `cargo run --example generate -- --synth weighted`
+//! The default uses weighted synthesized graphs for supported targets.
+//! Use `cargo run --example generate -- --manual` to force handwritten graphs.
 
 use falx::codegen::{self, CodegenOptions, GraphSource};
 use falx::kernels;
-use falx::synth_formats::{self, SynthProfile};
+use falx::synth_formats;
 
-const USAGE: &str = "usage: generate [--synth weighted]";
+const USAGE: &str = "usage: generate [--manual|--synth weighted]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerateMode {
@@ -22,10 +22,11 @@ where
     I: IntoIterator,
     I::Item: Into<String>,
 {
-    let mut mode = GenerateMode::Manual;
+    let mut mode = GenerateMode::SynthWeighted;
     let mut args = args.into_iter().map(Into::into).skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--manual" => mode = GenerateMode::Manual,
             "--synth" => {
                 let Some(value) = args.next() else {
                     return Err("--synth requires a value".into());
@@ -72,17 +73,18 @@ fn main() {
     };
 
     for (name, dialect, columns) in kernels::targets() {
-        let (options, source) =
+        let source =
             if mode == GenerateMode::SynthWeighted && synth_formats::supports_weighted(&dialect) {
-                (
-                    CodegenOptions {
-                        graph_source: GraphSource::SynthWeighted(SynthProfile::Weighted),
-                    },
-                    "synth-weighted",
-                )
+                "synth-weighted"
             } else {
-                (CodegenOptions::default(), "manual")
+                "manual"
             };
+        let options = match mode {
+            GenerateMode::Manual => CodegenOptions {
+                graph_source: GraphSource::Manual,
+            },
+            GenerateMode::SynthWeighted => CodegenOptions::default(),
+        };
 
         let code = codegen::emit_parser_with_columns_options(&dialect, name, &columns, options)
             .expect("dialect should be emittable");
@@ -97,8 +99,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_defaults_to_manual() {
-        assert_eq!(parse_mode(["generate"]).unwrap(), GenerateMode::Manual);
+    fn parse_defaults_to_weighted_synth() {
+        assert_eq!(
+            parse_mode(["generate"]).unwrap(),
+            GenerateMode::SynthWeighted
+        );
+    }
+
+    #[test]
+    fn parse_manual_mode() {
+        assert_eq!(
+            parse_mode(["generate", "--manual"]).unwrap(),
+            GenerateMode::Manual
+        );
     }
 
     #[test]
@@ -125,6 +138,7 @@ mod tests {
     fn detects_help_flag() {
         assert!(wants_help(["generate", "--help"]));
         assert!(wants_help(["generate", "-h"]));
+        assert!(!wants_help(["generate", "--manual"]));
         assert!(!wants_help(["generate", "--synth", "weighted"]));
         assert!(!wants_help(["generate", "--unknown", "--help"]));
     }

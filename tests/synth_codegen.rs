@@ -139,6 +139,54 @@ fn weighted_synth_codegen_emits_native_simd_without_fallback() {
 }
 
 #[test]
+fn codegen_default_uses_weighted_when_supported() {
+    let dialect = formats::csv_dialect();
+    let default = codegen::emit_parser_with_columns(&dialect, "csv_default_test", &[])
+        .expect("default codegen should succeed");
+    let weighted = codegen::emit_parser_with_columns_options(
+        &dialect,
+        "csv_default_test",
+        &[],
+        CodegenOptions {
+            graph_source: GraphSource::SynthWeighted(SynthProfile::Weighted),
+        },
+    )
+    .expect("weighted codegen should succeed");
+
+    assert_eq!(default, weighted);
+}
+
+#[test]
+fn codegen_default_uses_manual_for_unsupported_dialects() {
+    let dialect = formats::csv_hash_dialect();
+    let columns = [
+        codegen::Column {
+            index: 0,
+            name: Some("key".into()),
+            ty: codegen::ColumnType::Str,
+        },
+        codegen::Column {
+            index: 1,
+            name: Some("amount".into()),
+            ty: codegen::ColumnType::I64,
+        },
+    ];
+    let default = codegen::emit_parser_with_columns(&dialect, "csv_hash_default_test", &columns)
+        .expect("default codegen should succeed");
+    let manual = codegen::emit_parser_with_columns_options(
+        &dialect,
+        "csv_hash_default_test",
+        &columns,
+        CodegenOptions {
+            graph_source: GraphSource::Manual,
+        },
+    )
+    .expect("manual codegen should succeed");
+
+    assert_eq!(default, manual);
+}
+
+#[test]
 fn weighted_synth_rejects_comment_region_dialects() {
     let dialect = formats::csv_hash_dialect();
     assert!(!synth_formats::supports_weighted(&dialect));

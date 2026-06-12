@@ -742,10 +742,9 @@ mod avx512 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 9u8); // class "\t"
-        let v2 = v1 | v0;
-        (v2, v2 & v0)
+        let v0 = eq_mask(lo, hi, 9u8) | eq_mask(lo, hi, 10u8); // class "\t\n"
+        let v1 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v0, v0 & v1)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
@@ -941,10 +940,9 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 9u8); // class "\t"
-        let v2 = v1 | v0;
-        (v2, v2 & v0)
+        let v0 = eq_mask(lo, hi, 9u8) | eq_mask(lo, hi, 10u8); // class "\t\n"
+        let v1 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v0, v0 & v1)
     }
 
     #[target_feature(enable = "avx2")]

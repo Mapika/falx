@@ -139,6 +139,9 @@ impl Column {
 pub enum GraphSource {
     /// Use the handwritten graph builder in `formats`.
     Manual,
+    /// Use weighted synthesis for supported dialects and the handwritten
+    /// graph builder for dialects the synthesizer cannot express yet.
+    AutoWeighted(crate::synth_formats::SynthProfile),
     /// Use weighted synthesis to build the graph, then emit the same native
     /// SIMD backend as manual graph generation.
     SynthWeighted(crate::synth_formats::SynthProfile),
@@ -153,7 +156,7 @@ pub struct CodegenOptions {
 impl Default for CodegenOptions {
     fn default() -> Self {
         Self {
-            graph_source: GraphSource::Manual,
+            graph_source: GraphSource::AutoWeighted(crate::synth_formats::SynthProfile::Weighted),
         }
     }
 }
@@ -284,6 +287,14 @@ pub fn emit_parser_with_columns_options(
     validate_nesting(dialect)?;
     let parts = match options.graph_source {
         GraphSource::Manual => crate::formats::delimited_parts(dialect),
+        GraphSource::AutoWeighted(profile) => {
+            if crate::synth_formats::supports_weighted(dialect) {
+                crate::synth_formats::synthesize_delimited_parts_with_profile(dialect, profile)
+                    .map_err(|err| CodegenError(format!("synth-weighted {format_name}: {err}")))?
+            } else {
+                crate::formats::delimited_parts(dialect)
+            }
+        }
         GraphSource::SynthWeighted(profile) => {
             crate::synth_formats::synthesize_delimited_parts_with_profile(dialect, profile)
                 .map_err(|err| CodegenError(format!("synth-weighted {format_name}: {err}")))?

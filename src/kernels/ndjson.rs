@@ -623,20 +623,20 @@ mod avx512 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 34u8); // class "\""
-        let v2 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v3 = 0x5555555555555555u64;
-        let v4 = v2 ^ v3;
-        let v5 = { let (partial, c1) = v3.overflowing_add(v4); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v6 = !v5;
-        let v7 = v3 ^ v6;
-        let v8 = !v7;
-        let v9 = v1 & v8;
-        let v10 = { let parity = prefix_xor(v9) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v11 = !v10;
-        let v12 = v0 & v11;
-        (v12, v12 & v0)
+        let v0 = 0x5555555555555555u64;
+        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v2 = v0 ^ v1;
+        let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
+        let v4 = !v3;
+        let v5 = v0 ^ v4;
+        let v6 = eq_mask(lo, hi, 34u8); // class "\""
+        let v7 = !v5;
+        let v8 = v6 & v7;
+        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v10 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v11 = !v9;
+        let v12 = v10 & v11;
+        (v12, v12 & v10)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
@@ -798,20 +798,20 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 34u8); // class "\""
-        let v2 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v3 = 0x5555555555555555u64;
-        let v4 = v2 ^ v3;
-        let v5 = { let (partial, c1) = v3.overflowing_add(v4); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v6 = !v5;
-        let v7 = v3 ^ v6;
-        let v8 = !v7;
-        let v9 = v1 & v8;
-        let v10 = { let parity = prefix_xor(v9) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v11 = !v10;
-        let v12 = v0 & v11;
-        (v12, v12 & v0)
+        let v0 = 0x5555555555555555u64;
+        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v2 = v0 ^ v1;
+        let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
+        let v4 = !v3;
+        let v5 = v0 ^ v4;
+        let v6 = eq_mask(lo, hi, 34u8); // class "\""
+        let v7 = !v5;
+        let v8 = v6 & v7;
+        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v10 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v11 = !v9;
+        let v12 = v10 & v11;
+        (v12, v12 & v10)
     }
 
     #[target_feature(enable = "avx2")]

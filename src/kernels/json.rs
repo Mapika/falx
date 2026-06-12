@@ -1342,21 +1342,21 @@ mod avx512 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v2 = eq_mask(lo, hi, 34u8); // class "\""
-        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v4 = 0x5555555555555555u64;
-        let v5 = v3 ^ v4;
-        let v6 = { let (partial, c1) = v4.overflowing_add(v5); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v7 = !v6;
-        let v8 = v4 ^ v7;
-        let v9 = !v8;
-        let v10 = v2 & v9;
-        let v11 = { let parity = prefix_xor(v10) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v12 = !v11;
-        let v13 = v1 & v12;
-        (v13, v13 & v0)
+        let v0 = 0x5555555555555555u64;
+        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v2 = v0 ^ v1;
+        let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
+        let v4 = !v3;
+        let v5 = v0 ^ v4;
+        let v6 = eq_mask(lo, hi, 34u8); // class "\""
+        let v7 = !v5;
+        let v8 = v6 & v7;
+        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v11 = !v9;
+        let v12 = v10 & v11;
+        let v13 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v12, v12 & v13)
     }
 
     /// `step` twin for the fused nested driver.
@@ -1369,24 +1369,24 @@ mod avx512 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v2 = eq_mask(lo, hi, 34u8); // class "\""
-        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v4 = 0x5555555555555555u64;
-        let v5 = v3 ^ v4;
-        let v6 = { let (partial, c1) = v4.overflowing_add(v5); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v7 = !v6;
-        let v8 = v4 ^ v7;
-        let v9 = !v8;
-        let v10 = v2 & v9;
-        let v11 = { let parity = prefix_xor(v10) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v12 = !v11;
-        let v13 = v1 & v12;
+        let v0 = 0x5555555555555555u64;
+        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v2 = v0 ^ v1;
+        let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
+        let v4 = !v3;
+        let v5 = v0 ^ v4;
+        let v6 = eq_mask(lo, hi, 34u8); // class "\""
+        let v7 = !v5;
+        let v8 = v6 & v7;
+        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v11 = !v9;
+        let v12 = v10 & v11;
         let v14 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
-        let v15 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
-        let v16 = v14 & v13;
-        let v17 = v15 & v13;
-        (v13, v16, v17)
+        let v15 = v14 & v11;
+        let v16 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
+        let v17 = v16 & v11;
+        (v12, v15, v17)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
@@ -1670,21 +1670,21 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v2 = eq_mask(lo, hi, 34u8); // class "\""
-        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v4 = 0x5555555555555555u64;
-        let v5 = v3 ^ v4;
-        let v6 = { let (partial, c1) = v4.overflowing_add(v5); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v7 = !v6;
-        let v8 = v4 ^ v7;
-        let v9 = !v8;
-        let v10 = v2 & v9;
-        let v11 = { let parity = prefix_xor(v10) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v12 = !v11;
-        let v13 = v1 & v12;
-        (v13, v13 & v0)
+        let v0 = 0x5555555555555555u64;
+        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v2 = v0 ^ v1;
+        let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
+        let v4 = !v3;
+        let v5 = v0 ^ v4;
+        let v6 = eq_mask(lo, hi, 34u8); // class "\""
+        let v7 = !v5;
+        let v8 = v6 & v7;
+        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v11 = !v9;
+        let v12 = v10 & v11;
+        let v13 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v12, v12 & v13)
     }
 
     /// `step` twin for the fused nested driver.
@@ -1697,24 +1697,24 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v2 = eq_mask(lo, hi, 34u8); // class "\""
-        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
-        let v4 = 0x5555555555555555u64;
-        let v5 = v3 ^ v4;
-        let v6 = { let (partial, c1) = v4.overflowing_add(v5); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v7 = !v6;
-        let v8 = v4 ^ v7;
-        let v9 = !v8;
-        let v10 = v2 & v9;
-        let v11 = { let parity = prefix_xor(v10) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v12 = !v11;
-        let v13 = v1 & v12;
+        let v0 = 0x5555555555555555u64;
+        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v2 = v0 ^ v1;
+        let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
+        let v4 = !v3;
+        let v5 = v0 ^ v4;
+        let v6 = eq_mask(lo, hi, 34u8); // class "\""
+        let v7 = !v5;
+        let v8 = v6 & v7;
+        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v11 = !v9;
+        let v12 = v10 & v11;
         let v14 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
-        let v15 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
-        let v16 = v14 & v13;
-        let v17 = v15 & v13;
-        (v13, v16, v17)
+        let v15 = v14 & v11;
+        let v16 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
+        let v17 = v16 & v11;
+        (v12, v15, v17)
     }
 
     #[target_feature(enable = "avx2")]

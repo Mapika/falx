@@ -5,10 +5,12 @@ use crate::formats::{DelimitedParts, Dialect, Escape};
 use crate::synth::{
     synthesize_multi, Budget, CostModel, Leaf, MultiOutcome, MultiSpec, Order, Spec, Stats,
 };
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SynthProfile {
     /// Bounded search profile for CI and smoke tests.
     Fast,
@@ -46,7 +48,28 @@ pub fn synthesize_delimited_parts_with_profile(
     profile: SynthProfile,
 ) -> Result<DelimitedParts, SynthFormatError> {
     validate_dialect(dialect)?;
+    let key = SynthKey::new(dialect, profile);
+    if let Some(parts) = cache()
+        .lock()
+        .expect("synth cache poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(parts);
+    }
 
+    let parts = synthesize_delimited_parts_uncached(dialect, profile)?;
+    cache()
+        .lock()
+        .expect("synth cache poisoned")
+        .insert(key, parts.clone());
+    Ok(parts)
+}
+
+fn synthesize_delimited_parts_uncached(
+    dialect: &Dialect,
+    profile: SynthProfile,
+) -> Result<DelimitedParts, SynthFormatError> {
     let corpus = corpus_for(dialect);
     let budget = budget(profile);
     let structural_bytes = dialect.structural.clone();
@@ -163,6 +186,49 @@ pub fn synthesize_delimited_parts_with_profile(
         terminators,
         nest,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SynthKey {
+    structural: Vec<u8>,
+    quote: Option<u8>,
+    escape: EscapeKey,
+    comment: Option<u8>,
+    nesting: Vec<(u8, u8)>,
+    profile: SynthProfile,
+}
+
+impl SynthKey {
+    fn new(dialect: &Dialect, profile: SynthProfile) -> Self {
+        Self {
+            structural: dialect.structural.clone(),
+            quote: dialect.quote,
+            escape: EscapeKey::from(dialect.escape),
+            comment: dialect.comment,
+            nesting: dialect.nesting.clone(),
+            profile,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EscapeKey {
+    None,
+    Backslash(u8),
+}
+
+impl From<Escape> for EscapeKey {
+    fn from(escape: Escape) -> Self {
+        match escape {
+            Escape::None => Self::None,
+            Escape::Backslash(byte) => Self::Backslash(byte),
+        }
+    }
+}
+
+fn cache() -> &'static Mutex<HashMap<SynthKey, DelimitedParts>> {
+    static CACHE: OnceLock<Mutex<HashMap<SynthKey, DelimitedParts>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn budget(profile: SynthProfile) -> Budget {

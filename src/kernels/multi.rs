@@ -814,14 +814,13 @@ mod avx512 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 9u8) | eq_mask(lo, hi, 32u8) | eq_mask(lo, hi, 38u8) | eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 47u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 59u8) | eq_mask(lo, hi, 61u8) | eq_mask(lo, hi, 124u8); // class "\t &,/:;=|"
-        let v2 = v1 | v0;
-        let v3 = eq_mask(lo, hi, 34u8); // class "\""
-        let v4 = { let parity = prefix_xor(v3) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v5 = !v4;
-        let v6 = v2 & v5;
-        (v6, v6 & v0)
+        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
+        let v2 = eq_mask(lo, hi, 9u8) | eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 32u8) | eq_mask(lo, hi, 38u8) | eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 47u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 59u8) | eq_mask(lo, hi, 61u8) | eq_mask(lo, hi, 124u8); // class "\t\n &,/:;=|"
+        let v3 = !v1;
+        let v4 = v2 & v3;
+        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
@@ -1027,14 +1026,13 @@ mod avx2 {
                 _mm256_loadu_si256(ptr.add(32) as *const __m256i),
             )
         };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = { let lo_tbl = _mm256_setr_epi8(2u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 2u8 as i8, 0u8 as i8, 0u8 as i8, 1u8 as i8, 4u8 as i8, 4u8 as i8, 10u8 as i8, 4u8 as i8, 0u8 as i8, 2u8 as i8, 2u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 2u8 as i8, 0u8 as i8, 0u8 as i8, 1u8 as i8, 4u8 as i8, 4u8 as i8, 10u8 as i8, 4u8 as i8, 0u8 as i8, 2u8 as i8); let hi_tbl = _mm256_setr_epi8(1u8 as i8, 0u8 as i8, 2u8 as i8, 4u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 8u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 1u8 as i8, 0u8 as i8, 2u8 as i8, 4u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 8u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8); table_mask(lo, hi, lo_tbl, hi_tbl) }; // class "\t &,/:;=|"
-        let v2 = v1 | v0;
-        let v3 = eq_mask(lo, hi, 34u8); // class "\""
-        let v4 = { let parity = prefix_xor(v3) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v5 = !v4;
-        let v6 = v2 & v5;
-        (v6, v6 & v0)
+        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
+        let v2 = { let lo_tbl = _mm256_setr_epi8(2u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 2u8 as i8, 0u8 as i8, 0u8 as i8, 1u8 as i8, 5u8 as i8, 4u8 as i8, 10u8 as i8, 4u8 as i8, 0u8 as i8, 2u8 as i8, 2u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 2u8 as i8, 0u8 as i8, 0u8 as i8, 1u8 as i8, 5u8 as i8, 4u8 as i8, 10u8 as i8, 4u8 as i8, 0u8 as i8, 2u8 as i8); let hi_tbl = _mm256_setr_epi8(1u8 as i8, 0u8 as i8, 2u8 as i8, 4u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 8u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 1u8 as i8, 0u8 as i8, 2u8 as i8, 4u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 8u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8, 0u8 as i8); table_mask(lo, hi, lo_tbl, hi_tbl) }; // class "\t\n &,/:;=|"
+        let v3 = !v1;
+        let v4 = v2 & v3;
+        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx2")]
