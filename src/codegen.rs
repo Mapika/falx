@@ -134,6 +134,30 @@ impl Column {
     }
 }
 
+/// Source used to build the parser graph before native backend emission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphSource {
+    /// Use the handwritten graph builder in `formats`.
+    Manual,
+    /// Use weighted synthesis to build the graph, then emit the same native
+    /// SIMD backend as manual graph generation.
+    SynthWeighted(crate::synth_formats::SynthProfile),
+}
+
+/// Options for parser code generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodegenOptions {
+    pub graph_source: GraphSource,
+}
+
+impl Default for CodegenOptions {
+    fn default() -> Self {
+        Self {
+            graph_source: GraphSource::Manual,
+        }
+    }
+}
+
 /// Field names the generated `Columns` struct reserves for itself.
 const RESERVED_FIELDS: &[&str] = &["data", "rows"];
 
@@ -247,9 +271,24 @@ pub fn emit_parser_with_columns(
     format_name: &str,
     columns: &[Column],
 ) -> Result<String, CodegenError> {
+    emit_parser_with_columns_options(dialect, format_name, columns, CodegenOptions::default())
+}
+
+pub fn emit_parser_with_columns_options(
+    dialect: &crate::formats::Dialect,
+    format_name: &str,
+    columns: &[Column],
+    options: CodegenOptions,
+) -> Result<String, CodegenError> {
     validate_columns(columns)?;
     validate_nesting(dialect)?;
-    let parts = crate::formats::delimited_parts(dialect);
+    let parts = match options.graph_source {
+        GraphSource::Manual => crate::formats::delimited_parts(dialect),
+        GraphSource::SynthWeighted(profile) => {
+            crate::synth_formats::synthesize_delimited_parts_with_profile(dialect, profile)
+                .map_err(|err| CodegenError(format!("synth-weighted {format_name}: {err}")))?
+        }
+    };
     emit_with(
         &parts.graph,
         format_name,
