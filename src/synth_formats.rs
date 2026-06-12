@@ -90,14 +90,12 @@ pub fn synthesize_delimited_parts_with_profile(
     ];
     let quote_leaves = quote_byte.map(|quote| vec![Leaf::class("Q", &[quote])]);
     let structural_leaves = vec![Leaf::class("Struct", &dialect.structural)];
-    let terminator_leaves = vec![Leaf::class("N", &[b'\n'])];
+    let terminator_leaves = vec![Leaf::class("N", b"\n")];
     let open_leaves = (!dialect.nesting.is_empty()).then(|| vec![Leaf::class("Open", &opens)]);
     let close_leaves = (!dialect.nesting.is_empty()).then(|| vec![Leaf::class("Close", &closes)]);
 
     let mut specs = Vec::new();
     let mut stage_names = Vec::new();
-    let structural_idx;
-    let terminator_idx;
     let mut opens_idx = None;
     let mut closes_idx = None;
 
@@ -122,14 +120,14 @@ pub fn synthesize_delimited_parts_with_profile(
         });
     }
 
-    structural_idx = specs.len();
+    let structural_idx = specs.len();
     stage_names.push("structural mask");
     specs.push(MultiSpec {
         leaves: &structural_leaves,
         spec: Spec::exact(&structural_ref),
     });
 
-    terminator_idx = specs.len();
+    let terminator_idx = specs.len();
     stage_names.push("terminator mask");
     specs.push(MultiSpec {
         leaves: &terminator_leaves,
