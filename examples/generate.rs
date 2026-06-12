@@ -9,6 +9,8 @@ use falx::codegen::{self, CodegenOptions, GraphSource};
 use falx::kernels;
 use falx::synth_formats::{self, SynthProfile};
 
+const USAGE: &str = "usage: generate [--synth weighted]";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerateMode {
     Manual,
@@ -34,7 +36,7 @@ where
                 }
             }
             "--help" | "-h" => {
-                return Err("usage: generate [--synth weighted]".into());
+                return Err(USAGE.into());
             }
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -42,8 +44,24 @@ where
     Ok(mode)
 }
 
+fn wants_help<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|arg| matches!(arg.as_ref(), "--help" | "-h"))
+}
+
 fn main() {
-    let mode = match parse_mode(std::env::args()) {
+    let args: Vec<_> = std::env::args().collect();
+    if wants_help(&args) {
+        println!("{USAGE}");
+        return;
+    }
+
+    let mode = match parse_mode(args) {
         Ok(mode) => mode,
         Err(err) => {
             eprintln!("{err}");
@@ -93,5 +111,18 @@ mod tests {
     fn parse_rejects_unknown_synth_mode() {
         let err = parse_mode(["generate", "--synth", "tree"]).unwrap_err();
         assert!(err.contains("unknown --synth value"));
+    }
+
+    #[test]
+    fn parse_rejects_missing_synth_value() {
+        let err = parse_mode(["generate", "--synth"]).unwrap_err();
+        assert!(err.contains("--synth requires a value"));
+    }
+
+    #[test]
+    fn detects_help_flag() {
+        assert!(wants_help(["generate", "--help"]));
+        assert!(wants_help(["generate", "-h"]));
+        assert!(!wants_help(["generate", "--synth", "weighted"]));
     }
 }
