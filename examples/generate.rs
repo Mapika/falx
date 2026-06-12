@@ -49,9 +49,11 @@ where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
-    args.into_iter()
-        .skip(1)
-        .any(|arg| matches!(arg.as_ref(), "--help" | "-h"))
+    let mut args = args.into_iter().skip(1);
+    let Some(arg) = args.next() else {
+        return false;
+    };
+    matches!(arg.as_ref(), "--help" | "-h") && args.next().is_none()
 }
 
 fn main() {
@@ -124,5 +126,6 @@ mod tests {
         assert!(wants_help(["generate", "--help"]));
         assert!(wants_help(["generate", "-h"]));
         assert!(!wants_help(["generate", "--synth", "weighted"]));
+        assert!(!wants_help(["generate", "--unknown", "--help"]));
     }
 }
