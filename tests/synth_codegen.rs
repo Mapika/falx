@@ -76,6 +76,48 @@ fn weighted_synth_csv_and_tsv_match_manual_graphs() {
 }
 
 #[test]
+fn weighted_synth_json_nesting_matches_manual_outputs() {
+    let dialect = formats::json_dialect();
+    let manual = formats::delimited_parts(&dialect);
+    let synthesized =
+        synth_formats::synthesize_delimited_parts_with_profile(&dialect, SynthProfile::Fast)
+            .expect("fast weighted synthesis should solve JSON nesting");
+    let (manual_opens, manual_closes) = manual.nest.expect("JSON has nesting nodes");
+    let (synth_opens, synth_closes) = synthesized.nest.expect("JSON has nesting nodes");
+
+    let cases = [
+        b"{}".as_slice(),
+        b"{\"a\":[1,2,{\"b\":3}]}",
+        b"{\"quoted\":\"[not structural]\",\"escaped\":\"\\\"}\"}",
+        b"[\n{\"a\":1}, {\"b\":[true,false,null]}]",
+        b"{\"multi\\nline\":\"x\", \"arr\":[{\"k\":\"v\"}]}",
+    ];
+
+    for data in cases {
+        assert_eq!(
+            run_graph(&synthesized.graph, data),
+            run_graph(&manual.graph, data),
+            "JSON structural stream diverged for input {data:?}"
+        );
+        assert_eq!(
+            run_node(&synthesized.graph, synthesized.terminators, data),
+            run_node(&manual.graph, manual.terminators, data),
+            "JSON raw terminator stream diverged for input {data:?}"
+        );
+        assert_eq!(
+            run_node(&synthesized.graph, synth_opens, data),
+            run_node(&manual.graph, manual_opens, data),
+            "JSON live open stream diverged for input {data:?}"
+        );
+        assert_eq!(
+            run_node(&synthesized.graph, synth_closes, data),
+            run_node(&manual.graph, manual_closes, data),
+            "JSON live close stream diverged for input {data:?}"
+        );
+    }
+}
+
+#[test]
 fn weighted_synth_codegen_emits_native_simd_without_fallback() {
     let code = codegen::emit_parser_with_columns_options(
         &formats::csv_dialect(),
@@ -154,4 +196,26 @@ fn weighted_synth_handles_large_structural_sets_in_boundary_corpus() {
         run_graph(&synthesized.graph, &[1, 32, 33, b'\n']),
         vec![0, 1, 3]
     );
+}
+
+#[test]
+fn weighted_synth_rejects_invalid_nesting_dialects() {
+    let dialect = formats::Dialect {
+        structural: vec![b'[', b']'],
+        quote: None,
+        escape: formats::Escape::None,
+        comment: None,
+        nesting: vec![(b'{', b'}')],
+    };
+
+    assert!(!synth_formats::supports_weighted(&dialect));
+
+    let err = match synth_formats::synthesize_delimited_parts_with_profile(
+        &dialect,
+        SynthProfile::Fast,
+    ) {
+        Ok(_) => panic!("invalid nesting should not be synth-supported"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("nesting"));
 }

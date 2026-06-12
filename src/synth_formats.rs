@@ -10,7 +10,7 @@ const EVEN: u64 = 0x5555_5555_5555_5555;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SynthProfile {
-    /// Small search profile for CI and smoke tests.
+    /// Bounded search profile for CI and smoke tests.
     Fast,
     /// Full weighted profile for opt-in kernel generation.
     Weighted,
@@ -38,23 +38,14 @@ impl std::fmt::Display for SynthFormatError {
 impl std::error::Error for SynthFormatError {}
 
 pub fn supports_weighted(dialect: &Dialect) -> bool {
-    dialect.comment.is_none() && !quote_escape_conflict(dialect)
+    validate_dialect(dialect).is_ok()
 }
 
 pub fn synthesize_delimited_parts_with_profile(
     dialect: &Dialect,
     profile: SynthProfile,
 ) -> Result<DelimitedParts, SynthFormatError> {
-    if dialect.comment.is_some() {
-        return Err(SynthFormatError::Unsupported(
-            "comment regions currently use the sequential Regions op",
-        ));
-    }
-    if quote_escape_conflict(dialect) {
-        return Err(SynthFormatError::Unsupported(
-            "quote/escape conflict: quote and escape byte must differ",
-        ));
-    }
+    validate_dialect(dialect)?;
 
     let corpus = corpus_for(dialect);
     let budget = budget(profile);
@@ -177,9 +168,9 @@ pub fn synthesize_delimited_parts_with_profile(
 fn budget(profile: SynthProfile) -> Budget {
     match profile {
         SynthProfile::Fast => Budget {
-            max_level: 18,
-            max_candidates: 5_000_000,
-            max_bank: 500_000,
+            max_level: 28,
+            max_candidates: 20_000_000,
+            max_bank: 2_000_000,
             settle_levels: 0,
             cost: CostModel::avx2(),
             order: Order::Cost,
@@ -285,6 +276,52 @@ fn quote_boundary_case(dialect: &Dialect, alphabet: &[u8]) -> Vec<u8> {
 
 fn quote_escape_conflict(dialect: &Dialect) -> bool {
     matches!(dialect.escape, Escape::Backslash(escape) if dialect.quote == Some(escape))
+}
+
+fn validate_dialect(dialect: &Dialect) -> Result<(), SynthFormatError> {
+    if dialect.comment.is_some() {
+        return Err(SynthFormatError::Unsupported(
+            "comment regions currently use the sequential Regions op",
+        ));
+    }
+    if quote_escape_conflict(dialect) {
+        return Err(SynthFormatError::Unsupported(
+            "quote/escape conflict: quote and escape byte must differ",
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for &(open, close) in &dialect.nesting {
+        if open == close {
+            return Err(SynthFormatError::Unsupported(
+                "nesting pair has identical open and close bytes",
+            ));
+        }
+        for byte in [open, close] {
+            if !dialect.structural.contains(&byte) {
+                return Err(SynthFormatError::Unsupported(
+                    "nesting byte is not in the structural set",
+                ));
+            }
+            if Some(byte) == dialect.quote || Some(byte) == dialect.comment {
+                return Err(SynthFormatError::Unsupported(
+                    "nesting byte conflicts with the quote or comment byte",
+                ));
+            }
+            if byte == b'\n' {
+                return Err(SynthFormatError::Unsupported(
+                    "newline cannot be a nesting byte",
+                ));
+            }
+            if !seen.insert(byte) {
+                return Err(SynthFormatError::Unsupported(
+                    "nesting byte appears in more than one pair",
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn mask_ref(data: &[u8], mut f: impl FnMut(u8) -> bool) -> Vec<u64> {
