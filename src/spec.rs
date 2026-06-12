@@ -74,6 +74,18 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         structural.push(byte);
     }
 
+    // Extract `record_terminator` (optional, string, single byte; default "\n").
+    let record_terminator = match parsed.get("record_terminator") {
+        Some(value) => {
+            let s = value
+                .as_str()
+                .ok_or("'record_terminator' must be a string")?;
+            parse_string_as_byte(s)
+                .map_err(|e| format!("'record_terminator': {}", e))?
+        }
+        None => b'\n',
+    };
+
     // Extract `quote` (optional, string, single byte).
     let quote = match parsed.get("quote") {
         Some(value) => {
@@ -175,6 +187,7 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
 
     let dialect = Dialect {
         structural,
+        record_terminator,
         quote,
         escape,
         comment,
