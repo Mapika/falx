@@ -141,6 +141,7 @@ fn alternative_dialects_differential() {
         // Build the graph for this dialect.
         let g = formats::delimited(&formats::Dialect {
             structural: vec![*delimiter, b'\n'],
+            record_terminator: b'\n',
             quote: Some(*quote),
             escape: formats::Escape::None,
         });
