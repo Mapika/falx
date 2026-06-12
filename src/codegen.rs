@@ -151,12 +151,25 @@ pub enum GraphSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodegenOptions {
     pub graph_source: GraphSource,
+    pub graph_optimizer: GraphOptimizer,
+}
+
+/// Graph optimization pass applied after graph-source selection and before
+/// backend emission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphOptimizer {
+    /// Emit the selected graph as-is. Used for baseline comparisons.
+    Disabled,
+    /// Run the deterministic cost-weighted graph simplifier using the AVX2
+    /// cost model.
+    CostWeightedAvx2,
 }
 
 impl Default for CodegenOptions {
     fn default() -> Self {
         Self {
             graph_source: GraphSource::AutoWeighted(crate::synth_formats::SynthProfile::Weighted),
+            graph_optimizer: GraphOptimizer::CostWeightedAvx2,
         }
     }
 }
@@ -298,6 +311,12 @@ pub fn emit_parser_with_columns_options(
         GraphSource::SynthWeighted(profile) => {
             crate::synth_formats::synthesize_delimited_parts_with_profile(dialect, profile)
                 .map_err(|err| CodegenError(format!("synth-weighted {format_name}: {err}")))?
+        }
+    };
+    let parts = match options.graph_optimizer {
+        GraphOptimizer::Disabled => parts,
+        GraphOptimizer::CostWeightedAvx2 => {
+            crate::graph_opt::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
         }
     };
     emit_with(

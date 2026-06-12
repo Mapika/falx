@@ -1,4 +1,4 @@
-use falx::codegen::{self, CodegenOptions, GraphSource};
+use falx::codegen::{self, CodegenOptions, GraphOptimizer, GraphSource};
 use falx::formats;
 use falx::interp;
 use falx::ir::{Graph, NodeId};
@@ -125,6 +125,7 @@ fn weighted_synth_codegen_emits_native_simd_without_fallback() {
         &[],
         CodegenOptions {
             graph_source: GraphSource::SynthWeighted(SynthProfile::Fast),
+            ..CodegenOptions::default()
         },
     )
     .expect("synth-weighted codegen should succeed");
@@ -149,6 +150,7 @@ fn codegen_default_uses_weighted_when_supported() {
         &[],
         CodegenOptions {
             graph_source: GraphSource::SynthWeighted(SynthProfile::Weighted),
+            ..CodegenOptions::default()
         },
     )
     .expect("weighted codegen should succeed");
@@ -179,11 +181,53 @@ fn codegen_default_uses_manual_for_unsupported_dialects() {
         &columns,
         CodegenOptions {
             graph_source: GraphSource::Manual,
+            ..CodegenOptions::default()
         },
     )
     .expect("manual codegen should succeed");
 
     assert_eq!(default, manual);
+}
+
+#[test]
+fn codegen_default_uses_cost_weighted_graph_optimizer() {
+    let dialect = formats::csv_dialect();
+    let default = codegen::emit_parser_with_columns(&dialect, "csv_opt_default_test", &[])
+        .expect("default codegen should succeed");
+    let explicit = codegen::emit_parser_with_columns_options(
+        &dialect,
+        "csv_opt_default_test",
+        &[],
+        CodegenOptions {
+            graph_optimizer: GraphOptimizer::CostWeightedAvx2,
+            ..CodegenOptions::default()
+        },
+    )
+    .expect("explicit optimizer codegen should succeed");
+
+    assert_eq!(default, explicit);
+}
+
+#[test]
+fn disabled_graph_optimizer_still_emits_native_simd_without_fallback() {
+    let code = codegen::emit_parser_with_columns_options(
+        &formats::csv_dialect(),
+        "csv_unoptimized_test",
+        &[],
+        CodegenOptions {
+            graph_optimizer: GraphOptimizer::Disabled,
+            ..CodegenOptions::default()
+        },
+    )
+    .expect("unoptimized codegen should succeed");
+
+    assert!(!code.contains("pub mod fallback"));
+    assert!(!code.contains("fallback::"));
+    assert!(code.contains("mod avx512"));
+    assert!(
+        code.find("avx512::").expect("AVX-512 dispatch present")
+            < code.find("avx2::").expect("AVX2 dispatch present")
+    );
 }
 
 #[test]

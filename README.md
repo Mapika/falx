@@ -244,7 +244,7 @@ Verification is exhaustive. Every candidate passes 4,000-input differential CEGI
 
 Caveats, stated plainly. An earlier discovery (a PrefixXor-based 9-node form) was 5–8% slower in the kernels despite being smaller; PrefixXor is a carry-less multiply on AVX2. The search now optimizes a per-backend cost model instead of node count. Throughput of the escape kernels is flat either way on this WSL2 box (memory-bandwidth-bound), so the practical win is smaller generated code and one fewer carried state, not GiB/s. With don't-care masks (the stream is only read at quote bytes), the search found a 6-node form. The prover also certifies impossibilities: CR-before-LF needs one byte of lookahead, every IR op is causal, so no graph of any size computes it ([#3](https://github.com/Mapika/falx/issues/3) context).
 
-Multi-output synthesis solves several specs against one corpus, later outputs reusing earlier ones and merging into a shared-CSE graph.
+Multi-output synthesis solves several specs against one corpus, later outputs reusing earlier ones and merging into a shared-CSE graph. Before native code emission, the selected `DelimitedParts` pass through a deterministic cost-weighted graph optimizer: it prunes unreachable nodes, canonicalizes commutative bit ops, folds boolean identities, and remaps the structural/terminator/nesting output roles onto the optimized graph. Codegen accepts the rewrite only when the AVX2 cost model is lower, so equal-cost normalizations do not perturb instruction order in generated kernels.
 
 ## Building on falx
 
@@ -292,7 +292,7 @@ cargo run --example generate        # regenerate src/kernels/ from dialects
 cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 ```
 
-Kernel generation defaults to the weighted auto-discovery path for supported dialects; unsupported dialects such as comment-region CSV stay on the handwritten graph path. To force handwritten graphs for every target, run `cargo run --example generate -- --manual`.
+Kernel generation defaults to weighted auto-discovery plus cost-weighted graph optimization for supported dialects; unsupported dialects such as comment-region CSV stay on the handwritten graph path but still use the optimizer before emission. To force handwritten graphs for every target, run `cargo run --example generate -- --manual`.
 
 ## Roadmap
 
@@ -317,7 +317,7 @@ Kernel generation defaults to the weighted auto-discovery path for supported dia
   nested builder's serial prepass), per-field clean/Cow cost (the
   remaining span-layer headroom, ~2.5 ns/field), configurable record
   terminators ([#3](https://github.com/Mapika/falx/issues/3), in
-  progress), ARM NEON backend, cost-weighted e-graph simplification of format graphs (the synthesizer's cost models are the seed)
+  progress), ARM NEON backend, full equality-saturation graph extraction on top of the current local cost-weighted optimizer
 
 ## License
 

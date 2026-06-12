@@ -82,6 +82,7 @@ fn main() {
         let options = match mode {
             GenerateMode::Manual => CodegenOptions {
                 graph_source: GraphSource::Manual,
+                ..CodegenOptions::default()
             },
             GenerateMode::SynthWeighted => CodegenOptions::default(),
         };

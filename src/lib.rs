@@ -25,9 +25,10 @@
 pub mod avx2;
 pub mod codegen;
 pub mod formats;
-pub mod kernels;
+pub mod graph_opt;
 pub mod interp;
 pub mod ir;
+pub mod kernels;
 pub mod scalar;
 #[cfg(feature = "spec")]
 pub mod spec;
