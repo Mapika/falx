@@ -28,7 +28,11 @@ impl Rng {
         (0..len)
             .map(|_| {
                 let c = self.below(36);
-                if c < 26 { b'a' + c as u8 } else { b'0' + (c - 26) as u8 }
+                if c < 26 {
+                    b'a' + c as u8
+                } else {
+                    b'0' + (c - 26) as u8
+                }
             })
             .collect()
     }
@@ -50,8 +54,8 @@ fn generate_ndjson_escape_heavy(target: usize) -> Vec<u8> {
         let msg_len = 20 + rng.below(40);
         for _ in 0..msg_len {
             match rng.below(4) {
-                0 => data.extend_from_slice(b"\\\""),      // \" escape
-                1 => data.extend_from_slice(b"\\\\"),      // \\ escape
+                0 => data.extend_from_slice(b"\\\""), // \" escape
+                1 => data.extend_from_slice(b"\\\\"), // \\ escape
                 _ => {
                     let c = rng.alnum(1..2);
                     data.extend_from_slice(&c);
@@ -83,8 +87,8 @@ fn generate_logfmt_escape_heavy(target: usize) -> Vec<u8> {
         let val_len = 25 + rng.below(50);
         for _ in 0..val_len {
             match rng.below(4) {
-                0 => data.extend_from_slice(b"\\\""),      // \" escape
-                1 => data.extend_from_slice(b"\\\\"),      // \\ escape
+                0 => data.extend_from_slice(b"\\\""), // \" escape
+                1 => data.extend_from_slice(b"\\\\"), // \\ escape
                 _ => {
                     let c = rng.alnum(1..2);
                     data.extend_from_slice(&c);
@@ -120,8 +124,8 @@ fn generate_json_escape_heavy(target: usize) -> Vec<u8> {
         let val_len = 30 + rng.below(60);
         for _ in 0..val_len {
             match rng.below(4) {
-                0 => data.extend_from_slice(b"\\\""),      // \" escape
-                1 => data.extend_from_slice(b"\\\\"),      // \\ escape
+                0 => data.extend_from_slice(b"\\\""), // \" escape
+                1 => data.extend_from_slice(b"\\\\"), // \\ escape
                 _ => {
                     let c = rng.alnum(1..2);
                     data.extend_from_slice(&c);
@@ -208,50 +212,34 @@ fn check_counts(format: &str, rows: &[Row]) {
 }
 
 fn main() {
-    println!("Structural indexing benchmark: escape-heavy data across ndjson, logfmt, json kernels\n");
+    println!(
+        "Structural indexing benchmark: escape-heavy data across ndjson, logfmt, json kernels\n"
+    );
 
     // NDJSON benchmark
     let ndjson_data = generate_ndjson_escape_heavy(TARGET_BYTES);
-    let ndjson_rows = vec![
-        Row {
-            label: "ndjson",
-            m: measure_indexer(&ndjson_data, falx::kernels::ndjson::index_structurals),
-        },
-        Row {
-            label: "ndjson scalar",
-            m: measure_indexer(&ndjson_data, falx::kernels::ndjson::fallback::index_structurals),
-        },
-    ];
+    let ndjson_rows = vec![Row {
+        label: "ndjson",
+        m: measure_indexer(&ndjson_data, falx::kernels::ndjson::index_structurals),
+    }];
     report("ndjson", ndjson_data.len(), &ndjson_rows);
     check_counts("ndjson", &ndjson_rows);
 
     // Logfmt benchmark
     let logfmt_data = generate_logfmt_escape_heavy(TARGET_BYTES);
-    let logfmt_rows = vec![
-        Row {
-            label: "logfmt",
-            m: measure_indexer(&logfmt_data, falx::kernels::logfmt::index_structurals),
-        },
-        Row {
-            label: "logfmt scalar",
-            m: measure_indexer(&logfmt_data, falx::kernels::logfmt::fallback::index_structurals),
-        },
-    ];
+    let logfmt_rows = vec![Row {
+        label: "logfmt",
+        m: measure_indexer(&logfmt_data, falx::kernels::logfmt::index_structurals),
+    }];
     report("logfmt", logfmt_data.len(), &logfmt_rows);
     check_counts("logfmt", &logfmt_rows);
 
     // JSON benchmark
     let json_data = generate_json_escape_heavy(TARGET_BYTES);
-    let json_rows = vec![
-        Row {
-            label: "json",
-            m: measure_indexer(&json_data, falx::kernels::json::index_structurals),
-        },
-        Row {
-            label: "json scalar",
-            m: measure_indexer(&json_data, falx::kernels::json::fallback::index_structurals),
-        },
-    ];
+    let json_rows = vec![Row {
+        label: "json",
+        m: measure_indexer(&json_data, falx::kernels::json::index_structurals),
+    }];
     report("json", json_data.len(), &json_rows);
     check_counts("json", &json_rows);
 }

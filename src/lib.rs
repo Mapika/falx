@@ -129,36 +129,6 @@ mod tests {
         }
     }
 
-    /// The fused projection driver's portable fallback must agree with the
-    /// dispatched (AVX2 on CI/dev machines) path. In-crate because the
-    /// driver is pub(crate): the sink type never enters the public API.
-    #[test]
-    fn fused_fallback_driver_matches_dispatch() {
-        let mut rng = Rng(0xABCD_EF12_3456_789A);
-        let alphabet: &[u8] = b"\",\n\r0123456789.x";
-        for _ in 0..300 {
-            let len = (rng.next() % 4000) as usize;
-            let data: Vec<u8> = (0..len)
-                .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
-                .collect();
-            let cols = kernels::csv_typed::parse_columns(&data);
-            let mut sink = kernels::csv_typed::ColumnSink::new(&data, 0, data.len() as u32, true);
-            kernels::csv_typed::fallback::index_cells(&data, 0, 0, &mut sink);
-            let fb = sink.finish();
-            assert_eq!(cols.rows, fb.rows, "row count diverged on {:?}", data);
-            assert_eq!(cols.id, fb.id);
-            assert_eq!(cols.id_valid, fb.id_valid);
-            assert!(
-                cols.value.iter().map(|v| v.to_bits()).eq(fb.value.iter().map(|v| v.to_bits())),
-                "f64 column diverged on {:?}",
-                data
-            );
-            assert_eq!(cols.value_valid, fb.value_valid);
-            assert_eq!(cols.label, fb.label);
-            assert_eq!(cols.label_valid, fb.label_valid);
-        }
-    }
-
     #[test]
     fn randomized_differential() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);

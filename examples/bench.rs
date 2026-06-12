@@ -2,12 +2,12 @@
 //!
 //! For each format: ~64 MiB of synthetic data, 1 warmup + 7 timed runs per
 //! parser, best run reported (median printed for noise visibility). The
-//! generated AVX2 kernel is compared against the generated portable
-//! fallback, the hand-written M0 kernel (CSV only — the codegen fidelity
-//! check), and an ecosystem baseline where a fair one exists (csv crate for
-//! CSV, serde_json line-parsing for NDJSON). Baselines do more work than
-//! structural indexing (they materialize values); the comparison shows the
-//! headroom indexing creates, not a like-for-like parse.
+//! generated SIMD kernel is compared against the hand-written M0 kernel
+//! (CSV only — the codegen fidelity check), and an ecosystem baseline where
+//! a fair one exists (csv crate for CSV, serde_json line-parsing for
+//! NDJSON). Baselines do more work than structural indexing (they
+//! materialize values); the comparison shows the headroom indexing creates,
+//! not a like-for-like parse.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -31,7 +31,11 @@ impl Rng {
         (0..len)
             .map(|_| {
                 let c = self.below(36);
-                if c < 26 { b'a' + c as u8 } else { b'0' + (c - 26) as u8 }
+                if c < 26 {
+                    b'a' + c as u8
+                } else {
+                    b'0' + (c - 26) as u8
+                }
             })
             .collect()
     }
@@ -225,16 +229,12 @@ fn main() {
     let data = generate_csv(TARGET_BYTES);
     let mut rows = vec![
         Row {
-            label: "generated kernel (AVX2)",
+            label: "generated kernel (SIMD)",
             m: measure_indexer(&data, falx::kernels::csv::index_structurals),
         },
         Row {
             label: "hand-written M0 kernel",
             m: measure_indexer(&data, falx::index_structurals),
-        },
-        Row {
-            label: "generated fallback (scalar)",
-            m: measure_indexer(&data, falx::kernels::csv::fallback::index_structurals),
         },
     ];
     rows.push(Row {
@@ -402,16 +402,10 @@ fn main() {
 
     // ---- TSV ----
     let data = generate_tsv(TARGET_BYTES);
-    let rows = vec![
-        Row {
-            label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, falx::kernels::tsv::index_structurals),
-        },
-        Row {
-            label: "generated fallback (scalar)",
-            m: measure_indexer(&data, falx::kernels::tsv::fallback::index_structurals),
-        },
-    ];
+    let rows = vec![Row {
+        label: "generated kernel (SIMD)",
+        m: measure_indexer(&data, falx::kernels::tsv::index_structurals),
+    }];
     let rows = {
         let mut rows = rows;
         rows.push(Row {
@@ -429,43 +423,29 @@ fn main() {
         rows
     };
     check_counts("tsv", &rows);
-    report("TSV", data.len(), "generated fallback (scalar)", &rows);
+    report("TSV", data.len(), "generated kernel (SIMD)", &rows);
 
     // ---- logfmt ----
     let data = generate_logfmt(TARGET_BYTES);
-    let rows = vec![
-        Row {
-            label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, falx::kernels::logfmt::index_structurals),
-        },
-        Row {
-            label: "generated fallback (scalar)",
-            m: measure_indexer(&data, falx::kernels::logfmt::fallback::index_structurals),
-        },
-    ];
+    let rows = vec![Row {
+        label: "generated kernel (SIMD)",
+        m: measure_indexer(&data, falx::kernels::logfmt::index_structurals),
+    }];
     check_counts("logfmt", &rows);
-    report("logfmt", data.len(), "generated fallback (scalar)", &rows);
+    report("logfmt", data.len(), "generated kernel (SIMD)", &rows);
 
     // ---- NDJSON: framing kernel vs serde_json full parse ----
     let data = generate_ndjson(TARGET_BYTES);
-    let mut rows = vec![
-        Row {
-            label: "generated kernel (AVX2)",
-            m: measure_indexer(&data, falx::kernels::ndjson::index_structurals),
-        },
-        Row {
-            label: "generated fallback (scalar)",
-            m: measure_indexer(&data, falx::kernels::ndjson::fallback::index_structurals),
-        },
-    ];
+    let mut rows = vec![Row {
+        label: "generated kernel (SIMD)",
+        m: measure_indexer(&data, falx::kernels::ndjson::index_structurals),
+    }];
     check_counts("ndjson", &rows);
     rows.push(Row {
         label: "serde_json (full parse)",
         m: measure(|| {
             let mut count = 0;
-            for line in data.split(|&b| b == b'\n')
-                .filter(|line| !line.is_empty())
-            {
+            for line in data.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
                 serde_json::from_slice::<serde_json::Value>(line).expect("valid json");
                 count += 1;
             }

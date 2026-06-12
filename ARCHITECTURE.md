@@ -9,10 +9,10 @@ The falx parser generator transforms declarative format specifications into self
 3. **IR Graph**: Built by `formats::delimited_parts()`, a DAG of bitstream operations (`src/ir.rs`) on which every execution strategy can operate.
 4. **Execution**:
    - `interp::run()` — reference interpreter (ground truth, byte-at-a-time execution for testing).
-   - `codegen::emit_parser()` — generates a self-contained Rust file with two kernels (AVX2+PCLMULQDQ and scalar fallback), runtime dispatch, and a span API with quote stripping and unescaping.
+   - `codegen::emit_parser()` — generates a self-contained Rust file with native x86 SIMD kernels (AVX-512F/BW/VL+PCLMULQDQ preferred over AVX2+PCLMULQDQ), runtime dispatch, and a span API with quote stripping and unescaping.
 5. **Output**: A single `.rs` file (std-only) exposing `index_structurals(data, out)`, a records/fields span API, and — when the spec declares typed columns — a columnar `parse_columns` API.
 
-All three executors (interp, codegen AVX2, codegen scalar) run the same blockwise node schedule and are differential-testable against each other.
+The interpreter and generated SIMD backends run the same blockwise node schedule and are differential-testable against the byte-at-a-time scalar reference.
 
 ## The Bitstream IR
 
@@ -34,18 +34,18 @@ The emitted code exports `index_structurals(data: &[u8], out: &mut Vec<u32>)`, w
 
 ### Structure
 
-1. **Dispatch wrapper**: Runtime detection of AVX2 + PCLMULQDQ; falls back to scalar.
-2. **Scalar fallback** (`fallback` module):
-   - `step(block: &[u8; 64], carries) -> u64`: Evaluates every IR node over one block, returning the output mask. Inlined.
-   - Implements `Class` via `eq_mask()` (loop over 64 bytes, compare and set bits).
-   - Implements `PrefixXor` via `prefix_xor()` (log-step XOR cascade).
+1. **Dispatch wrapper**: Runtime detection prefers AVX-512F/BW/VL + PCLMULQDQ, then AVX2 + PCLMULQDQ. Unsupported CPUs fail fast instead of embedding scalar fallback code in the generated parser.
+2. **AVX-512 kernel** (`avx512` module):
+   - Same `step()` logic but with target-feature attributes.
+   - `Class` via two 32-byte loads and AVX-512VL `_mm256_cmpeq_epi8_mask`, returning the 64-bit block mask without a movemask instruction.
+   - `PrefixXor` via PCLMULQDQ-based carryless multiply.
 3. **AVX2 kernel** (`avx2` module):
    - Same `step()` logic but with target-feature attributes.
-   - `Class` via `_mm256_cmpeq_epi8` on five u64s (covering all 256 byte values).
+   - `Class` via `_mm256_cmpeq_epi8` over two 32-byte halves; larger classes use PSHUFB nibble lookup tables.
    - `PrefixXor` via PCLMULQDQ-based carryless multiply.
 4. **Drivers**:
-   - Unrolled 128-byte loops (two blocks per iteration) for AVX2 throughput.
-   - Single-block loops for scalar and AVX2 tail handling.
+   - Unrolled 128-byte loops (two blocks per iteration) for SIMD throughput.
+   - Single-block tail handling with zero-padded final blocks.
 5. **Tape indexing** (parser mode only): `push_tape()` flattens structurals into two streams:
    - Separator positions (`seps`).
    - Record ends, encoded as `(cumulative_sep_count << 32) | position`.
@@ -195,8 +195,7 @@ For doubled-quote dialects (no backslash escapes, so quote parity is independent
 
 1. **Scalar reference** (`scalar::index_structurals_spec()`): The ground truth, byte-at-a-time baseline.
 2. **IR interpreter** (`interp::run()`): Reference implementation of the bitstream algebra.
-3. **Generated AVX2 kernel**: The fast path.
-4. **Generated scalar fallback**: Portable, same IR semantics as AVX2 but portable primitives.
+3. **Generated SIMD kernels**: Runtime-dispatched AVX-512 or AVX2 generated code.
 5. **Oracle**: For CSV, cross-validated against the `csv` crate for real-world data.
 
 Tests cover:

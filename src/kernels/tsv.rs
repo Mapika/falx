@@ -11,6 +11,16 @@
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_structurals(data, out) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -18,7 +28,11 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
         unsafe { avx2::index_structurals(data, out) };
         return;
     }
-    fallback::index_structurals(data, out);
+    unsupported_cpu();
+}
+
+fn unsupported_cpu() -> ! {
+    panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
 
 
@@ -59,6 +73,16 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
 
 fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_structurals_seeded(data, seed, base, out) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -66,7 +90,7 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
         unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
         return;
     }
-    fallback::index_structurals_seeded(data, seed, base, out);
+    unsupported_cpu();
 }
 
 /// Parallel [`parse`]: identical tape, built across `threads` chunks.
@@ -111,6 +135,16 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
 
 fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape_seeded(data, seed, base, seps, ends) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -118,10 +152,20 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         unsafe { avx2::index_tape_seeded(data, seed, base, seps, ends) };
         return;
     }
-    fallback::index_tape_seeded(data, seed, base, seps, ends);
+    unsupported_cpu();
 }
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape(data, seps, ends) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -130,7 +174,7 @@ fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         unsafe { avx2::index_tape(data, seps, ends) };
         return;
     }
-    fallback::index_tape(data, seps, ends);
+    unsupported_cpu();
 }
 
 /// Index `data` and return a lazy record/field view over it.
@@ -497,6 +541,16 @@ impl StreamParser {
 
 fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 0], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape_partial(data, carries, base, seps, ends) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -504,10 +558,20 @@ fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 0], base: u32, s
         unsafe { avx2::index_tape_partial(data, carries, base, seps, ends) };
         return;
     }
-    fallback::index_tape_partial(data, carries, base, seps, ends);
+    unsupported_cpu();
 }
 
 fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 0], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape_block(block, live, carries, base, seps, ends) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -516,7 +580,7 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 0]
         unsafe { avx2::index_tape_block(block, live, carries, base, seps, ends) };
         return;
     }
-    fallback::index_tape_block(block, live, carries, base, seps, ends);
+    unsupported_cpu();
 }
 
 /// No quote convention in this dialect: fields are returned verbatim.
@@ -524,13 +588,26 @@ fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Borrowed(raw)
 }
 
-/// Portable kernel, public so the dispatch-bypassed path stays testable.
-pub mod fallback {
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
         let mut offset = 0usize;
+        // Two blocks per iteration: amortizes loop control and lets the
+        // second block's classification overlap the first block's extract.
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let m0 = unsafe { step(data.as_ptr().add(offset)) }.0;
+            push_indexes(m0, offset as u32, out);
+            let m1 = unsafe { step(data.as_ptr().add(offset + 64)) }.0;
+            push_indexes(m1, (offset + 64) as u32, out);
+            offset += 128;
+        }
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let mask = step(block).0;
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let mask = unsafe { step(data.as_ptr().add(offset)) }.0;
             push_indexes(mask, offset as u32, out);
             offset += 64;
         }
@@ -538,20 +615,29 @@ pub mod fallback {
         if rem > 0 {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
-            // Mask off bits that fall in the zero padding.
-            let mask = step(&block).0 & ((1u64 << rem) - 1);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
             push_indexes(mask, offset as u32, out);
         }
     }
 
-    /// Record-aware indexing for [`crate::parse`]-style use: separator
-    /// positions into `seps`, record ends into `ends` encoded as
-    /// (cumulative separator count << 32) | byte position.
+
+    /// Record-aware indexing; structural and terminator masks encode the tape.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe { step(data.as_ptr().add(offset)) };
+            push_tape(m0, t0, offset as u32, seps, ends);
+            let (m1, t1) = unsafe { step(data.as_ptr().add(offset + 64)) };
+            push_tape(m1, t1, (offset + 64) as u32, seps, ends);
+            offset += 128;
+        }
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, term) = step(block);
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
             push_tape(mask, term, offset as u32, seps, ends);
             offset += 64;
         }
@@ -560,7 +646,8 @@ pub mod fallback {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
             let live = (1u64 << rem) - 1;
-            let (mask, term) = step(&block);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr()) };
             push_tape(mask & live, term & live, offset as u32, seps, ends);
         }
     }
@@ -580,12 +667,13 @@ pub mod fallback {
 
     /// Like `index_structurals` but with seeded quote-parity carry and an
     /// absolute base offset: the building block for parallel indexing.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
         let _ = seed;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let mask = step(block).0;
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset)) }.0;
             push_indexes(mask, base + offset as u32, out);
             offset += 64;
         }
@@ -593,18 +681,20 @@ pub mod fallback {
         if rem > 0 {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
-            let mask = step(&block).0 & ((1u64 << rem) - 1);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
             push_indexes(mask, base + offset as u32, out);
         }
     }
 
     /// Seeded-carry, based variant of `index_tape` for parallel parsing.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape_seeded(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = seed;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, term) = step(block);
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
             push_tape(mask, term, base + offset as u32, seps, ends);
             offset += 64;
         }
@@ -613,19 +703,21 @@ pub mod fallback {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
             let live = (1u64 << rem) - 1;
-            let (mask, term) = step(&block);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr()) };
             push_tape(mask & live, term & live, base + offset as u32, seps, ends);
         }
     }
 
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 0], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, term) = step(block);
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
             push_tape(mask, term, base + offset as u32, seps, ends);
             offset += 64;
         }
@@ -633,36 +725,64 @@ pub mod fallback {
 
     /// Index one final zero-padded block (end-of-stream only); `live`
     /// masks off the padding bits.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 0], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
-        let (mask, term) = step(block);
+        // SAFETY: block is a readable 64-byte buffer.
+        let (mask, term) = unsafe { step(block.as_ptr()) };
         push_tape(mask & live, term & live, base, seps, ends);
     }
 
-    #[inline]
-    fn step(block: &[u8; 64]) -> (u64, u64) {
-        let v0 = eq_mask(block, 10u8); // class "\n"
-        let v1 = eq_mask(block, 9u8); // class "\t"
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    unsafe fn step(ptr: *const u8) -> (u64, u64) {
+        // SAFETY: caller guarantees 64 readable bytes at `ptr`.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_loadu_si256(ptr as *const __m256i),
+                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
+            )
+        };
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = eq_mask(lo, hi, 9u8); // class "\t"
         let v2 = v1 | v0;
         (v2, v2 & v0)
     }
 
-    #[inline]
-    fn eq_mask(block: &[u8; 64], byte: u8) -> u64 {
-        let mut mask = 0u64;
-        let mut i = 0;
-        while i < 64 {
-            mask |= ((block[i] == byte) as u64) << i;
-            i += 1;
-        }
-        mask
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
+        let needle = _mm256_set1_epi8(byte as i8);
+        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
+        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
+        lo_bits | (hi_bits << 32)
     }
 
+    /// Branchless bit decoding (simdjson flatten_bits): write indexes in
+    /// unconditional chunks of 8, then expose only the popcount-many real
+    /// entries.
     #[inline]
     fn push_indexes(mut mask: u64, base: u32, out: &mut Vec<u32>) {
-        while mask != 0 {
-            out.push(base + mask.trailing_zeros());
-            mask &= mask - 1;
+        let count = mask.count_ones() as usize;
+        if count == 0 {
+            return;
+        }
+        let len = out.len();
+        out.reserve(count + 8);
+        // SAFETY: capacity covers len + count + 8; chunked writes overshoot
+        // by at most 7 entries and set_len exposes only the real ones.
+        unsafe {
+            let mut ptr = out.as_mut_ptr().add(len);
+            let mut remaining = count as isize;
+            while remaining > 0 {
+                let mut j = 0;
+                while j < 8 {
+                    *ptr.add(j) = base + mask.trailing_zeros();
+                    mask &= mask.wrapping_sub(1);
+                    j += 1;
+                }
+                ptr = ptr.add(8);
+                remaining -= 8;
+            }
+            out.set_len(len + count);
         }
     }
 }
@@ -701,7 +821,7 @@ mod avx2 {
     }
 
 
-    /// Record-aware indexing; see the fallback twin for the tape encoding.
+    /// Record-aware indexing; structural and terminator masks encode the tape.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let mut offset = 0usize;

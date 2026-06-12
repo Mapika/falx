@@ -15,6 +15,16 @@ const CARRY_INIT: [u64; 2] = [0, 0];
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_structurals(data, out) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -22,11 +32,25 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
         unsafe { avx2::index_structurals(data, out) };
         return;
     }
-    fallback::index_structurals(data, out);
+    unsupported_cpu();
+}
+
+fn unsupported_cpu() -> ! {
+    panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
 
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape(data, seps, ends) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -35,7 +59,7 @@ fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         unsafe { avx2::index_tape(data, seps, ends) };
         return;
     }
-    fallback::index_tape(data, seps, ends);
+    unsupported_cpu();
 }
 
 /// Index `data` and return a lazy record/field view over it.
@@ -402,6 +426,16 @@ impl StreamParser {
 
 fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 2], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape_partial(data, carries, base, seps, ends) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -409,10 +443,20 @@ fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 2], base: u32, s
         unsafe { avx2::index_tape_partial(data, carries, base, seps, ends) };
         return;
     }
-    fallback::index_tape_partial(data, carries, base, seps, ends);
+    unsupported_cpu();
 }
 
 fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 2], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape_block(block, live, carries, base, seps, ends) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -421,7 +465,7 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 2]
         unsafe { avx2::index_tape_block(block, live, carries, base, seps, ends) };
         return;
     }
-    fallback::index_tape_block(block, live, carries, base, seps, ends);
+    unsupported_cpu();
 }
 
 /// Strip surrounding quotes and resolve backslash escapes (`\x` -> `x`).
@@ -517,13 +561,22 @@ pub fn parse_nested_into<'a>(data: &'a [u8], recycle: Nested<'_>) -> Nested<'a> 
 
 fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<NestError> {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::nested_tape(data, tape, stack) };
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
         return unsafe { avx2::nested_tape(data, tape, stack) };
     }
-    fallback::nested_tape(data, tape, stack)
+    unsupported_cpu()
 }
 
 /// Consume one block's structural masks in one ordered pass. The masks
@@ -920,6 +973,17 @@ unsafe fn nested_tape_seeded_dispatch(
     pending: &mut Vec<u64>,
 ) -> (Option<NestError>, usize) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: features detected; slot contract forwarded to caller.
+        return unsafe {
+            avx512::nested_tape_seeded(data, seed, pos_base, master, tape_base, stack, pending)
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -928,8 +992,7 @@ unsafe fn nested_tape_seeded_dispatch(
             avx2::nested_tape_seeded(data, seed, pos_base, master, tape_base, stack, pending)
         };
     }
-    // SAFETY: slot contract forwarded to the caller.
-    unsafe { fallback::nested_tape_seeded(data, seed, pos_base, master, tape_base, stack, pending) }
+    unsupported_cpu()
 }
 
 fn nested_prepass_dispatch(
@@ -939,6 +1002,16 @@ fn nested_prepass_dispatch(
     counts: &mut Vec<usize>,
 ) {
     #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::nested_prepass(data, bounds, entries, counts) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
@@ -946,7 +1019,7 @@ fn nested_prepass_dispatch(
         unsafe { avx2::nested_prepass(data, bounds, entries, counts) };
         return;
     }
-    fallback::nested_prepass(data, bounds, entries, counts);
+    unsupported_cpu();
 }
 
 /// `push_nested` twin for parallel chunks: byte reads are chunk-local
@@ -1035,14 +1108,27 @@ unsafe fn push_nested_par(
     error
 }
 
-/// Portable kernel, public so the dispatch-bypassed path stays testable.
-pub mod fallback {
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
         let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
+        // Two blocks per iteration: amortizes loop control and lets the
+        // second block's classification overlap the first block's extract.
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let m0 = unsafe { step(data.as_ptr().add(offset), &mut carries) }.0;
+            push_indexes(m0, offset as u32, out);
+            let m1 = unsafe { step(data.as_ptr().add(offset + 64), &mut carries) }.0;
+            push_indexes(m1, (offset + 64) as u32, out);
+            offset += 128;
+        }
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let mask = step(block, &mut carries).0;
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let mask = unsafe { step(data.as_ptr().add(offset), &mut carries) }.0;
             push_indexes(mask, offset as u32, out);
             offset += 64;
         }
@@ -1050,21 +1136,30 @@ pub mod fallback {
         if rem > 0 {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
-            // Mask off bits that fall in the zero padding.
-            let mask = step(&block, &mut carries).0 & ((1u64 << rem) - 1);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr(), &mut carries) }.0 & ((1u64 << rem) - 1);
             push_indexes(mask, offset as u32, out);
         }
     }
 
-    /// Record-aware indexing for [`crate::parse`]-style use: separator
-    /// positions into `seps`, record ends into `ends` encoded as
-    /// (cumulative separator count << 32) | byte position.
+
+    /// Record-aware indexing; structural and terminator masks encode the tape.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            push_tape(m0, t0, offset as u32, seps, ends);
+            let (m1, t1) = unsafe { step(data.as_ptr().add(offset + 64), &mut carries) };
+            push_tape(m1, t1, (offset + 64) as u32, seps, ends);
+            offset += 128;
+        }
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, term) = step(block, &mut carries);
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
             push_tape(mask, term, offset as u32, seps, ends);
             offset += 64;
         }
@@ -1073,7 +1168,8 @@ pub mod fallback {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
             let live = (1u64 << rem) - 1;
-            let (mask, term) = step(&block, &mut carries);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
             push_tape(mask & live, term & live, offset as u32, seps, ends);
         }
     }
@@ -1091,14 +1187,27 @@ pub mod fallback {
         }
     }
 
-    /// Fused driver for [`crate::parse_nested`]: per-block masks feed the
-    /// bracket matcher directly. Returns the first matching error, if any.
+    /// Fused nested-tape driver.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<super::NestError> {
         let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, o0, c0) = unsafe { step_nested(data.as_ptr().add(offset), &mut carries) };
+            if let Some(err) = super::push_nested(data, m0, o0, c0, offset as u32, tape, stack) {
+                return Some(err);
+            }
+            let (m1, o1, c1) = unsafe { step_nested(data.as_ptr().add(offset + 64), &mut carries) };
+            if let Some(err) = super::push_nested(data, m1, o1, c1, (offset + 64) as u32, tape, stack) {
+                return Some(err);
+            }
+            offset += 128;
+        }
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, opens, closes) = step_nested(block, &mut carries);
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, opens, closes) = unsafe { step_nested(data.as_ptr().add(offset), &mut carries) };
             if let Some(err) = super::push_nested(data, mask, opens, closes, offset as u32, tape, stack) {
                 return Some(err);
             }
@@ -1108,7 +1217,8 @@ pub mod fallback {
         if rem > 0 {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
-            let (mask, opens, closes) = step_nested(&block, &mut carries);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, opens, closes) = unsafe { step_nested(block.as_ptr(), &mut carries) };
             let live = (1u64 << rem) - 1;
             if let Some(err) =
                 super::push_nested(data, mask & live, opens & live, closes & live, offset as u32, tape, stack)
@@ -1124,6 +1234,7 @@ pub mod fallback {
     /// boundary and counting each chunk's structural events — which is
     /// exactly its master-tape slot count. Exact for any dialect, so the
     /// parallel pass can write into disjoint master ranges directly.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn nested_prepass(data: &[u8], bounds: &[usize], entries: &mut Vec<[u64; 2]>, counts: &mut Vec<usize>) {
         let mut carries = super::CARRY_INIT;
         let mut offset = 0usize;
@@ -1132,8 +1243,9 @@ pub mod fallback {
             let bound = bounds[t + 1];
             let mut count = 0usize;
             while offset + 64 <= bound {
-                let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-                let (mask, _) = step(block, &mut carries);
+                // SAFETY: the while guard keeps offset + 64 within data (interior
+                // bounds are 64-aligned and at most data.len()).
+                let (mask, _) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
                 count += mask.count_ones() as usize;
                 offset += 64;
             }
@@ -1142,7 +1254,8 @@ pub mod fallback {
                 let rem = bound - offset;
                 let mut block = [0u8; 64];
                 block[..rem].copy_from_slice(&data[offset..bound]);
-                let (mask, _) = step(&block, &mut carries);
+                // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+                let (mask, _) = unsafe { step(block.as_ptr(), &mut carries) };
                 count += (mask & ((1u64 << rem) - 1)).count_ones() as usize;
                 offset = bound;
             }
@@ -1164,13 +1277,15 @@ pub mod fallback {
     /// `master.add(tape_base + i)` must be valid for `i` up to this
     /// chunk's prepass count, and that slot range must be owned
     /// exclusively by this call.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub unsafe fn nested_tape_seeded(data: &[u8], seed: [u64; 2], pos_base: u32, master: *mut u64, tape_base: usize, stack: &mut Vec<u64>, pending: &mut Vec<u64>) -> (Option<super::NestError>, usize) {
         let mut carries = seed;
         let mut offset = 0usize;
         let mut tlen = 0usize;
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, opens, closes) = step_nested(block, &mut carries);
+            // SAFETY: the while guard keeps offset + 64 within data (interior
+                // bounds are 64-aligned and at most data.len()).
+                let (mask, opens, closes) = unsafe { step_nested(data.as_ptr().add(offset), &mut carries) };
             // SAFETY: forwarded from the caller's contract.
             let err = unsafe { super::push_nested_par(data, mask, opens, closes, offset as u32, pos_base, master, tape_base, &mut tlen, stack, pending) };
             if err.is_some() {
@@ -1182,7 +1297,8 @@ pub mod fallback {
         if rem > 0 {
             let mut block = [0u8; 64];
             block[..rem].copy_from_slice(&data[offset..]);
-            let (mask, opens, closes) = step_nested(&block, &mut carries);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+                let (mask, opens, closes) = unsafe { step_nested(block.as_ptr(), &mut carries) };
             let live = (1u64 << rem) - 1;
             // SAFETY: forwarded from the caller's contract.
             let err = unsafe { super::push_nested_par(data, mask & live, opens & live, closes & live, offset as u32, pos_base, master, tape_base, &mut tlen, stack, pending) };
@@ -1195,12 +1311,13 @@ pub mod fallback {
 
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 2], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
-            let block: &[u8; 64] = data[offset..offset + 64].try_into().unwrap();
-            let (mask, term) = step(block, carries);
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), carries) };
             push_tape(mask, term, base + offset as u32, seps, ends);
             offset += 64;
         }
@@ -1208,18 +1325,27 @@ pub mod fallback {
 
     /// Index one final zero-padded block (end-of-stream only); `live`
     /// masks off the padding bits.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 2], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let _ = &carries;
-        let (mask, term) = step(block, carries);
+        // SAFETY: block is a readable 64-byte buffer.
+        let (mask, term) = unsafe { step(block.as_ptr(), carries) };
         push_tape(mask & live, term & live, base, seps, ends);
     }
 
-    #[inline]
-    fn step(block: &[u8; 64], carries: &mut [u64; 2]) -> (u64, u64) {
-        let v0 = eq_mask(block, 10u8); // class "\n"
-        let v1 = eq_mask(block, 44u8) | eq_mask(block, 58u8) | eq_mask(block, 91u8) | eq_mask(block, 93u8) | eq_mask(block, 123u8) | eq_mask(block, 125u8); // class ",:[]{}"
-        let v2 = eq_mask(block, 34u8); // class "\""
-        let v3 = eq_mask(block, 92u8); // class "\\"
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    unsafe fn step(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64) {
+        // SAFETY: caller guarantees 64 readable bytes at `ptr`.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_loadu_si256(ptr as *const __m256i),
+                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
+            )
+        };
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v2 = eq_mask(lo, hi, 34u8); // class "\""
+        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
         let v4 = 0x5555555555555555u64;
         let v5 = v3 ^ v4;
         let v6 = { let (partial, c1) = v4.overflowing_add(v5); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
@@ -1233,13 +1359,19 @@ pub mod fallback {
         (v13, v13 & v0)
     }
 
-    /// `step` twin for the fused nested driver: (structural, open-bracket,
-    /// close-bracket) masks. Lines are pruned to this return's needs.
-    #[inline]
-    fn step_nested(block: &[u8; 64], carries: &mut [u64; 2]) -> (u64, u64, u64) {
-        let v1 = eq_mask(block, 44u8) | eq_mask(block, 58u8) | eq_mask(block, 91u8) | eq_mask(block, 93u8) | eq_mask(block, 123u8) | eq_mask(block, 125u8); // class ",:[]{}"
-        let v2 = eq_mask(block, 34u8); // class "\""
-        let v3 = eq_mask(block, 92u8); // class "\\"
+    /// `step` twin for the fused nested driver.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    unsafe fn step_nested(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64, u64) {
+        // SAFETY: caller guarantees 64 readable bytes at `ptr`.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_loadu_si256(ptr as *const __m256i),
+                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
+            )
+        };
+        let v1 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v2 = eq_mask(lo, hi, 34u8); // class "\""
+        let v3 = eq_mask(lo, hi, 92u8); // class "\\"
         let v4 = 0x5555555555555555u64;
         let v5 = v3 ^ v4;
         let v6 = { let (partial, c1) = v4.overflowing_add(v5); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
@@ -1250,40 +1382,56 @@ pub mod fallback {
         let v11 = { let parity = prefix_xor(v10) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v12 = !v11;
         let v13 = v1 & v12;
-        let v14 = eq_mask(block, 91u8) | eq_mask(block, 123u8); // class "[{"
-        let v15 = eq_mask(block, 93u8) | eq_mask(block, 125u8); // class "]}"
+        let v14 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
+        let v15 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
         let v16 = v14 & v13;
         let v17 = v15 & v13;
         (v13, v16, v17)
     }
 
-    #[inline]
-    fn eq_mask(block: &[u8; 64], byte: u8) -> u64 {
-        let mut mask = 0u64;
-        let mut i = 0;
-        while i < 64 {
-            mask |= ((block[i] == byte) as u64) << i;
-            i += 1;
-        }
-        mask
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
+        let needle = _mm256_set1_epi8(byte as i8);
+        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
+        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
+        lo_bits | (hi_bits << 32)
     }
 
-    #[inline]
-    fn prefix_xor(mut x: u64) -> u64 {
-        x ^= x << 1;
-        x ^= x << 2;
-        x ^= x << 4;
-        x ^= x << 8;
-        x ^= x << 16;
-        x ^= x << 32;
-        x
+    #[target_feature(enable = "pclmulqdq")]
+    fn prefix_xor(mask: u64) -> u64 {
+        let ones = _mm_set1_epi8(-1);
+        let value = _mm_set_epi64x(0, mask as i64);
+        let product = _mm_clmulepi64_si128::<0>(value, ones);
+        _mm_cvtsi128_si64(product) as u64
     }
 
+    /// Branchless bit decoding (simdjson flatten_bits): write indexes in
+    /// unconditional chunks of 8, then expose only the popcount-many real
+    /// entries.
     #[inline]
     fn push_indexes(mut mask: u64, base: u32, out: &mut Vec<u32>) {
-        while mask != 0 {
-            out.push(base + mask.trailing_zeros());
-            mask &= mask - 1;
+        let count = mask.count_ones() as usize;
+        if count == 0 {
+            return;
+        }
+        let len = out.len();
+        out.reserve(count + 8);
+        // SAFETY: capacity covers len + count + 8; chunked writes overshoot
+        // by at most 7 entries and set_len exposes only the real ones.
+        unsafe {
+            let mut ptr = out.as_mut_ptr().add(len);
+            let mut remaining = count as isize;
+            while remaining > 0 {
+                let mut j = 0;
+                while j < 8 {
+                    *ptr.add(j) = base + mask.trailing_zeros();
+                    mask &= mask.wrapping_sub(1);
+                    j += 1;
+                }
+                ptr = ptr.add(8);
+                remaining -= 8;
+            }
+            out.set_len(len + count);
         }
     }
 }
@@ -1323,7 +1471,7 @@ mod avx2 {
     }
 
 
-    /// Record-aware indexing; see the fallback twin for the tape encoding.
+    /// Record-aware indexing; structural and terminator masks encode the tape.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
         let mut carries = super::CARRY_INIT;
@@ -1367,7 +1515,7 @@ mod avx2 {
         }
     }
 
-    /// Fused nested-tape driver; see the fallback twin for semantics.
+    /// Fused nested-tape driver.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub fn nested_tape(data: &[u8], tape: &mut Vec<u64>, stack: &mut Vec<u64>) -> Option<super::NestError> {
         let mut carries = super::CARRY_INIT;
@@ -1539,7 +1687,7 @@ mod avx2 {
         (v13, v13 & v0)
     }
 
-    /// `step` twin for the fused nested driver; see the fallback twin.
+    /// `step` twin for the fused nested driver.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step_nested(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.

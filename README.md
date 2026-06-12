@@ -10,9 +10,10 @@ such generator currently exists.
 $ cargo run --features cli --bin falx -- build specs/logfmt.toml -o logfmt_parser.rs
 ```
 
-The output is a single self-contained Rust file (std only): an
-AVX2+PCLMULQDQ structural indexer with a portable scalar fallback, runtime
-dispatch, and a zero-copy record/field API — ready to drop into any project:
+The output is a single self-contained Rust file (std only): native x86 SIMD
+structural indexers with AVX-512F/BW/VL+PCLMULQDQ preferred over
+AVX2+PCLMULQDQ at runtime, plus a zero-copy record/field API — ready to
+drop into any project:
 
 ```rust
 let parsed = logfmt_parser::parse(&data);
@@ -46,12 +47,12 @@ let ok = parser::bitmap_get(&cols.latitude_valid, row);  // Arrow-style
 Intel Core Ultra 9 285H (AVX2 + PCLMULQDQ, WSL2, Rust 1.93), 64 MiB
 synthetic data per format, best of 7 runs:
 
-| format | generated kernel | generated scalar fallback | ecosystem baseline |
-|---|---|---|---|
-| CSV | 5.61 GiB/s serial, **9.14 GiB/s parallel x16** | 0.67 GiB/s | csv crate 0.47 GiB/s |
-| TSV | 7.33 GiB/s serial, **13.17 GiB/s parallel x16** | 0.98 GiB/s | — |
-| logfmt | **4.99 GiB/s** | 0.42 GiB/s | — |
-| NDJSON framing | **6.61 GiB/s** | 0.76 GiB/s | serde_json 0.24 GiB/s (27x slower), simd-json tape 0.41 GiB/s (16x slower) |
+| format | generated kernel | ecosystem baseline |
+|---|---|---|
+| CSV | 5.61 GiB/s serial, **9.14 GiB/s parallel x16** | csv crate 0.47 GiB/s |
+| TSV | 7.33 GiB/s serial, **13.17 GiB/s parallel x16** | — |
+| logfmt | **4.99 GiB/s** | — |
+| NDJSON framing | **6.61 GiB/s** | serde_json 0.24 GiB/s (27x slower), simd-json tape 0.41 GiB/s (16x slower) |
 
 Structural indexing is less work than the baselines do (they materialize
 values), so those speedups show headroom. The **like-for-like** comparison —
@@ -179,12 +180,11 @@ Codegen fidelity: after two-block unrolling in the emitter, the generated
 CSV kernel outruns the hand-written kernel it was modeled on
 (5.61 vs 5.12 GiB/s).
 
-Correctness: every kernel is differential-tested — generated AVX2, generated
-scalar fallback, the IR interpreter, and an independent byte-at-a-time
-reference must agree bit-for-bit across thousands of randomized inputs,
-including escape runs and quotes spanning 64-byte block boundaries. The
-benchmark additionally cross-checks structural counts between
-implementations at runtime.
+Correctness: every kernel is differential-tested — generated SIMD dispatch,
+the IR interpreter, and an independent byte-at-a-time reference must agree
+bit-for-bit across thousands of randomized inputs, including escape runs
+and quotes spanning 64-byte block boundaries. The benchmark additionally
+cross-checks structural counts between implementations at runtime.
 
 ## How it works
 

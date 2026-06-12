@@ -52,14 +52,20 @@ fn hand_picked_comment_semantics() {
     // A comment line between quoted multi-line fields must not confuse
     // quote context, and a quote inside a comment must be inert.
     let tricky = b"#comment with one \" quote\na,\"multi\nline\"\n#another \" stray\nb,2\n";
-    let recs: Vec<Vec<u8>> = k::parse(tricky).records().map(|r| r.as_bytes().to_vec()).collect();
+    let recs: Vec<Vec<u8>> = k::parse(tricky)
+        .records()
+        .map(|r| r.as_bytes().to_vec())
+        .collect();
     assert_eq!(recs, vec![b"a,\"multi\nline\"".to_vec(), b"b,2".to_vec()]);
 }
 
 #[test]
 fn streaming_skips_comments_like_batch() {
     let data = b"# c1\nfoo,1\n#c2,x\nbar,2\n# trailing";
-    let batch: Vec<Vec<u8>> = k::parse(data).records().map(|r| r.as_bytes().to_vec()).collect();
+    let batch: Vec<Vec<u8>> = k::parse(data)
+        .records()
+        .map(|r| r.as_bytes().to_vec())
+        .collect();
     for feed in [1usize, 3, 7, 64, 1024] {
         let mut streamed = Vec::new();
         let mut sp = k::stream();
@@ -71,10 +77,10 @@ fn streaming_skips_comments_like_batch() {
     }
 }
 
-/// Structural-level differential: generated AVX2, generated fallback, and
-/// the IR interpreter must agree with the comment-aware scalar reference,
-/// with comment bytes, quotes, and newlines interleaving freely across
-/// 64-byte block boundaries.
+/// Structural-level differential: generated SIMD dispatch and the IR
+/// interpreter must agree with the comment-aware scalar reference, with
+/// comment bytes, quotes, and newlines interleaving freely across 64-byte
+/// block boundaries.
 #[test]
 fn randomized_structural_differential() {
     let d = formats::csv_hash_dialect();
@@ -87,7 +93,14 @@ fn randomized_structural_differential() {
             .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
             .collect();
         let mut expected = Vec::new();
-        scalar::index_structurals_spec(&input, &d.structural, d.quote, None, d.comment, &mut expected);
+        scalar::index_structurals_spec(
+            &input,
+            &d.structural,
+            d.quote,
+            None,
+            d.comment,
+            &mut expected,
+        );
         let mut got = Vec::new();
         k::index_structurals(&input, &mut got);
         assert_eq!(
@@ -96,9 +109,6 @@ fn randomized_structural_differential() {
             "dispatched divergence round {round} on {:?}",
             String::from_utf8_lossy(&input)
         );
-        let mut fb = Vec::new();
-        k::fallback::index_structurals(&input, &mut fb);
-        assert_eq!(fb, expected, "fallback divergence round {round}");
         let mut ir = Vec::new();
         interp::run(&g, &input, &mut ir);
         assert_eq!(ir, expected, "interp divergence round {round}");
@@ -158,7 +168,10 @@ fn randomized_record_differential() {
             .collect();
         // NOTE: this dumb split is only valid because the generator never
         // emits quote bytes outside comment lines.
-        let got: Vec<Vec<u8>> = k::parse(&data).records().map(|r| r.as_bytes().to_vec()).collect();
+        let got: Vec<Vec<u8>> = k::parse(&data)
+            .records()
+            .map(|r| r.as_bytes().to_vec())
+            .collect();
         assert_eq!(
             got.len(),
             expected.len(),
@@ -166,7 +179,12 @@ fn randomized_record_differential() {
             String::from_utf8_lossy(&data)
         );
         for (g, e) in got.iter().zip(expected.iter()) {
-            assert_eq!(g.as_slice(), *e, "record mismatch on {:?}", String::from_utf8_lossy(&data));
+            assert_eq!(
+                g.as_slice(),
+                *e,
+                "record mismatch on {:?}",
+                String::from_utf8_lossy(&data)
+            );
         }
     }
 }

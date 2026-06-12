@@ -25,14 +25,45 @@ fn generated_kernels_match_codegen() {
             .expect("codegen should succeed");
 
         let path = format!("{}/src/kernels/{}.rs", env!("CARGO_MANIFEST_DIR"), name);
-        let expected = std::fs::read_to_string(&path)
-            .expect("failed to read checked-in kernel file");
+        let expected =
+            std::fs::read_to_string(&path).expect("failed to read checked-in kernel file");
 
         assert_eq!(
             generated, expected,
             "Generated code for {} does not match checked-in kernel at {}.\n\
              This is a drift test: run `cargo run --example generate` to regenerate.",
             name, path
+        );
+    }
+}
+
+/// Generated kernels are native SIMD artifacts: the emitted source should
+/// contain only runtime-selected x86 SIMD backends, not a portable fallback
+/// module.
+#[test]
+fn generated_kernels_emit_native_simd_without_fallback() {
+    for (name, dialect, columns) in falx::kernels::targets() {
+        let generated = codegen::emit_parser_with_columns(&dialect, name, &columns)
+            .expect("codegen should succeed");
+
+        assert!(
+            !generated.contains("pub mod fallback"),
+            "{name} still emits the portable fallback module"
+        );
+        assert!(
+            !generated.contains("fallback::"),
+            "{name} still dispatches to the portable fallback path"
+        );
+        assert!(
+            generated.contains("mod avx512"),
+            "{name} does not emit the native AVX-512 backend"
+        );
+        assert!(
+            generated
+                .find("avx512::")
+                .expect("AVX-512 dispatch present")
+                < generated.find("avx2::").expect("AVX2 dispatch present"),
+            "{name} should prefer the AVX-512 backend before AVX2"
         );
     }
 }
@@ -106,34 +137,18 @@ fn generated_kernels_differential() {
                 _ => panic!("unknown format: {}", name),
             }
 
-            // Test fallback kernel.
-            let mut fallback = Vec::new();
-            match *name {
-                "csv" => falx::kernels::csv::fallback::index_structurals(&data, &mut fallback),
-                "tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
-                "logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
-                "ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
-                "multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
-                "csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
-                _ => panic!("unknown format: {}", name),
-            }
-
             assert_eq!(
                 dispatched, expected,
                 "dispatched kernel mismatch for {} test {}: dispatched={:?}, expected={:?}",
                 name, test_num, dispatched, expected
-            );
-            assert_eq!(
-                fallback, expected,
-                "fallback kernel mismatch for {} test {}: fallback={:?}, expected={:?}",
-                name, test_num, fallback, expected
             );
         }
     }
 }
 
 /// Test 3: Generated kernels with long input.
-/// Each format tested with a 100_000 byte randomized input; all three paths (dispatched, fallback, scalar) must agree.
+/// Each format tested with a 100_000 byte randomized input; dispatched
+/// generated SIMD must agree with the independent scalar reference.
 #[test]
 fn generated_kernels_long_input() {
     let formats = [
@@ -199,20 +214,11 @@ fn generated_kernels_long_input() {
             _ => panic!("unknown format: {}", name),
         }
 
-        // Test fallback kernel.
-        let mut fallback = Vec::new();
-        match *name {
-            "csv" => falx::kernels::csv::fallback::index_structurals(&data, &mut fallback),
-            "tsv" => falx::kernels::tsv::fallback::index_structurals(&data, &mut fallback),
-            "logfmt" => falx::kernels::logfmt::fallback::index_structurals(&data, &mut fallback),
-            "ndjson" => falx::kernels::ndjson::fallback::index_structurals(&data, &mut fallback),
-            "multi" => falx::kernels::multi::fallback::index_structurals(&data, &mut fallback),
-            "csv_hash" => falx::kernels::csv_hash::fallback::index_structurals(&data, &mut fallback),
-            _ => panic!("unknown format: {}", name),
-        }
-
-        assert_eq!(dispatched, expected, "dispatched kernel mismatch for {} long input", name);
-        assert_eq!(fallback, expected, "fallback kernel mismatch for {} long input", name);
+        assert_eq!(
+            dispatched, expected,
+            "dispatched kernel mismatch for {} long input",
+            name
+        );
     }
 }
 
@@ -267,7 +273,10 @@ fn parallel_index_matches_serial() {
         for threads in [1, 2, 3, 7, 16] {
             let mut par = Vec::new();
             falx::kernels::csv::index_structurals_par(&data, threads, &mut par);
-            assert_eq!(par, serial, "csv par mismatch at {threads} threads, len {len}");
+            assert_eq!(
+                par, serial,
+                "csv par mismatch at {threads} threads, len {len}"
+            );
             let mut par_tsv = Vec::new();
             falx::kernels::tsv::index_structurals_par(&data, threads, &mut par_tsv);
             let mut serial_tsv = Vec::new();
