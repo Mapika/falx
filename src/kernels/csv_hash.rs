@@ -965,16 +965,15 @@ mod avx512 {
             )
         };
         let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 44u8); // class ","
-        let v2 = v1 | v0;
-        let v3 = eq_mask(lo, hi, 34u8); // class "\""
-        let v4 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
-        let v5 = eq_mask(lo, hi, 35u8); // class "#"
-        let v6 = v5 & v4;
-        let v7 = resolve_regions(v3, v6, v0, &mut carries[1]);
-        let v8 = !v7;
-        let v9 = v2 & v8;
-        (v9, v9 & v0)
+        let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
+        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v3 = v1 & v2;
+        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
+        let v6 = !v5;
+        let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v8 = v6 & v7;
+        (v8, v8 & v0)
     }
 
     /// Three-state (normal/quote/comment) region resolution: walks the set
@@ -1210,16 +1209,15 @@ mod avx2 {
             )
         };
         let v0 = eq_mask(lo, hi, 10u8); // class "\n"
-        let v1 = eq_mask(lo, hi, 44u8); // class ","
-        let v2 = v1 | v0;
-        let v3 = eq_mask(lo, hi, 34u8); // class "\""
-        let v4 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
-        let v5 = eq_mask(lo, hi, 35u8); // class "#"
-        let v6 = v5 & v4;
-        let v7 = resolve_regions(v3, v6, v0, &mut carries[1]);
-        let v8 = !v7;
-        let v9 = v2 & v8;
-        (v9, v9 & v0)
+        let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
+        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v3 = v1 & v2;
+        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
+        let v6 = !v5;
+        let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v8 = v6 & v7;
+        (v8, v8 & v0)
     }
 
     /// Three-state (normal/quote/comment) region resolution: walks the set

@@ -1346,17 +1346,15 @@ mod avx512 {
         let v1 = eq_mask(lo, hi, 92u8); // class "\\"
         let v2 = v0 ^ v1;
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v4 = !v3;
-        let v5 = v0 ^ v4;
-        let v6 = eq_mask(lo, hi, 34u8); // class "\""
-        let v7 = !v5;
-        let v8 = v6 & v7;
-        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v11 = !v9;
-        let v12 = v10 & v11;
-        let v13 = eq_mask(lo, hi, 10u8); // class "\n"
-        (v12, v12 & v13)
+        let v4 = v0 ^ v3;
+        let v5 = eq_mask(lo, hi, 34u8); // class "\""
+        let v6 = v4 & v5;
+        let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v8 = !v7;
+        let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v10 = v8 & v9;
+        let v11 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v10, v10 & v11)
     }
 
     /// `step` twin for the fused nested driver.
@@ -1373,20 +1371,18 @@ mod avx512 {
         let v1 = eq_mask(lo, hi, 92u8); // class "\\"
         let v2 = v0 ^ v1;
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v4 = !v3;
-        let v5 = v0 ^ v4;
-        let v6 = eq_mask(lo, hi, 34u8); // class "\""
-        let v7 = !v5;
-        let v8 = v6 & v7;
-        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v11 = !v9;
-        let v12 = v10 & v11;
-        let v14 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
-        let v15 = v14 & v11;
-        let v16 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
-        let v17 = v16 & v11;
-        (v12, v15, v17)
+        let v4 = v0 ^ v3;
+        let v5 = eq_mask(lo, hi, 34u8); // class "\""
+        let v6 = v4 & v5;
+        let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v8 = !v7;
+        let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v10 = v8 & v9;
+        let v12 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
+        let v13 = v8 & v12;
+        let v14 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
+        let v15 = v8 & v14;
+        (v10, v13, v15)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
@@ -1674,17 +1670,15 @@ mod avx2 {
         let v1 = eq_mask(lo, hi, 92u8); // class "\\"
         let v2 = v0 ^ v1;
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v4 = !v3;
-        let v5 = v0 ^ v4;
-        let v6 = eq_mask(lo, hi, 34u8); // class "\""
-        let v7 = !v5;
-        let v8 = v6 & v7;
-        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v11 = !v9;
-        let v12 = v10 & v11;
-        let v13 = eq_mask(lo, hi, 10u8); // class "\n"
-        (v12, v12 & v13)
+        let v4 = v0 ^ v3;
+        let v5 = eq_mask(lo, hi, 34u8); // class "\""
+        let v6 = v4 & v5;
+        let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v8 = !v7;
+        let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v10 = v8 & v9;
+        let v11 = eq_mask(lo, hi, 10u8); // class "\n"
+        (v10, v10 & v11)
     }
 
     /// `step` twin for the fused nested driver.
@@ -1701,20 +1695,18 @@ mod avx2 {
         let v1 = eq_mask(lo, hi, 92u8); // class "\\"
         let v2 = v0 ^ v1;
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
-        let v4 = !v3;
-        let v5 = v0 ^ v4;
-        let v6 = eq_mask(lo, hi, 34u8); // class "\""
-        let v7 = !v5;
-        let v8 = v6 & v7;
-        let v9 = { let parity = prefix_xor(v8) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
-        let v10 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v11 = !v9;
-        let v12 = v10 & v11;
-        let v14 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
-        let v15 = v14 & v11;
-        let v16 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
-        let v17 = v16 & v11;
-        (v12, v15, v17)
+        let v4 = v0 ^ v3;
+        let v5 = eq_mask(lo, hi, 34u8); // class "\""
+        let v6 = v4 & v5;
+        let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
+        let v8 = !v7;
+        let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
+        let v10 = v8 & v9;
+        let v12 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
+        let v13 = v8 & v12;
+        let v14 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
+        let v15 = v8 & v14;
+        (v10, v13, v15)
     }
 
     #[target_feature(enable = "avx2")]

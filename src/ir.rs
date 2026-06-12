@@ -54,6 +54,22 @@ impl CharClass {
         self.bits
     }
 
+    /// Rebuild a class from its membership bitmap (inverse of [`Self::words`]).
+    pub const fn from_words(bits: [u64; 4]) -> Self {
+        Self { bits }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bits == [0; 4]
+    }
+
     pub fn members(&self) -> impl Iterator<Item = u8> + '_ {
         (0..=255u8).filter(|&byte| self.contains(byte))
     }
