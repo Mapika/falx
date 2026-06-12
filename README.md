@@ -292,6 +292,8 @@ cargo run --example generate        # regenerate src/kernels/ from dialects
 cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 ```
 
+Kernel generation defaults to the handwritten format graph path. To try the weighted auto-discovery path for supported dialects, run `cargo run --example generate -- --synth weighted`; unsupported dialects such as comment-region CSV stay on the manual graph path in this opt-in mode.
+
 ## Roadmap
 
 - M0 (done): hand-written AVX2 CSV structural indexer, benchmark methodology
