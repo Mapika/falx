@@ -3,7 +3,7 @@
 
 use crate::formats::{DelimitedParts, Dialect, Escape};
 use crate::synth::{
-    Budget, CostModel, Leaf, MultiOutcome, MultiSpec, Order, Spec, Stats, synthesize_multi,
+    synthesize_multi, Budget, CostModel, Leaf, MultiOutcome, MultiSpec, Order, Spec, Stats,
 };
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
@@ -38,7 +38,7 @@ impl std::fmt::Display for SynthFormatError {
 impl std::error::Error for SynthFormatError {}
 
 pub fn supports_weighted(dialect: &Dialect) -> bool {
-    dialect.comment.is_none()
+    dialect.comment.is_none() && !quote_escape_conflict(dialect)
 }
 
 pub fn synthesize_delimited_parts_with_profile(
@@ -48,6 +48,11 @@ pub fn synthesize_delimited_parts_with_profile(
     if dialect.comment.is_some() {
         return Err(SynthFormatError::Unsupported(
             "comment regions currently use the sequential Regions op",
+        ));
+    }
+    if quote_escape_conflict(dialect) {
+        return Err(SynthFormatError::Unsupported(
+            "quote/escape conflict: quote and escape byte must differ",
         ));
     }
 
@@ -260,7 +265,10 @@ fn runs(alphabet: &[u8], blocks: usize, rng: &mut Rng) -> Vec<u8> {
 }
 
 fn quote_boundary_case(dialect: &Dialect, alphabet: &[u8]) -> Vec<u8> {
-    let mut data = vec![alphabet[0]; 192];
+    let structural_len =
+        21usize.saturating_add(dialect.structural.len().saturating_sub(1).saturating_mul(7));
+    let len = structural_len.next_multiple_of(64).max(192);
+    let mut data = vec![alphabet[0]; len];
     if let Some(quote) = dialect.quote {
         for pos in [0usize, 63, 64, 65, 127, 128] {
             data[pos] = quote;
@@ -275,6 +283,10 @@ fn quote_boundary_case(dialect: &Dialect, alphabet: &[u8]) -> Vec<u8> {
         data[20 + i * 7] = byte;
     }
     data
+}
+
+fn quote_escape_conflict(dialect: &Dialect) -> bool {
+    matches!(dialect.escape, Escape::Backslash(escape) if dialect.quote == Some(escape))
 }
 
 fn mask_ref(data: &[u8], mut f: impl FnMut(u8) -> bool) -> Vec<u64> {

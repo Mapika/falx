@@ -81,7 +81,9 @@ fn weighted_synth_codegen_emits_native_simd_without_fallback() {
         &formats::csv_dialect(),
         "csv_synth_test",
         &[],
-        CodegenOptions { graph_source: GraphSource::SynthWeighted(SynthProfile::Fast) },
+        CodegenOptions {
+            graph_source: GraphSource::SynthWeighted(SynthProfile::Fast),
+        },
     )
     .expect("synth-weighted codegen should succeed");
 
@@ -107,4 +109,49 @@ fn weighted_synth_rejects_comment_region_dialects() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("comment"));
+}
+
+#[test]
+fn weighted_synth_rejects_quote_escape_conflicts() {
+    let dialect = formats::Dialect {
+        structural: vec![b',', b'\n'],
+        quote: Some(b'\\'),
+        escape: formats::Escape::Backslash(b'\\'),
+        comment: None,
+        nesting: vec![],
+    };
+
+    assert!(!synth_formats::supports_weighted(&dialect));
+
+    let err = match synth_formats::synthesize_delimited_parts_with_profile(
+        &dialect,
+        SynthProfile::Fast,
+    ) {
+        Ok(_) => panic!("quote/escape conflicts are not synth-supported"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("quote"));
+    assert!(message.contains("escape"));
+    assert!(message.contains("conflict"));
+}
+
+#[test]
+fn weighted_synth_handles_large_structural_sets_in_boundary_corpus() {
+    let dialect = formats::Dialect {
+        structural: (1..=32).collect(),
+        quote: None,
+        escape: formats::Escape::None,
+        comment: None,
+        nesting: vec![],
+    };
+
+    let synthesized =
+        synth_formats::synthesize_delimited_parts_with_profile(&dialect, SynthProfile::Fast)
+            .expect("large structural class should synthesize without corpus panic");
+
+    assert_eq!(
+        run_graph(&synthesized.graph, &[1, 32, 33, b'\n']),
+        vec![0, 1, 3]
+    );
 }
