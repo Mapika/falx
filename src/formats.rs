@@ -228,12 +228,21 @@ pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
             let outside = g.not(inside);
             g.and(candidates, outside)
         }
-        (quotes, Some(comment)) => {
+        (None, Some(_comment)) => {
+            // Comment without quote: a comment line is inert as a *whole
+            // record*, and the record/stream iterators already skip any record
+            // whose first byte is the comment byte. So the kernel needs no
+            // comment machinery — index every structural byte normally and let
+            // the skip handle comments. This keeps these dialects (VCF, BED,
+            // GFF, SAM, Matrix Market …) on the fast bit-parallel plain path
+            // instead of the sequential Regions op.
+            candidates
+        }
+        (Some(quotes), Some(comment)) => {
             // Quotes and comments interleave (each makes the other inert),
-            // which parity cannot express: the sequential Regions op
-            // resolves both region kinds at once. A comment opens only at
-            // line start — position 0 counts via the seeded shift.
-            let quotes = quotes.unwrap_or_else(|| g.constant(0));
+            // which parity cannot express: the sequential Regions op resolves
+            // both region kinds at once. A comment opens only at line start —
+            // position 0 counts via the seeded shift.
             let line_start = g.shift_left1_seeded(terminators);
             let comment_class = g.class_byte(comment);
             let comment_starts = g.and(comment_class, line_start);

@@ -345,9 +345,9 @@ fn quote_escape_conflict(dialect: &Dialect) -> bool {
 }
 
 fn validate_dialect(dialect: &Dialect) -> Result<(), SynthFormatError> {
-    if dialect.comment.is_some() {
+    if dialect.comment.is_some() && dialect.quote.is_some() {
         return Err(SynthFormatError::Unsupported(
-            "comment regions currently use the sequential Regions op",
+            "comment + quote interleaving uses the sequential Regions op",
         ));
     }
     if quote_escape_conflict(dialect) {
