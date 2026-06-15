@@ -520,7 +520,7 @@ fn emit_with(
             r#"
     /// Seeded-carry, based variant of `index_tape` for parallel parsing.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
-    pub fn index_tape_seeded(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {{
+    pub fn index_tape_seeded(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) -> u64 {{
 {seed_init}        let mut offset = 0usize;
         while offset + 64 <= data.len() {{
             // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
@@ -537,6 +537,7 @@ fn emit_with(
             let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};
             push_tape(mask & live, term & live, base + offset as u32, seps, ends);
         }}
+        {carry_ret}
     }}
 "#
         )
@@ -548,7 +549,7 @@ fn emit_with(
             r#"
     /// Seeded-carry, based variant of `index_tape` for parallel parsing.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    pub fn index_tape_seeded(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {{
+    pub fn index_tape_seeded(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) -> u64 {{
 {seed_init}        let mut offset = 0usize;
         while offset + 64 <= data.len() {{
             // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
@@ -565,6 +566,7 @@ fn emit_with(
             let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};
             push_tape(mask & live, term & live, base + offset as u32, seps, ends);
         }}
+        {carry_ret}
     }}
 "#
         )
@@ -692,9 +694,13 @@ fn emit_with(
     };
 
     let par_block = if par_mode {
-        let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.and_then(|d| d.quote), "slice");
+        // One per-chunk tape part; aliased to keep the parallel driver's
+        // collection types within clippy's complexity budget.
+        let tape_part = "/// One chunk's tape: separator positions and end entries.\ntype TapePart = (Vec<u32>, Vec<u64>);";
         format!(
             r#"
+{tape_part}
+
 /// Parallel structural indexing: byte-identical to [`index_structurals`],
 /// split across `threads` chunks. Each chunk is indexed speculatively as if
 /// it started outside a quoted region; its quote parity falls out of the
@@ -831,21 +837,57 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {{
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})
         .collect();
-{par_shared}    let parts: Vec<(Vec<u32>, Vec<u64>)> = std::thread::scope(|s| {{
+    // Index each chunk speculatively as if it started outside a quoted region
+    // (seed 0); each returns its quote parity (the final carry) for free, so
+    // no separate counting prepass over the data is needed.
+    let mut results: Vec<(TapePart, u64)> = std::thread::scope(|s| {{
         let handles: Vec<_> = (0..threads)
             .map(|t| {{
                 let slice = &data[bounds[t]..bounds[t + 1]];
                 let base = bounds[t] as u32;
-{par_refs}                s.spawn(move || {{
-{par_seed}                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+                s.spawn(move || {{
+                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
                     let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
-                    index_tape_seeded_dispatch(slice, seed, base, &mut seps, &mut ends);
-                    (seps, ends)
+                    let carry = index_tape_seeded_dispatch(slice, 0, base, &mut seps, &mut ends);
+                    ((seps, ends), carry)
                 }})
             }})
             .collect();
         handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
     }});
+    // A chunk that truly began inside a quoted region was mis-indexed at seed 0
+    // (prefix XOR of carries gives the true entry state); re-index it. Rare for
+    // well-formed data, always correct.
+    let mut entry = 0u64;
+    let mut redo: Vec<usize> = Vec::new();
+    for (t, r) in results.iter().enumerate() {{
+        if entry != 0 {{
+            redo.push(t);
+        }}
+        entry ^= r.1;
+    }}
+    if !redo.is_empty() {{
+        let redone: Vec<(usize, TapePart)> = std::thread::scope(|s| {{
+            let handles: Vec<_> = redo
+                .iter()
+                .map(|&t| {{
+                    let slice = &data[bounds[t]..bounds[t + 1]];
+                    let base = bounds[t] as u32;
+                    s.spawn(move || {{
+                        let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+                        let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
+                        index_tape_seeded_dispatch(slice, u64::MAX, base, &mut seps, &mut ends);
+                        (t, (seps, ends))
+                    }})
+                }})
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("redo thread ok")).collect()
+        }});
+        for (t, part) in redone {{
+            results[t].0 = part;
+        }}
+    }}
+    let parts: Vec<TapePart> = results.into_iter().map(|r| r.0).collect();
     let (seps, ends) = scatter_tape(&parts);
     Parsed {{ data, seps, ends }}
 }}
@@ -854,7 +896,7 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {{
 /// its own disjoint slot concurrently. Separator positions and end byte
 /// offsets are already absolute; only each end entry's cumulative-separator
 /// high word is rebased by the separators in the preceding chunks.
-fn scatter_tape(parts: &[(Vec<u32>, Vec<u64>)]) -> (Vec<u32>, Vec<u64>) {{
+fn scatter_tape(parts: &[TapePart]) -> (Vec<u32>, Vec<u64>) {{
     let sep_total: usize = parts.iter().map(|p| p.0.len()).sum();
     let end_total: usize = parts.iter().map(|p| p.1.len()).sum();
     let mut seps: Vec<u32> = Vec::with_capacity(sep_total);
@@ -913,7 +955,7 @@ fn scatter_tape(parts: &[(Vec<u32>, Vec<u64>)]) -> (Vec<u32>, Vec<u64>) {{
     (seps, ends)
 }}
 
-fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {{
+fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) -> u64 {{
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -921,18 +963,16 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {{
         // SAFETY: the required target features were just detected.
-        unsafe {{ avx512::index_tape_seeded(data, seed, base, seps, ends) }};
-        return;
+        return unsafe {{ avx512::index_tape_seeded(data, seed, base, seps, ends) }};
     }}
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {{
         // SAFETY: the required target features were just detected.
-        unsafe {{ avx2::index_tape_seeded(data, seed, base, seps, ends) }};
-        return;
+        return unsafe {{ avx2::index_tape_seeded(data, seed, base, seps, ends) }};
     }}
-    unsupported_cpu();
+    unsupported_cpu()
 }}
 "#
         )
