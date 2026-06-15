@@ -58,9 +58,6 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // Index each chunk assuming it starts outside any quoted region (seed 0).
-    // Each chunk returns its quote parity (the final carry) for free, so no
-    // separate counting prepass over the data is needed.
     let mut results: Vec<(Vec<u32>, u64)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -75,11 +72,6 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
             .collect();
         handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
     });
-    // A chunk's true entry state is the prefix XOR of preceding carries (0
-    // outside, all-ones inside a quoted region). A chunk that actually started
-    // inside a quote was mis-indexed at seed 0 and is re-indexed with the
-    // correct seed — rare for well-formed data (only when a quoted field spans
-    // a chunk boundary), and always correct.
     let mut entry = 0u64;
     let mut redo: Vec<usize> = Vec::new();
     for (t, r) in results.iter().enumerate() {
@@ -168,8 +160,6 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
 }
 
 /// Parallel [`parse`]: identical tape, built across `threads` chunks.
-/// Chunk tapes concatenate directly; each end entry's cumulative separator
-/// count is rebased with one add during the merge.
 pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -179,9 +169,6 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // Index each chunk speculatively as if it started outside a quoted region
-    // (seed 0); each returns its quote parity (the final carry) for free, so
-    // no separate counting prepass over the data is needed.
     let mut results: Vec<(TapePart, u64)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -197,9 +184,6 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
             .collect();
         handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
     });
-    // A chunk that truly began inside a quoted region was mis-indexed at seed 0
-    // (prefix XOR of carries gives the true entry state); re-index it. Rare for
-    // well-formed data, always correct.
     let mut entry = 0u64;
     let mut redo: Vec<usize> = Vec::new();
     for (t, r) in results.iter().enumerate() {

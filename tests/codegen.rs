@@ -285,3 +285,54 @@ fn parallel_index_matches_serial() {
         }
     }
 }
+
+/// Comment dialects parallelize by line ownership; their parallel output must
+/// match serial for any thread count, including when a (possibly long) comment
+/// line straddles a chunk boundary. Uses the VCF dialect (tab + `#`, no quote).
+#[test]
+fn comment_parallel_matches_serial() {
+    let mut rng = Rng(0x7A57_7A57_C0DE_F00D);
+    for _ in 0..40 {
+        let target = 4096 + (rng.next() % 200_000) as usize;
+        let mut data: Vec<u8> = Vec::with_capacity(target + 512);
+        while data.len() < target {
+            // ~1 in 5 lines is a `#` comment; lines vary in length, and ~1 in
+            // 16 is long enough to straddle chunk boundaries at high thread
+            // counts. Comment lines carry tabs and `#` (inert) on purpose.
+            let long = rng.next().is_multiple_of(16);
+            let cells = if long { 40 + rng.next() % 60 } else { 1 + rng.next() % 6 };
+            if rng.next().is_multiple_of(5) {
+                data.push(b'#');
+                for _ in 0..cells {
+                    data.push(*b"abc\t#9".get((rng.next() % 6) as usize).unwrap());
+                }
+            } else {
+                for f in 0..cells {
+                    if f > 0 {
+                        data.push(b'\t');
+                    }
+                    for _ in 0..(rng.next() % 8) {
+                        data.push(*b"abcd".get((rng.next() % 4) as usize).unwrap());
+                    }
+                }
+            }
+            data.push(b'\n');
+        }
+        let mut serial = Vec::new();
+        falx::kernels::vcf::index_structurals(&data, &mut serial);
+        let serial_fields: Vec<Vec<Vec<u8>>> = falx::kernels::vcf::parse(&data)
+            .records()
+            .map(|r| r.fields().map(|f| f.into_owned()).collect())
+            .collect();
+        for threads in [1usize, 2, 3, 7, 16, 32] {
+            let mut par = Vec::new();
+            falx::kernels::vcf::index_structurals_par(&data, threads, &mut par);
+            assert_eq!(par, serial, "vcf index_par mismatch at {threads} threads");
+            let par_fields: Vec<Vec<Vec<u8>>> = falx::kernels::vcf::parse_par(&data, threads)
+                .records()
+                .map(|r| r.fields().map(|f| f.into_owned()).collect())
+                .collect();
+            assert_eq!(par_fields, serial_fields, "vcf parse_par mismatch at {threads} threads");
+        }
+    }
+}

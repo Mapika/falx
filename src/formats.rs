@@ -105,6 +105,19 @@ pub fn csv_hash_dialect() -> Dialect {
     }
 }
 
+/// VCF / BED / GFF / SAM-style genomics records: tab-delimited, with `#`
+/// header/meta lines, and no CSV-style quoting. Comment without quote, so the
+/// parallel path uses line-ownership chunking.
+pub fn vcf_dialect() -> Dialect {
+    Dialect {
+        structural: vec![b'\t', b'\n'],
+        quote: None,
+        escape: Escape::None,
+        comment: Some(b'#'),
+        nesting: vec![],
+    }
+}
+
 /// NDJSON framing: newlines outside JSON strings delimit records. (Framing
 /// only — splitting a stream into documents; not a JSON value parser.)
 pub fn ndjson_dialect() -> Dialect {

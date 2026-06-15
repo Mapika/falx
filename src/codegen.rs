@@ -451,14 +451,23 @@ fn emit_with(
     // stay serial for now.
     let par_mode = matches!(
         dialect,
-        Some(d) if d.escape == crate::formats::Escape::None && d.comment.is_none()
+        Some(d) if d.escape == crate::formats::Escape::None
+            && !(d.comment.is_some() && d.quote.is_some())
     );
+    // Structural/tape parallelism now covers comment dialects (line-ownership);
+    // the columns/cells parallel path keeps its record-ownership driver, not yet
+    // validated against comment lines, so it stays gated off for comment
+    // dialects (their serial `parse_columns` is unaffected).
+    let col_par = par_mode && !matches!(dialect, Some(d) if d.comment.is_some());
     let seed_init = if carry_count == 1 {
         "        let mut carries = [seed];\n".to_string()
     } else if carry_count == 0 {
         "        let _ = seed;\n".to_string()
     } else {
-        String::new() // par_mode never emits with >1 carry
+        // Comment-without-quote dialects carry [line-start, region-state]. The
+        // parallel driver starts every worker on a fresh line, so the standard
+        // CARRY_INIT entry is always correct and no seed is propagated.
+        "        let _ = seed;\n        let mut carries = super::CARRY_INIT;\n".to_string()
     };
     // The final carry is each chunk's quote parity (0 outside / all-ones
     // inside a quoted region), which the parallel driver recovers for free
@@ -602,7 +611,7 @@ fn emit_with(
     }
 "#;
     let cells_fill = |attr: &str, load: &str, load2: &str| -> String {
-        let (doc, params, init, start) = if par_mode {
+        let (doc, params, init, start) = if col_par {
             (
                 " Scans 64-byte blocks from\n    /// `start` (block-aligned) onward, until end of data or until the\n    /// sink completes its record range.",
                 "data: &[u8], seed: u64, start: usize, ",
@@ -697,78 +706,16 @@ fn emit_with(
         // One per-chunk tape part; aliased to keep the parallel driver's
         // collection types within clippy's complexity budget.
         let tape_part = "/// One chunk's tape: separator positions and end entries.\ntype TapePart = (Vec<u32>, Vec<u64>);";
+        // Comment-without-quote dialects (VCF/BED/GFF/SAM/MTX …) parallelize by
+        // line ownership; quote/plain dialects by speculative entry-parity.
+        let has_comment = dialect.is_some_and(|d| d.comment.is_some());
+        let index_par_body = if has_comment { COMMENT_INDEX_PAR } else { SPEC_INDEX_PAR };
+        let parse_par_body = if has_comment { COMMENT_PARSE_PAR } else { SPEC_PARSE_PAR };
         format!(
             r#"
 {tape_part}
 
-/// Parallel structural indexing: byte-identical to [`index_structurals`],
-/// split across `threads` chunks. Each chunk is indexed speculatively as if
-/// it started outside a quoted region; its quote parity falls out of the
-/// kernel's final carry, so there is no separate counting prepass over the
-/// data. The rare chunk that truly began inside a quoted field is re-indexed.
-pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {{
-    let threads = threads.max(1).min(data.len() / 64 + 1);
-    let chunk = (data.len() / threads + 63) & !63;
-    if threads == 1 || chunk == 0 {{
-        index_structurals(data, out);
-        return;
-    }}
-    let bounds: Vec<usize> = (0..=threads)
-        .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})
-        .collect();
-    // Index each chunk assuming it starts outside any quoted region (seed 0).
-    // Each chunk returns its quote parity (the final carry) for free, so no
-    // separate counting prepass over the data is needed.
-    let mut results: Vec<(Vec<u32>, u64)> = std::thread::scope(|s| {{
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {{
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                let base = bounds[t] as u32;
-                s.spawn(move || {{
-                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
-                    let carry = index_structurals_seeded_dispatch(slice, 0, base, &mut part);
-                    (part, carry)
-                }})
-            }})
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
-    }});
-    // A chunk's true entry state is the prefix XOR of preceding carries (0
-    // outside, all-ones inside a quoted region). A chunk that actually started
-    // inside a quote was mis-indexed at seed 0 and is re-indexed with the
-    // correct seed — rare for well-formed data (only when a quoted field spans
-    // a chunk boundary), and always correct.
-    let mut entry = 0u64;
-    let mut redo: Vec<usize> = Vec::new();
-    for (t, r) in results.iter().enumerate() {{
-        if entry != 0 {{
-            redo.push(t);
-        }}
-        entry ^= r.1;
-    }}
-    if !redo.is_empty() {{
-        let redone: Vec<(usize, Vec<u32>)> = std::thread::scope(|s| {{
-            let handles: Vec<_> = redo
-                .iter()
-                .map(|&t| {{
-                    let slice = &data[bounds[t]..bounds[t + 1]];
-                    let base = bounds[t] as u32;
-                    s.spawn(move || {{
-                        let mut part = Vec::with_capacity(slice.len() / 16 + 8);
-                        index_structurals_seeded_dispatch(slice, u64::MAX, base, &mut part);
-                        (t, part)
-                    }})
-                }})
-                .collect();
-            handles.into_iter().map(|h| h.join().expect("redo thread ok")).collect()
-        }});
-        for (t, part) in redone {{
-            results[t].0 = part;
-        }}
-    }}
-    let parts: Vec<Vec<u32>> = results.into_iter().map(|r| r.0).collect();
-    scatter_u32(out, &parts);
-}}
+{index_par_body}
 
 /// Append per-chunk index parts to `out`, copying each into its own disjoint
 /// slot concurrently. The previous single-threaded concat serialized an
@@ -825,72 +772,7 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
     unsupported_cpu()
 }}
 
-/// Parallel [`parse`]: identical tape, built across `threads` chunks.
-/// Chunk tapes concatenate directly; each end entry's cumulative separator
-/// count is rebased with one add during the merge.
-pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {{
-    let threads = threads.max(1).min(data.len() / 64 + 1);
-    let chunk = (data.len() / threads + 63) & !63;
-    if threads == 1 || chunk == 0 {{
-        return parse(data);
-    }}
-    let bounds: Vec<usize> = (0..=threads)
-        .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})
-        .collect();
-    // Index each chunk speculatively as if it started outside a quoted region
-    // (seed 0); each returns its quote parity (the final carry) for free, so
-    // no separate counting prepass over the data is needed.
-    let mut results: Vec<(TapePart, u64)> = std::thread::scope(|s| {{
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {{
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                let base = bounds[t] as u32;
-                s.spawn(move || {{
-                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
-                    let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
-                    let carry = index_tape_seeded_dispatch(slice, 0, base, &mut seps, &mut ends);
-                    ((seps, ends), carry)
-                }})
-            }})
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
-    }});
-    // A chunk that truly began inside a quoted region was mis-indexed at seed 0
-    // (prefix XOR of carries gives the true entry state); re-index it. Rare for
-    // well-formed data, always correct.
-    let mut entry = 0u64;
-    let mut redo: Vec<usize> = Vec::new();
-    for (t, r) in results.iter().enumerate() {{
-        if entry != 0 {{
-            redo.push(t);
-        }}
-        entry ^= r.1;
-    }}
-    if !redo.is_empty() {{
-        let redone: Vec<(usize, TapePart)> = std::thread::scope(|s| {{
-            let handles: Vec<_> = redo
-                .iter()
-                .map(|&t| {{
-                    let slice = &data[bounds[t]..bounds[t + 1]];
-                    let base = bounds[t] as u32;
-                    s.spawn(move || {{
-                        let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
-                        let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
-                        index_tape_seeded_dispatch(slice, u64::MAX, base, &mut seps, &mut ends);
-                        (t, (seps, ends))
-                    }})
-                }})
-                .collect();
-            handles.into_iter().map(|h| h.join().expect("redo thread ok")).collect()
-        }});
-        for (t, part) in redone {{
-            results[t].0 = part;
-        }}
-    }}
-    let parts: Vec<TapePart> = results.into_iter().map(|r| r.0).collect();
-    let (seps, ends) = scatter_tape(&parts);
-    Parsed {{ data, seps, ends }}
-}}
+{parse_par_body}
 
 /// Concatenate per-chunk tape parts into the master tape, copying each into
 /// its own disjoint slot concurrently. Separator positions and end byte
@@ -1664,6 +1546,207 @@ mod avx2 {{
 /// as much as the indexing itself. Folding it in behind one barrier spawns
 /// the workers once. Returns (declarations before the scope, reference
 /// captures in the map closure, per-thread seed computation in the spawn).
+/// Parallel driver bodies (quote/plain dialects): index each chunk
+/// speculatively as outside-quote, recover parity from the returned carry,
+/// re-index the rare chunk that began mid-quote. Inserted verbatim into the
+/// generated kernel; uses single braces (it is not re-processed by `format!`).
+const SPEC_INDEX_PAR: &str = r#"/// Parallel structural indexing: byte-identical to [`index_structurals`],
+/// split across `threads` chunks. Each chunk is indexed speculatively as if
+/// it started outside a quoted region; its quote parity falls out of the
+/// kernel's final carry, so there is no separate counting prepass over the
+/// data. The rare chunk that truly began inside a quoted field is re-indexed.
+pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        index_structurals(data, out);
+        return;
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    let mut results: Vec<(Vec<u32>, u64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                s.spawn(move || {
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    let carry = index_structurals_seeded_dispatch(slice, 0, base, &mut part);
+                    (part, carry)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
+    });
+    let mut entry = 0u64;
+    let mut redo: Vec<usize> = Vec::new();
+    for (t, r) in results.iter().enumerate() {
+        if entry != 0 {
+            redo.push(t);
+        }
+        entry ^= r.1;
+    }
+    if !redo.is_empty() {
+        let redone: Vec<(usize, Vec<u32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = redo
+                .iter()
+                .map(|&t| {
+                    let slice = &data[bounds[t]..bounds[t + 1]];
+                    let base = bounds[t] as u32;
+                    s.spawn(move || {
+                        let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                        index_structurals_seeded_dispatch(slice, u64::MAX, base, &mut part);
+                        (t, part)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("redo thread ok")).collect()
+        });
+        for (t, part) in redone {
+            results[t].0 = part;
+        }
+    }
+    let parts: Vec<Vec<u32>> = results.into_iter().map(|r| r.0).collect();
+    scatter_u32(out, &parts);
+}"#;
+
+const SPEC_PARSE_PAR: &str = r#"/// Parallel [`parse`]: identical tape, built across `threads` chunks.
+pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    let mut results: Vec<(TapePart, u64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                s.spawn(move || {
+                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+                    let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
+                    let carry = index_tape_seeded_dispatch(slice, 0, base, &mut seps, &mut ends);
+                    ((seps, ends), carry)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
+    });
+    let mut entry = 0u64;
+    let mut redo: Vec<usize> = Vec::new();
+    for (t, r) in results.iter().enumerate() {
+        if entry != 0 {
+            redo.push(t);
+        }
+        entry ^= r.1;
+    }
+    if !redo.is_empty() {
+        let redone: Vec<(usize, TapePart)> = std::thread::scope(|s| {
+            let handles: Vec<_> = redo
+                .iter()
+                .map(|&t| {
+                    let slice = &data[bounds[t]..bounds[t + 1]];
+                    let base = bounds[t] as u32;
+                    s.spawn(move || {
+                        let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+                        let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
+                        index_tape_seeded_dispatch(slice, u64::MAX, base, &mut seps, &mut ends);
+                        (t, (seps, ends))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("redo thread ok")).collect()
+        });
+        for (t, part) in redone {
+            results[t].0 = part;
+        }
+    }
+    let parts: Vec<TapePart> = results.into_iter().map(|r| r.0).collect();
+    let (seps, ends) = scatter_tape(&parts);
+    Parsed { data, seps, ends }
+}"#;
+
+/// Parallel driver bodies (comment-without-quote dialects). Comments end at
+/// every newline and there are no newline-spanning quoted regions, so any
+/// line boundary is a clean NORMAL region state: each worker just starts on a
+/// fresh line and indexes whole lines with the standard entry carry — no
+/// region state crosses a chunk, no seed propagation, no re-indexing.
+const COMMENT_INDEX_PAR: &str = r#"/// Chunk bounds snapped to just past a record terminator (newline) so every
+/// worker processes only whole lines: the byte before `bounds[t]` (t>0) is a
+/// terminator, so the worker begins in the NORMAL region state.
+fn line_aligned_bounds(data: &[u8], threads: usize) -> Vec<usize> {
+    let approx = data.len() / threads;
+    let mut bounds = vec![0usize; threads + 1];
+    bounds[threads] = data.len();
+    for (i, slot) in bounds[1..threads].iter_mut().enumerate() {
+        let from = ((i + 1) * approx).min(data.len());
+        *slot = match data[from..].iter().position(|&b| b == 10u8) {
+            Some(p) => from + p + 1,
+            None => data.len(),
+        };
+    }
+    bounds
+}
+
+/// Parallel structural indexing: byte-identical to [`index_structurals`],
+/// split across `threads` line-aligned chunks (comment state never crosses a
+/// chunk boundary, so no carry is propagated).
+pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 {
+        index_structurals(data, out);
+        return;
+    }
+    let bounds = line_aligned_bounds(data, threads);
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                s.spawn(move || {
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    let _ = index_structurals_seeded_dispatch(slice, 0, base, &mut part);
+                    part
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
+    });
+    scatter_u32(out, &parts);
+}"#;
+
+const COMMENT_PARSE_PAR: &str = r#"/// Parallel [`parse`] for a comment dialect; line-aligned chunking (see
+/// [`index_structurals_par`]). Chunk tapes concatenate; each end entry's
+/// cumulative separator count is rebased during the merge.
+pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 {
+        return parse(data);
+    }
+    let bounds = line_aligned_bounds(data, threads);
+    let parts: Vec<TapePart> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                s.spawn(move || {
+                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+                    let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
+                    let _ = index_tape_seeded_dispatch(slice, 0, base, &mut seps, &mut ends);
+                    (seps, ends)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
+    });
+    let (seps, ends) = scatter_tape(&parts);
+    Parsed { data, seps, ends }
+}"#;
+
 fn par_seed_parts(quote: Option<u8>, chunk: &str) -> (String, String, String) {
     match quote {
         Some(q) => (
@@ -2089,6 +2172,10 @@ fn push_columns_api(
     columns: &[Column],
     par_mode: bool,
 ) {
+    // The columns/cells parallel path keeps its record-ownership driver, which
+    // is not yet validated against comment lines; gate it off for comment
+    // dialects (serial `parse_columns` still works for them).
+    let col_par = par_mode && dialect.comment.is_none();
     let any_i64 = columns.iter().any(|c| c.ty == ColumnType::I64);
     let any_f64 = columns.iter().any(|c| c.ty == ColumnType::F64);
     let any_bytes = columns.iter().any(|c| c.ty == ColumnType::Bytes);
@@ -2397,7 +2484,7 @@ fn push_columns_api(
     }
 
     // --- serial entry point -------------------------------------------------
-    let (dispatch_sig, dispatch_serial_args, seed_param) = if par_mode {
+    let (dispatch_sig, dispatch_serial_args, seed_param) = if col_par {
         (
             "data: &[u8], seed: u64, start: usize, sink: &mut ColumnSink",
             "data, 0, 0, &mut sink",
@@ -2444,7 +2531,7 @@ fn push_columns_api(
     );
 
     // --- parallel entry point ------------------------------------------------
-    if par_mode {
+    if col_par {
         let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.quote, "data[start..end]");
         let _ = write!(
             code,

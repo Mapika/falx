@@ -15,6 +15,7 @@ pub mod logfmt;
 pub mod multi;
 pub mod ndjson;
 pub mod tsv;
+pub mod vcf;
 
 /// The registry of checked-in kernels: name, dialect, and projected
 /// columns. The generator example and the drift test both consume this, so
@@ -23,6 +24,10 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
     vec![
         ("csv", formats::csv_dialect(), vec![]),
         ("tsv", formats::tsv_dialect(), vec![]),
+        // Genomics: tab-delimited with `#` header lines, no quoting. A
+        // comment-without-quote dialect — its parallel path uses line
+        // ownership (no quote/region state crosses a chunk boundary).
+        ("vcf", formats::vcf_dialect(), vec![]),
         ("logfmt", formats::logfmt_dialect(), vec![]),
         ("ndjson", formats::ndjson_dialect(), vec![]),
         // Bracket nesting: the structural index feeds a nested tape with
