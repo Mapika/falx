@@ -935,6 +935,14 @@ mod avx512 {
         const NORMAL: u64 = 0;
         const QUOTE: u64 = 1;
         const COMMENT: u64 = 2;
+        // Fast path: outside any region with nothing opening this block, the
+        // only events are newlines, which are inert here — so there is no work
+        // and the state is unchanged. This is the overwhelming majority of
+        // blocks for comment dialects whose comments cluster (VCF/BED/SAM
+        // headers, etc.), turning per-block region resolution into a no-op.
+        if *state == NORMAL && (q | s) == 0 {
+            return 0;
+        }
         let mut inert = 0u64;
         // A region continuing from the previous block fills from bit 0.
         let mut run_start = 0u32;
@@ -1202,6 +1210,14 @@ mod avx2 {
         const NORMAL: u64 = 0;
         const QUOTE: u64 = 1;
         const COMMENT: u64 = 2;
+        // Fast path: outside any region with nothing opening this block, the
+        // only events are newlines, which are inert here — so there is no work
+        // and the state is unchanged. This is the overwhelming majority of
+        // blocks for comment dialects whose comments cluster (VCF/BED/SAM
+        // headers, etc.), turning per-block region resolution into a no-op.
+        if *state == NORMAL && (q | s) == 0 {
+            return 0;
+        }
         let mut inert = 0u64;
         // A region continuing from the previous block fills from bit 0.
         let mut run_start = 0u32;
