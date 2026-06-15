@@ -37,8 +37,10 @@ fn unsupported_cpu() -> ! {
 
 
 /// Parallel structural indexing: byte-identical to [`index_structurals`],
-/// split across `threads` chunks. Quote context is reconstructed per chunk
-/// inside the indexing scope (one barrier), so the workers are spawned once.
+/// split across `threads` chunks. Each chunk is indexed speculatively as if
+/// it started outside a quoted region; its quote parity falls out of the
+/// kernel's final carry, so there is no separate counting prepass over the
+/// data. The rare chunk that truly began inside a quoted field is re-indexed.
 pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -49,24 +51,57 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // Index chunks concurrently into per-thread parts, then scatter them
-    // into `out` in parallel. Concatenation needs no rebase — seeded
-    // indexing already wrote absolute positions.
-    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+    // Index each chunk assuming it starts outside any quoted region (seed 0).
+    // Each chunk returns its quote parity (the final carry) for free, so no
+    // separate counting prepass over the data is needed.
+    let mut results: Vec<(Vec<u32>, u64)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
                 let base = bounds[t] as u32;
                 s.spawn(move || {
-                    let seed = 0u64;
                     let mut part = Vec::with_capacity(slice.len() / 16 + 8);
-                    index_structurals_seeded_dispatch(slice, seed, base, &mut part);
-                    part
+                    let carry = index_structurals_seeded_dispatch(slice, 0, base, &mut part);
+                    (part, carry)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
     });
+    // A chunk's true entry state is the prefix XOR of preceding carries (0
+    // outside, all-ones inside a quoted region). A chunk that actually started
+    // inside a quote was mis-indexed at seed 0 and is re-indexed with the
+    // correct seed — rare for well-formed data (only when a quoted field spans
+    // a chunk boundary), and always correct.
+    let mut entry = 0u64;
+    let mut redo: Vec<usize> = Vec::new();
+    for (t, r) in results.iter().enumerate() {
+        if entry != 0 {
+            redo.push(t);
+        }
+        entry ^= r.1;
+    }
+    if !redo.is_empty() {
+        let redone: Vec<(usize, Vec<u32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = redo
+                .iter()
+                .map(|&t| {
+                    let slice = &data[bounds[t]..bounds[t + 1]];
+                    let base = bounds[t] as u32;
+                    s.spawn(move || {
+                        let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                        index_structurals_seeded_dispatch(slice, u64::MAX, base, &mut part);
+                        (t, part)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("redo thread ok")).collect()
+        });
+        for (t, part) in redone {
+            results[t].0 = part;
+        }
+    }
+    let parts: Vec<Vec<u32>> = results.into_iter().map(|r| r.0).collect();
     scatter_u32(out, &parts);
 }
 
@@ -105,7 +140,7 @@ fn scatter_u32(out: &mut Vec<u32>, parts: &[Vec<u32>]) {
     unsafe { out.set_len(start + total); }
 }
 
-fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -113,18 +148,16 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx512::index_structurals_seeded(data, seed, base, out) };
-        return;
+        return unsafe { avx512::index_structurals_seeded(data, seed, base, out) };
     }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
-        return;
+        return unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
     }
-    unsupported_cpu();
+    unsupported_cpu()
 }
 
 /// Parallel [`parse`]: identical tape, built across `threads` chunks.
@@ -809,10 +842,11 @@ mod avx512 {
         }
     }
 
-    /// Like `index_structurals` but with seeded quote-parity carry and an
-    /// absolute base offset: the building block for parallel indexing.
+    /// Like `index_structurals` but seeded with the entry quote-parity carry
+    /// and an absolute base offset; returns the *final* carry so the parallel
+    /// driver can recover each chunk's quote parity without a counting prepass.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
-    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
         let _ = seed;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
@@ -829,6 +863,7 @@ mod avx512 {
             let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
             push_indexes(mask, base + offset as u32, out);
         }
+        0
     }
 
     /// Seeded-carry, based variant of `index_tape` for parallel parsing.
@@ -1007,10 +1042,11 @@ mod avx2 {
         }
     }
 
-    /// Like `index_structurals` but with seeded quote-parity carry and an
-    /// absolute base offset: the building block for parallel indexing.
+    /// Like `index_structurals` but seeded with the entry quote-parity carry
+    /// and an absolute base offset; returns the *final* carry so the parallel
+    /// driver can recover each chunk's quote parity without a counting prepass.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
         let _ = seed;
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
@@ -1027,6 +1063,7 @@ mod avx2 {
             let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
             push_indexes(mask, base + offset as u32, out);
         }
+        0
     }
 
     /// Seeded-carry, based variant of `index_tape` for parallel parsing.
