@@ -118,6 +118,20 @@ pub fn vcf_dialect() -> Dialect {
     }
 }
 
+/// Pure newline framing: the structural index is every line boundary. The
+/// base for fixed-line-count record formats — FASTQ (sequencing reads) groups
+/// these by 4 (header / sequence / `+` / quality); the quality line may
+/// contain `@`/`+`, so framing must count lines, not split on a sigil.
+pub fn lines_dialect() -> Dialect {
+    Dialect {
+        structural: vec![b'\n'],
+        quote: None,
+        escape: Escape::None,
+        comment: None,
+        nesting: vec![],
+    }
+}
+
 /// NDJSON framing: newlines outside JSON strings delimit records. (Framing
 /// only — splitting a stream into documents; not a JSON value parser.)
 pub fn ndjson_dialect() -> Dialect {

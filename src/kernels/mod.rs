@@ -13,6 +13,7 @@ pub mod csv_hash;
 pub mod json;
 pub mod logfmt;
 pub mod multi;
+pub mod lines;
 pub mod ndjson;
 pub mod tsv;
 pub mod vcf;
@@ -28,6 +29,9 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
         // comment-without-quote dialect — its parallel path uses line
         // ownership (no quote/region state crosses a chunk boundary).
         ("vcf", formats::vcf_dialect(), vec![]),
+        // Pure newline framing; the base for fixed-line record formats like
+        // FASTQ (group line boundaries by 4). See examples/fastq.rs.
+        ("lines", formats::lines_dialect(), vec![]),
         ("logfmt", formats::logfmt_dialect(), vec![]),
         ("ndjson", formats::ndjson_dialect(), vec![]),
         // Bracket nesting: the structural index feeds a nested tape with

@@ -430,6 +430,10 @@ fn emit_with(
     };
     let sel = if parser.is_some() { ".0" } else { "" };
     let step_ret = match parser {
+        // When every structural byte is a record terminator (e.g. a
+        // newline-only framing dialect), the terminator node is the output
+        // node itself — emit it directly rather than a redundant `v & v`.
+        Some((_, term, _)) if term == output => format!("(v{out}, v{out})", out = output.0),
         Some((_, term, _)) => format!("(v{out}, v{out} & v{term})", out = output.0, term = term.0),
         None => format!("v{}", output.0),
     };
