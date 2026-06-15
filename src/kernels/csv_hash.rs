@@ -263,6 +263,20 @@ impl<'p> Record<'p> {
             done: false,
         }
     }
+
+    /// Zero-copy field iterator: raw `&[u8]` spans with quotes and escapes
+    /// intact — no `Cow`, no cleaning. The fastest field walk, for callers
+    /// that handle (or don't need) quote stripping themselves.
+    pub fn fields_raw(&self) -> FieldsRaw<'p> {
+        FieldsRaw {
+            data: self.data,
+            seps: self.seps,
+            next_sep: 0,
+            from: self.start,
+            end: self.trimmed_end(),
+            done: false,
+        }
+    }
 }
 
 /// Field iterator: one running offset, one separator-slice cursor — no
@@ -300,6 +314,46 @@ impl<'p> Iterator for Fields<'p> {
         } else if !self.done {
             self.done = true;
             Some(clean(&self.data[self.from..self.end]))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.seps.len() - self.next_sep + (!self.done) as usize;
+        (n, Some(n))
+    }
+}
+
+/// Zero-copy variant of [`Fields`]: yields raw `&[u8]` spans, quotes and
+/// escapes intact, with no `Cow` and no cleaning.
+pub struct FieldsRaw<'p> {
+    data: &'p [u8],
+    seps: &'p [u32],
+    next_sep: usize,
+    from: usize,
+    end: usize,
+    done: bool,
+}
+
+impl<'p> Iterator for FieldsRaw<'p> {
+    type Item = &'p [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_sep < self.seps.len() {
+            // SAFETY: identical tape invariants to `Fields::next`.
+            let span = unsafe {
+                let to = *self.seps.get_unchecked(self.next_sep) as usize;
+                self.next_sep += 1;
+                let span = self.data.get_unchecked(self.from..to);
+                self.from = to + 1;
+                span
+            };
+            Some(span)
+        } else if !self.done {
+            self.done = true;
+            Some(&self.data[self.from..self.end])
         } else {
             None
         }
@@ -483,6 +537,7 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 2]
 /// valid doubled-quote field every interior quote is half of a pair, so
 /// "contains the quote byte" is the collapse test; a malformed stray
 /// quote merely takes the copying path and comes out byte-identical.
+///
 #[inline]
 fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     const Q: u8 = 34u8;

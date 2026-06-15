@@ -69,8 +69,10 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
             parity ^= h.join().expect("prepass thread ok");
         }
     });
-    // Pass 2: index chunks concurrently with seeded entry state.
-    std::thread::scope(|s| {
+    // Pass 2: index chunks concurrently into per-thread parts, then
+    // scatter them into `out` in parallel. Concatenation needs no rebase —
+    // seeded indexing already wrote absolute positions.
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
@@ -83,10 +85,44 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
                 })
             })
             .collect();
-        for handle in handles {
-            out.extend_from_slice(&handle.join().expect("index thread ok"));
-        }
+        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
     });
+    scatter_u32(out, &parts);
+}
+
+/// Append per-chunk index parts to `out`, copying each into its own disjoint
+/// slot concurrently. The previous single-threaded concat serialized an
+/// O(positions) copy and was the parallel scaling ceiling.
+fn scatter_u32(out: &mut Vec<u32>, parts: &[Vec<u32>]) {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let start = out.len();
+    out.reserve(total);
+    {
+        let mut rest = &mut out.spare_capacity_mut()[..total];
+        let mut slots: Vec<&mut [std::mem::MaybeUninit<u32>]> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let (head, tail) = rest.split_at_mut(p.len());
+            slots.push(head);
+            rest = tail;
+        }
+        std::thread::scope(|s| {
+            for (slot, part) in slots.into_iter().zip(parts.iter()) {
+                s.spawn(move || {
+                    // SAFETY: slot.len() == part.len(); the copy initializes
+                    // exactly this disjoint slice of `out`'s spare capacity.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.as_ptr(),
+                            slot.as_mut_ptr().cast::<u32>(),
+                            part.len(),
+                        );
+                    }
+                });
+            }
+        });
+    }
+    // SAFETY: the scatter initialized every element of spare[..total].
+    unsafe { out.set_len(start + total); }
 }
 
 fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) {
@@ -155,14 +191,71 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
             .collect();
         handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
     });
-    let mut seps = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum::<usize>());
-    let mut ends = Vec::with_capacity(parts.iter().map(|p| p.1.len()).sum::<usize>());
-    for (part_seps, part_ends) in &parts {
-        let rebase = (seps.len() as u64) << 32;
-        seps.extend_from_slice(part_seps);
-        ends.extend(part_ends.iter().map(|&e| e + rebase));
-    }
+    let (seps, ends) = scatter_tape(&parts);
     Parsed { data, seps, ends }
+}
+
+/// Concatenate per-chunk tape parts into the master tape, copying each into
+/// its own disjoint slot concurrently. Separator positions and end byte
+/// offsets are already absolute; only each end entry's cumulative-separator
+/// high word is rebased by the separators in the preceding chunks.
+fn scatter_tape(parts: &[(Vec<u32>, Vec<u64>)]) -> (Vec<u32>, Vec<u64>) {
+    let sep_total: usize = parts.iter().map(|p| p.0.len()).sum();
+    let end_total: usize = parts.iter().map(|p| p.1.len()).sum();
+    let mut seps: Vec<u32> = Vec::with_capacity(sep_total);
+    let mut ends: Vec<u64> = Vec::with_capacity(end_total);
+    // Cumulative separator count before each chunk (the ends rebase amount).
+    let mut sep_prefix: Vec<u64> = Vec::with_capacity(parts.len());
+    {
+        let mut acc = 0u64;
+        for p in parts {
+            sep_prefix.push(acc);
+            acc += p.0.len() as u64;
+        }
+    }
+    {
+        let mut srest = &mut seps.spare_capacity_mut()[..sep_total];
+        let mut erest = &mut ends.spare_capacity_mut()[..end_total];
+        let mut sslots: Vec<&mut [std::mem::MaybeUninit<u32>]> = Vec::with_capacity(parts.len());
+        let mut eslots: Vec<&mut [std::mem::MaybeUninit<u64>]> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let (sh, st) = srest.split_at_mut(p.0.len());
+            sslots.push(sh);
+            srest = st;
+            let (eh, et) = erest.split_at_mut(p.1.len());
+            eslots.push(eh);
+            erest = et;
+        }
+        std::thread::scope(|s| {
+            for (((sslot, eslot), part), &prefix) in
+                sslots.into_iter().zip(eslots).zip(parts.iter()).zip(sep_prefix.iter())
+            {
+                s.spawn(move || {
+                    // SAFETY: each slot's length equals its part's; the writes
+                    // initialize exactly these disjoint slices.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.0.as_ptr(),
+                            sslot.as_mut_ptr().cast::<u32>(),
+                            part.0.len(),
+                        );
+                    }
+                    let rebase = prefix << 32;
+                    let dst = eslot.as_mut_ptr().cast::<u64>();
+                    for (i, &e) in part.1.iter().enumerate() {
+                        // SAFETY: i < part.1.len() == eslot.len().
+                        unsafe { *dst.add(i) = e + rebase; }
+                    }
+                });
+            }
+        });
+    }
+    // SAFETY: the scatter initialized every element of both spare regions.
+    unsafe {
+        seps.set_len(sep_total);
+        ends.set_len(end_total);
+    }
+    (seps, ends)
 }
 
 fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
@@ -402,6 +495,20 @@ impl<'p> Record<'p> {
             done: false,
         }
     }
+
+    /// Zero-copy field iterator: raw `&[u8]` spans with quotes and escapes
+    /// intact — no `Cow`, no cleaning. The fastest field walk, for callers
+    /// that handle (or don't need) quote stripping themselves.
+    pub fn fields_raw(&self) -> FieldsRaw<'p> {
+        FieldsRaw {
+            data: self.data,
+            seps: self.seps,
+            next_sep: 0,
+            from: self.start,
+            end: self.trimmed_end(),
+            done: false,
+        }
+    }
 }
 
 /// Field iterator: one running offset, one separator-slice cursor — no
@@ -439,6 +546,46 @@ impl<'p> Iterator for Fields<'p> {
         } else if !self.done {
             self.done = true;
             Some(clean(&self.data[self.from..self.end]))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.seps.len() - self.next_sep + (!self.done) as usize;
+        (n, Some(n))
+    }
+}
+
+/// Zero-copy variant of [`Fields`]: yields raw `&[u8]` spans, quotes and
+/// escapes intact, with no `Cow` and no cleaning.
+pub struct FieldsRaw<'p> {
+    data: &'p [u8],
+    seps: &'p [u32],
+    next_sep: usize,
+    from: usize,
+    end: usize,
+    done: bool,
+}
+
+impl<'p> Iterator for FieldsRaw<'p> {
+    type Item = &'p [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_sep < self.seps.len() {
+            // SAFETY: identical tape invariants to `Fields::next`.
+            let span = unsafe {
+                let to = *self.seps.get_unchecked(self.next_sep) as usize;
+                self.next_sep += 1;
+                let span = self.data.get_unchecked(self.from..to);
+                self.from = to + 1;
+                span
+            };
+            Some(span)
+        } else if !self.done {
+            self.done = true;
+            Some(&self.data[self.from..self.end])
         } else {
             None
         }
@@ -619,6 +766,7 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 1]
 /// valid doubled-quote field every interior quote is half of a pair, so
 /// "contains the quote byte" is the collapse test; a malformed stray
 /// quote merely takes the copying path and comes out byte-identical.
+///
 #[inline]
 fn clean(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     const Q: u8 = 34u8;
