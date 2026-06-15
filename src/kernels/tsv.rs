@@ -37,8 +37,8 @@ fn unsupported_cpu() -> ! {
 
 
 /// Parallel structural indexing: byte-identical to [`index_structurals`],
-/// split across `threads` chunks. Quote context is reconstructed with a
-/// counting prepass, so both passes run fully parallel.
+/// split across `threads` chunks. Quote context is reconstructed per chunk
+/// inside the indexing scope (one barrier), so the workers are spawned once.
 pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -49,18 +49,16 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // No quote context in this dialect: chunks are independent.
-    let entry = vec![0u64; threads];
-    // Pass 2: index chunks concurrently into per-thread parts, then
-    // scatter them into `out` in parallel. Concatenation needs no rebase —
-    // seeded indexing already wrote absolute positions.
+    // Index chunks concurrently into per-thread parts, then scatter them
+    // into `out` in parallel. Concatenation needs no rebase — seeded
+    // indexing already wrote absolute positions.
     let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
-                let seed = entry[t];
                 let base = bounds[t] as u32;
                 s.spawn(move || {
+                    let seed = 0u64;
                     let mut part = Vec::with_capacity(slice.len() / 16 + 8);
                     index_structurals_seeded_dispatch(slice, seed, base, &mut part);
                     part
@@ -141,15 +139,13 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // No quote context in this dialect: chunks are independent.
-    let entry = vec![0u64; threads];
     let parts: Vec<(Vec<u32>, Vec<u64>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
-                let seed = entry[t];
                 let base = bounds[t] as u32;
                 s.spawn(move || {
+                    let seed = 0u64;
                     let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
                     let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
                     index_tape_seeded_dispatch(slice, seed, base, &mut seps, &mut ends);

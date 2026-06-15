@@ -686,12 +686,12 @@ fn emit_with(
     };
 
     let par_block = if par_mode {
-        let prepass = prepass_snippet(dialect.and_then(|d| d.quote));
+        let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.and_then(|d| d.quote), "slice");
         format!(
             r#"
 /// Parallel structural indexing: byte-identical to [`index_structurals`],
-/// split across `threads` chunks. Quote context is reconstructed with a
-/// counting prepass, so both passes run fully parallel.
+/// split across `threads` chunks. Quote context is reconstructed per chunk
+/// inside the indexing scope (one barrier), so the workers are spawned once.
 pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {{
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -702,17 +702,16 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {{
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})
         .collect();
-{prepass}    // Pass 2: index chunks concurrently into per-thread parts, then
-    // scatter them into `out` in parallel. Concatenation needs no rebase —
-    // seeded indexing already wrote absolute positions.
+{par_shared}    // Index chunks concurrently into per-thread parts, then scatter them
+    // into `out` in parallel. Concatenation needs no rebase — seeded
+    // indexing already wrote absolute positions.
     let parts: Vec<Vec<u32>> = std::thread::scope(|s| {{
         let handles: Vec<_> = (0..threads)
             .map(|t| {{
                 let slice = &data[bounds[t]..bounds[t + 1]];
-                let seed = entry[t];
                 let base = bounds[t] as u32;
-                s.spawn(move || {{
-                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+{par_refs}                s.spawn(move || {{
+{par_seed}                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
                     index_structurals_seeded_dispatch(slice, seed, base, &mut part);
                     part
                 }})
@@ -792,14 +791,13 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {{
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})
         .collect();
-{prepass}    let parts: Vec<(Vec<u32>, Vec<u64>)> = std::thread::scope(|s| {{
+{par_shared}    let parts: Vec<(Vec<u32>, Vec<u64>)> = std::thread::scope(|s| {{
         let handles: Vec<_> = (0..threads)
             .map(|t| {{
                 let slice = &data[bounds[t]..bounds[t + 1]];
-                let seed = entry[t];
                 let base = bounds[t] as u32;
-                s.spawn(move || {{
-                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+{par_refs}                s.spawn(move || {{
+{par_seed}                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
                     let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
                     index_tape_seeded_dispatch(slice, seed, base, &mut seps, &mut ends);
                     (seps, ends)
@@ -1580,31 +1578,42 @@ mod avx2 {{
 
 /// The quote-parity counting prepass shared by every parallel entry
 /// point; the emitted code leaves `entry[t]` as the carry seed for chunk t.
-fn prepass_snippet(quote: Option<u8>) -> String {
+/// Fragments that resolve each chunk's quote-parity seed *inside* the
+/// indexing scope. Quote dialects otherwise need a separate prepass scope —
+/// a whole second round of thread creation, which the breakdown showed costs
+/// as much as the indexing itself. Folding it in behind one barrier spawns
+/// the workers once. Returns (declarations before the scope, reference
+/// captures in the map closure, per-thread seed computation in the spawn).
+fn par_seed_parts(quote: Option<u8>, chunk: &str) -> (String, String, String) {
     match quote {
-        Some(q) => format!(
-            r#"    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
-    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
-    let mut entry = vec![0u64; threads];
-    std::thread::scope(|s| {{
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {{
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                s.spawn(move || slice.iter().filter(|&&b| b == {q}u8).count() as u64 & 1)
-            }})
-            .collect();
-        let mut parity = 0u64;
-        for (t, h) in handles.into_iter().enumerate() {{
-            entry[t] = parity.wrapping_neg();
-            parity ^= h.join().expect("prepass thread ok");
-        }}
-    }});
-"#
+        Some(q) => (
+            "    // Quote seeds are resolved inside the indexing scope: each thread\n\
+             \x20   // contributes its chunk's quote-byte parity, then reads the parity\n\
+             \x20   // of all preceding chunks after one barrier (doubled-quote escapes\n\
+             \x20   // self-cancel, so raw parity is exact).\n\
+             \x20   let parity: Vec<std::sync::atomic::AtomicU64> =\n\
+             \x20       (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();\n\
+             \x20   let barrier = std::sync::Barrier::new(threads);\n"
+                .to_string(),
+            "                let parity = &parity;\n\
+             \x20               let barrier = &barrier;\n"
+                .to_string(),
+            format!(
+                "                    use std::sync::atomic::Ordering::Relaxed;\n\
+             \x20                   parity[t].store({chunk}.iter().filter(|&&b| b == {q}u8).count() as u64 & 1, Relaxed);\n\
+             \x20                   barrier.wait();\n\
+             \x20                   // Seed = quote parity of every preceding chunk.\n\
+             \x20                   let seed = parity[..t]\n\
+             \x20                       .iter()\n\
+             \x20                       .fold(0u64, |acc, p| acc ^ p.load(Relaxed))\n\
+             \x20                       .wrapping_neg();\n"
+            ),
         ),
-        None => r#"    // No quote context in this dialect: chunks are independent.
-    let entry = vec![0u64; threads];
-"#
-        .to_string(),
+        None => (
+            String::new(),
+            String::new(),
+            "                    let seed = 0u64;\n".to_string(),
+        ),
     }
 }
 
@@ -2356,16 +2365,16 @@ fn push_columns_api(
 
     // --- parallel entry point ------------------------------------------------
     if par_mode {
-        let prepass = prepass_snippet(dialect.quote);
+        let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.quote, "data[start..end]");
         let _ = write!(
             code,
             "/// Parallel [`parse_columns`]: records are assigned to workers by\n\
              /// terminator ownership — worker t skips to the first record\n\
              /// boundary at or past its chunk start, and finishes the record it\n\
              /// is mid-way through at chunk end — so every record is converted\n\
-             /// exactly once, with no tape built. Quote context comes from the\n\
-             /// same counting prepass as [`parse_par`]; column chunks\n\
-             /// concatenate, validity bitmaps stitch bit-shifted.\n\
+             /// exactly once, with no tape built. Quote context is resolved per\n\
+             /// chunk inside the scope (one barrier), as in [`parse_par`]; column\n\
+             /// chunks concatenate, validity bitmaps stitch bit-shifted.\n\
              pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {{\n\
              \x20   let threads = threads.max(1).min(data.len() / 64 + 1);\n\
              \x20   let chunk = (data.len() / threads + 63) & !63;\n\
@@ -2375,13 +2384,14 @@ fn push_columns_api(
              \x20   let bounds: Vec<usize> = (0..=threads)\n\
              \x20       .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})\n\
              \x20       .collect();\n\
-             {prepass}\
+             {par_shared}\
              \x20   let parts: Vec<Columns<'_>> = std::thread::scope(|s| {{\n\
              \x20       let handles: Vec<_> = (0..threads)\n\
              \x20           .map(|t| {{\n\
-             \x20               let seed = entry[t];\n\
              \x20               let (start, end) = (bounds[t], bounds[t + 1]);\n\
+             {par_refs}\
              \x20               s.spawn(move || {{\n\
+             {par_seed}\
              \x20                   let mut sink = ColumnSink::new(data, start as u32, end as u32, t == 0);\n\
              \x20                   index_cells_dispatch(data, seed, start, &mut sink);\n\
              \x20                   sink.finish()\n\

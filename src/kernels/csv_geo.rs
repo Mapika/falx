@@ -41,8 +41,8 @@ fn unsupported_cpu() -> ! {
 
 
 /// Parallel structural indexing: byte-identical to [`index_structurals`],
-/// split across `threads` chunks. Quote context is reconstructed with a
-/// counting prepass, so both passes run fully parallel.
+/// split across `threads` chunks. Quote context is reconstructed per chunk
+/// inside the indexing scope (one barrier), so the workers are spawned once.
 pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -53,32 +53,32 @@ pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
-    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
-    let mut entry = vec![0u64; threads];
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                s.spawn(move || slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1)
-            })
-            .collect();
-        let mut parity = 0u64;
-        for (t, h) in handles.into_iter().enumerate() {
-            entry[t] = parity.wrapping_neg();
-            parity ^= h.join().expect("prepass thread ok");
-        }
-    });
-    // Pass 2: index chunks concurrently into per-thread parts, then
-    // scatter them into `out` in parallel. Concatenation needs no rebase —
-    // seeded indexing already wrote absolute positions.
+    // Quote seeds are resolved inside the indexing scope: each thread
+    // contributes its chunk's quote-byte parity, then reads the parity
+    // of all preceding chunks after one barrier (doubled-quote escapes
+    // self-cancel, so raw parity is exact).
+    let parity: Vec<std::sync::atomic::AtomicU64> =
+        (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let barrier = std::sync::Barrier::new(threads);
+    // Index chunks concurrently into per-thread parts, then scatter them
+    // into `out` in parallel. Concatenation needs no rebase — seeded
+    // indexing already wrote absolute positions.
     let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
-                let seed = entry[t];
                 let base = bounds[t] as u32;
+                let parity = &parity;
+                let barrier = &barrier;
                 s.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    parity[t].store(slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1, Relaxed);
+                    barrier.wait();
+                    // Seed = quote parity of every preceding chunk.
+                    let seed = parity[..t]
+                        .iter()
+                        .fold(0u64, |acc, p| acc ^ p.load(Relaxed))
+                        .wrapping_neg();
                     let mut part = Vec::with_capacity(slice.len() / 16 + 8);
                     index_structurals_seeded_dispatch(slice, seed, base, &mut part);
                     part
@@ -159,29 +159,29 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
-    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
-    let mut entry = vec![0u64; threads];
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                s.spawn(move || slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1)
-            })
-            .collect();
-        let mut parity = 0u64;
-        for (t, h) in handles.into_iter().enumerate() {
-            entry[t] = parity.wrapping_neg();
-            parity ^= h.join().expect("prepass thread ok");
-        }
-    });
+    // Quote seeds are resolved inside the indexing scope: each thread
+    // contributes its chunk's quote-byte parity, then reads the parity
+    // of all preceding chunks after one barrier (doubled-quote escapes
+    // self-cancel, so raw parity is exact).
+    let parity: Vec<std::sync::atomic::AtomicU64> =
+        (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let barrier = std::sync::Barrier::new(threads);
     let parts: Vec<(Vec<u32>, Vec<u64>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
-                let seed = entry[t];
                 let base = bounds[t] as u32;
+                let parity = &parity;
+                let barrier = &barrier;
                 s.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    parity[t].store(slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1, Relaxed);
+                    barrier.wait();
+                    // Seed = quote parity of every preceding chunk.
+                    let seed = parity[..t]
+                        .iter()
+                        .fold(0u64, |acc, p| acc ^ p.load(Relaxed))
+                        .wrapping_neg();
                     let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
                     let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
                     index_tape_seeded_dispatch(slice, seed, base, &mut seps, &mut ends);
@@ -1000,9 +1000,9 @@ fn index_cells_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut ColumnS
 /// terminator ownership — worker t skips to the first record
 /// boundary at or past its chunk start, and finishes the record it
 /// is mid-way through at chunk end — so every record is converted
-/// exactly once, with no tape built. Quote context comes from the
-/// same counting prepass as [`parse_par`]; column chunks
-/// concatenate, validity bitmaps stitch bit-shifted.
+/// exactly once, with no tape built. Quote context is resolved per
+/// chunk inside the scope (one barrier), as in [`parse_par`]; column
+/// chunks concatenate, validity bitmaps stitch bit-shifted.
 pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -1012,28 +1012,28 @@ pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
         .collect();
-    // Pass 1: parity of quote bytes per chunk (doubled-quote escapes
-    // self-cancel, so raw parity is exact). Auto-vectorizes to ~memory speed.
-    let mut entry = vec![0u64; threads];
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let slice = &data[bounds[t]..bounds[t + 1]];
-                s.spawn(move || slice.iter().filter(|&&b| b == 34u8).count() as u64 & 1)
-            })
-            .collect();
-        let mut parity = 0u64;
-        for (t, h) in handles.into_iter().enumerate() {
-            entry[t] = parity.wrapping_neg();
-            parity ^= h.join().expect("prepass thread ok");
-        }
-    });
+    // Quote seeds are resolved inside the indexing scope: each thread
+    // contributes its chunk's quote-byte parity, then reads the parity
+    // of all preceding chunks after one barrier (doubled-quote escapes
+    // self-cancel, so raw parity is exact).
+    let parity: Vec<std::sync::atomic::AtomicU64> =
+        (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let barrier = std::sync::Barrier::new(threads);
     let parts: Vec<Columns<'_>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let seed = entry[t];
                 let (start, end) = (bounds[t], bounds[t + 1]);
+                let parity = &parity;
+                let barrier = &barrier;
                 s.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    parity[t].store(data[start..end].iter().filter(|&&b| b == 34u8).count() as u64 & 1, Relaxed);
+                    barrier.wait();
+                    // Seed = quote parity of every preceding chunk.
+                    let seed = parity[..t]
+                        .iter()
+                        .fold(0u64, |acc, p| acc ^ p.load(Relaxed))
+                        .wrapping_neg();
                     let mut sink = ColumnSink::new(data, start as u32, end as u32, t == 0);
                     index_cells_dispatch(data, seed, start, &mut sink);
                     sink.finish()
