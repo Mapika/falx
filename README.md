@@ -360,9 +360,11 @@ Kernel generation defaults to weighted auto-discovery plus cost-weighted graph o
   scientific formats (VCF/BED/GFF/SAM, Matrix Market) get the parallel path;
   FASTQ framing (4-line reads) via the newline kernel (`examples/fastq.rs`)
 - Next: vectorize the three-state region resolver (the scalar `Regions` pass
-  caps comment dialects — the genomics speed lever), per-field clean/Cow cost
-  (~2.5 ns/field span-layer headroom), `lines_per_record` so fixed-line
-  formats like FASTQ get a generated record API, ARM NEON backend, full
+  now gates only quote-*and*-comment dialects like `csv_hash` — genomics moved
+  to line-ownership parallelism, so this is a completeness/cleanliness item,
+  not the genomics lever it once was), per-field clean/Cow cost (~2.5 ns/field
+  span-layer headroom), a declarative `lines_per_record` so other fixed-line
+  formats get the generated record API FASTQ now has, ARM NEON backend, full
   equality-saturation graph extraction over the local cost-weighted optimizer
 
 ## License
