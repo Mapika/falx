@@ -2594,6 +2594,15 @@ pub enum FastqError {
 /// This is a generated domain API over the generated newline kernel: the SIMD
 /// step emits newline masks, and a fixed-four-line sink validates FASTQ shape
 /// while accumulating counters.
+///
+/// Strictness: a record is exactly four `\n`-terminated lines (`@` header,
+/// sequence, `+` separator, quality) and the input must end with a newline —
+/// a final record without a trailing `\n` is rejected (`IncompleteRecord` /
+/// `TrailingBytes`). Bytes are taken verbatim: `\r` is not stripped, so CRLF
+/// input either fails validation or counts the `\r` in line lengths and the
+/// checksum. This is intentionally stricter than lenient FASTQ readers;
+/// callers that must accept CRLF or an unterminated final record normalize
+/// the input first.
 pub fn parse_fastq(data: &[u8]) -> Result<FastqStats, FastqError> {
     let mut sink = FastqSink::new(data.len());
     fastq_blocks_dispatch(data, &mut sink)?;
@@ -2707,6 +2716,17 @@ fn fastq_record_bounds(data: &[u8], threads: usize) -> Option<Vec<usize>> {
     Some(bounds)
 }
 
+/// Find a safe worker-split point at or after `offset`.
+///
+/// Splits must land on a true record start, so this scans forward to a line
+/// beginning with `@` that revalidates as a complete four-line record
+/// (`fastq_record_end_at`). A structurally wrong split makes a worker's sink
+/// error and `parse_fastq_par` falls back to the serial parser, so a bad guess
+/// cannot corrupt the result. The one residual (and vanishingly unlikely) case
+/// is adversarial input where a quality line beginning with `@` coincidentally
+/// starts a shape-valid four-line record at a chunk target: that can shift
+/// framing without erroring, so the parallel record count is not trustworthy
+/// on hostile, hand-crafted FASTQ.
 fn fastq_find_record_boundary(data: &[u8], offset: usize) -> Option<usize> {
     if offset == 0 {
         return Some(0);
