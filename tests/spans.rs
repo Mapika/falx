@@ -177,7 +177,10 @@ fn csv_hand_cases() {
     // Record 1: last, row
     let record1 = records[1];
     assert_eq!(record1.field_count(), 2, "record 1: field_count");
-    assert_eq!(record1.field(0).expect("record 1 field 0").as_ref(), b"last");
+    assert_eq!(
+        record1.field(0).expect("record 1 field 0").as_ref(),
+        b"last"
+    );
     assert_eq!(record1.field(1).expect("record 1 field 1").as_ref(), b"row");
 }
 
@@ -206,7 +209,10 @@ fn backslash_hand_cases() {
 
     assert_eq!(fields.len(), 4, "expected 4 fields: a, x \" y, b, plain");
     assert_eq!(fields[0], b"a");
-    assert_eq!(fields[1], b"x \" y", "field 1: backslash should unescape \" to \"");
+    assert_eq!(
+        fields[1], b"x \" y",
+        "field 1: backslash should unescape \" to \""
+    );
     assert_eq!(fields[2], b"b");
     assert_eq!(fields[3], b"plain");
 }
@@ -254,10 +260,7 @@ fn ndjson_records_match_line_split() {
 
     // Parse with falx
     let parsed = falx::kernels::ndjson::parse(&ndjson_data);
-    let falx_records: Vec<_> = parsed
-        .records()
-        .map(|r| r.as_bytes().to_vec())
-        .collect();
+    let falx_records: Vec<_> = parsed.records().map(|r| r.as_bytes().to_vec()).collect();
 
     // Parse with line split
     let split_records: Vec<_> = ndjson_data
@@ -322,11 +325,7 @@ fn record_edge_cases() {
         let input = b"a,b";
         let parsed = falx::kernels::csv::parse(input);
         let records: Vec<_> = parsed.records().collect();
-        assert_eq!(
-            records.len(),
-            1,
-            "no-newline input: expected 1 record"
-        );
+        assert_eq!(records.len(), 1, "no-newline input: expected 1 record");
 
         let record = records[0];
         assert_eq!(record.field_count(), 2, "no-newline record: field_count");
@@ -342,18 +341,10 @@ fn record_edge_cases() {
         assert_eq!(records.len(), 2, "crlf input: expected 2 records");
 
         let record0 = records[0];
-        assert_eq!(
-            record0.as_bytes(),
-            b"a",
-            "record 0: \\r should be trimmed"
-        );
+        assert_eq!(record0.as_bytes(), b"a", "record 0: \\r should be trimmed");
 
         let record1 = records[1];
-        assert_eq!(
-            record1.as_bytes(),
-            b"b",
-            "record 1: \\r should be trimmed"
-        );
+        assert_eq!(record1.as_bytes(), b"b", "record 1: \\r should be trimmed");
     }
 }
 
@@ -399,7 +390,10 @@ fn parse_par_matches_parse() {
                 .records()
                 .map(|r| r.fields().map(|f| f.into_owned()).collect())
                 .collect();
-            assert_eq!(par, serial, "parse_par mismatch at {threads} threads, len {len}");
+            assert_eq!(
+                par, serial,
+                "parse_par mismatch at {threads} threads, len {len}"
+            );
         }
     }
 }
@@ -458,9 +452,7 @@ fn streaming_matches_batch() {
                         s.feed(&d[prev..], |r| {
                             out.push(r.fields().map(|f| f.into_owned()).collect())
                         });
-                        s.finish(|r| {
-                            out.push(r.fields().map(|f| f.into_owned()).collect())
-                        });
+                        s.finish(|r| out.push(r.fields().map(|f| f.into_owned()).collect()));
                         out
                     },
                 );
@@ -489,7 +481,9 @@ fn streaming_compaction_large_input() {
                 let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
                 let mut s = falx::kernels::csv::stream();
                 for chunk in d.chunks(feed) {
-                    s.feed(chunk, |r| out.push(r.fields().map(|f| f.into_owned()).collect()));
+                    s.feed(chunk, |r| {
+                        out.push(r.fields().map(|f| f.into_owned()).collect())
+                    });
                 }
                 s.finish(|r| out.push(r.fields().map(|f| f.into_owned()).collect()));
                 out
@@ -506,7 +500,9 @@ fn streaming_compaction_large_input() {
                 let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
                 let mut s = falx::kernels::ndjson::stream();
                 for chunk in d.chunks(feed) {
-                    s.feed(chunk, |r| out.push(r.fields().map(|f| f.into_owned()).collect()));
+                    s.feed(chunk, |r| {
+                        out.push(r.fields().map(|f| f.into_owned()).collect())
+                    });
                 }
                 s.finish(|r| out.push(r.fields().map(|f| f.into_owned()).collect()));
                 out

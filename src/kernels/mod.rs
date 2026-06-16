@@ -8,15 +8,17 @@ use crate::formats::{self, Dialect};
 pub mod csv;
 pub mod csv_geo;
 pub mod csv_geo_text;
-pub mod csv_typed;
 pub mod csv_hash;
+pub mod csv_typed;
+pub mod fastq;
 pub mod json;
+pub mod lines;
 pub mod logfmt;
 pub mod multi;
-pub mod lines;
 pub mod ndjson;
 pub mod tsv;
 pub mod vcf;
+pub mod vcf_typed;
 
 /// The registry of checked-in kernels: name, dialect, and projected
 /// columns. The generator example and the drift test both consume this, so
@@ -29,9 +31,38 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
         // comment-without-quote dialect — its parallel path uses line
         // ownership (no quote/region state crosses a chunk boundary).
         ("vcf", formats::vcf_dialect(), vec![]),
+        (
+            "vcf_typed",
+            formats::vcf_dialect(),
+            vec![
+                Column {
+                    index: 1,
+                    name: Some("pos".into()),
+                    ty: ColumnType::I64,
+                },
+                Column {
+                    index: 3,
+                    name: Some("reference".into()),
+                    ty: ColumnType::Bytes,
+                },
+                Column {
+                    index: 4,
+                    name: Some("alternate".into()),
+                    ty: ColumnType::Bytes,
+                },
+                Column {
+                    index: 5,
+                    name: Some("quality".into()),
+                    ty: ColumnType::F64,
+                },
+            ],
+        ),
         // Pure newline framing; the base for fixed-line record formats like
         // FASTQ (group line boundaries by 4). See examples/fastq.rs.
         ("lines", formats::lines_dialect(), vec![]),
+        // FASTQ uses the generated newline kernel plus a generated
+        // fixed-four-line validation/stat sink; no handwritten FASTQ kernel.
+        ("fastq", formats::lines_dialect(), vec![]),
         ("logfmt", formats::logfmt_dialect(), vec![]),
         ("ndjson", formats::ndjson_dialect(), vec![]),
         // Bracket nesting: the structural index feeds a nested tape with
@@ -45,8 +76,16 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
             "csv_hash",
             formats::csv_hash_dialect(),
             vec![
-                Column { index: 0, name: Some("key".into()), ty: ColumnType::Str },
-                Column { index: 1, name: Some("amount".into()), ty: ColumnType::I64 },
+                Column {
+                    index: 0,
+                    name: Some("key".into()),
+                    ty: ColumnType::Str,
+                },
+                Column {
+                    index: 1,
+                    name: Some("amount".into()),
+                    ty: ColumnType::I64,
+                },
             ],
         ),
         // Typed projection demo: non-adjacent indexes, one column of every
@@ -55,10 +94,26 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
             "csv_typed",
             formats::csv_dialect(),
             vec![
-                Column { index: 0, name: Some("id".into()), ty: ColumnType::I64 },
-                Column { index: 1, name: Some("title".into()), ty: ColumnType::Str },
-                Column { index: 2, name: Some("value".into()), ty: ColumnType::F64 },
-                Column { index: 4, name: Some("label".into()), ty: ColumnType::Bytes },
+                Column {
+                    index: 0,
+                    name: Some("id".into()),
+                    ty: ColumnType::I64,
+                },
+                Column {
+                    index: 1,
+                    name: Some("title".into()),
+                    ty: ColumnType::Str,
+                },
+                Column {
+                    index: 2,
+                    name: Some("value".into()),
+                    ty: ColumnType::F64,
+                },
+                Column {
+                    index: 4,
+                    name: Some("label".into()),
+                    ty: ColumnType::Bytes,
+                },
             ],
         ),
         // worldcitiespop schema (Country,City,AccentCity,Region,Population,
@@ -67,8 +122,16 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
             "csv_geo",
             formats::csv_dialect(),
             vec![
-                Column { index: 5, name: Some("latitude".into()), ty: ColumnType::F64 },
-                Column { index: 6, name: Some("longitude".into()), ty: ColumnType::F64 },
+                Column {
+                    index: 5,
+                    name: Some("latitude".into()),
+                    ty: ColumnType::F64,
+                },
+                Column {
+                    index: 6,
+                    name: Some("longitude".into()),
+                    ty: ColumnType::F64,
+                },
             ],
         ),
         // Same schema with the City column materialized as a string: the
@@ -77,9 +140,21 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
             "csv_geo_text",
             formats::csv_dialect(),
             vec![
-                Column { index: 1, name: Some("city".into()), ty: ColumnType::Str },
-                Column { index: 5, name: Some("latitude".into()), ty: ColumnType::F64 },
-                Column { index: 6, name: Some("longitude".into()), ty: ColumnType::F64 },
+                Column {
+                    index: 1,
+                    name: Some("city".into()),
+                    ty: ColumnType::Str,
+                },
+                Column {
+                    index: 5,
+                    name: Some("latitude".into()),
+                    ty: ColumnType::F64,
+                },
+                Column {
+                    index: 6,
+                    name: Some("longitude".into()),
+                    ty: ColumnType::F64,
+                },
             ],
         ),
     ]

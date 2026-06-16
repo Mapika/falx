@@ -13,10 +13,14 @@ use std::time::Instant;
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12; self.0 ^= self.0 << 25; self.0 ^= self.0 >> 27;
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    fn b(&mut self, n: u64) -> u64 { self.next() % n }
+    fn b(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
 }
 
 fn generate_fastq(target: usize) -> Vec<u8> {
@@ -32,9 +36,13 @@ fn generate_fastq(target: usize) -> Vec<u8> {
         d.extend_from_slice(b"@read");
         d.extend_from_slice(id.to_string().as_bytes());
         d.extend_from_slice(b" flowcell:1:lane:2\n");
-        for _ in 0..len { d.push(bases[r.b(4) as usize]); }
+        for _ in 0..len {
+            d.push(bases[r.b(4) as usize]);
+        }
         d.extend_from_slice(b"\n+\n");
-        for _ in 0..len { d.push(quals[r.b(quals.len() as u64) as usize]); }
+        for _ in 0..len {
+            d.push(quals[r.b(quals.len() as u64) as usize]);
+        }
         d.push(b'\n');
         id += 1;
     }
@@ -42,14 +50,24 @@ fn generate_fastq(target: usize) -> Vec<u8> {
 }
 
 /// One FASTQ read: four byte-slices into the original buffer, zero-copy.
-struct Read<'a> { header: &'a [u8], seq: &'a [u8], plus: &'a [u8], qual: &'a [u8] }
+struct Read<'a> {
+    header: &'a [u8],
+    seq: &'a [u8],
+    plus: &'a [u8],
+    qual: &'a [u8],
+}
 
 /// Frame reads from sorted newline positions: every four line boundaries are
 /// one read. Calls `f` per read; no allocation, no copy.
 fn for_each_read(data: &[u8], nls: &[u32], mut f: impl FnMut(Read<'_>)) {
     let mut start = 0usize;
     for rec in nls.chunks_exact(4) {
-        let (a, b, c, d) = (rec[0] as usize, rec[1] as usize, rec[2] as usize, rec[3] as usize);
+        let (a, b, c, d) = (
+            rec[0] as usize,
+            rec[1] as usize,
+            rec[2] as usize,
+            rec[3] as usize,
+        );
         f(Read {
             header: &data[start..a],
             seq: &data[a + 1..b],
@@ -65,7 +83,9 @@ fn scalar_total_bases(data: &[u8]) -> usize {
     let (mut total, mut line_start, mut line_in_rec) = (0usize, 0usize, 0u32);
     for (i, &b) in data.iter().enumerate() {
         if b == b'\n' {
-            if line_in_rec == 1 { total += i - line_start; } // sequence line
+            if line_in_rec == 1 {
+                total += i - line_start;
+            } // sequence line
             line_in_rec = (line_in_rec + 1) % 4;
             line_start = i + 1;
         }
@@ -76,7 +96,11 @@ fn scalar_total_bases(data: &[u8]) -> usize {
 fn best(reps: usize, mut f: impl FnMut() -> usize) -> (f64, usize) {
     let w = black_box(f());
     let mut v: Vec<f64> = (0..reps)
-        .map(|_| { let s = Instant::now(); black_box(f()); s.elapsed().as_secs_f64() })
+        .map(|_| {
+            let s = Instant::now();
+            black_box(f());
+            s.elapsed().as_secs_f64()
+        })
         .collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     (v[0], w)
@@ -119,10 +143,31 @@ fn main() {
         }
     });
 
-    println!("FASTQ {:.0} MiB, {} reads, {malformed} malformed\n", data.len() as f64 / (1024.0 * 1024.0), n / 4);
-    println!("falx newline index (par x{threads}):   {:.2} GiB/s", gib / t_idx);
-    println!("falx frame + base count (par x{threads}): {:.2} GiB/s", gib / t_full);
-    println!("scalar reader (baseline):          {:.2} GiB/s", gib / t_scalar);
-    println!("\nsequence bytes agree: {} ({} vs {})", falx_bases == scalar_bases, falx_bases, scalar_bases);
-    println!("speedup vs scalar: {:.1}x", (gib / t_full) / (gib / t_scalar));
+    println!(
+        "FASTQ {:.0} MiB, {} reads, {malformed} malformed\n",
+        data.len() as f64 / (1024.0 * 1024.0),
+        n / 4
+    );
+    println!(
+        "falx newline index (par x{threads}):   {:.2} GiB/s",
+        gib / t_idx
+    );
+    println!(
+        "falx frame + base count (par x{threads}): {:.2} GiB/s",
+        gib / t_full
+    );
+    println!(
+        "scalar reader (baseline):          {:.2} GiB/s",
+        gib / t_scalar
+    );
+    println!(
+        "\nsequence bytes agree: {} ({} vs {})",
+        falx_bases == scalar_bases,
+        falx_bases,
+        scalar_bases
+    );
+    println!(
+        "speedup vs scalar: {:.1}x",
+        (gib / t_full) / (gib / t_scalar)
+    );
 }

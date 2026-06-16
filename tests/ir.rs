@@ -1,7 +1,7 @@
-use falx::ir::{CharClass, Graph};
-use falx::interp;
-use falx::scalar;
 use falx::formats;
+use falx::interp;
+use falx::ir::{CharClass, Graph};
+use falx::scalar;
 
 /// xorshift64* RNG; avoids a dev-dependency for test data generation.
 struct Rng(u64);
@@ -129,11 +129,7 @@ fn shift_left1_at_end_of_input() {
 
 #[test]
 fn alternative_dialects_differential() {
-    let dialects = [
-        (b';', b'\''),
-        (b'\t', b'"'),
-        (b'|', b'q'),
-    ];
+    let dialects = [(b';', b'\''), (b'\t', b'"'), (b'|', b'q')];
 
     let mut rng = Rng(0x1234_5678_9ABC_DEF0);
 
@@ -212,7 +208,8 @@ fn backslash_escape_differential() {
             let mut output = Vec::new();
             interp::run(&g, &data, &mut output);
             assert_eq!(
-                output, expected,
+                output,
+                expected,
                 "escape dialect {:?} mismatch on input: {:?}",
                 dialect,
                 String::from_utf8_lossy(&data)
@@ -246,14 +243,22 @@ fn charclass_membership() {
     assert!(class_single.contains(42));
     for byte in 0..=255u8 {
         if byte != 42 {
-            assert!(!class_single.contains(byte), "from_byte(42) unexpectedly contains {}", byte);
+            assert!(
+                !class_single.contains(byte),
+                "from_byte(42) unexpectedly contains {}",
+                byte
+            );
         }
     }
 
     // Test empty().
     let empty = CharClass::empty();
     for byte in 0..=255u8 {
-        assert!(!empty.contains(byte), "empty() unexpectedly contains {}", byte);
+        assert!(
+            !empty.contains(byte),
+            "empty() unexpectedly contains {}",
+            byte
+        );
     }
 }
 

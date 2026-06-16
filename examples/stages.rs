@@ -31,9 +31,7 @@ fn main() {
         out.len()
     });
 
-    let (t_records, recs) = best_of(5, || {
-        falx::kernels::csv::parse(&data).records().count()
-    });
+    let (t_records, recs) = best_of(5, || falx::kernels::csv::parse(&data).records().count());
 
     let (t_raw, raw_bytes) = best_of(5, || {
         let parsed = falx::kernels::csv::parse(&data);
@@ -57,7 +55,9 @@ fn main() {
         total
     });
 
-    println!("structurals: {n}, records: {recs}, raw bytes: {raw_bytes}, clean bytes: {clean_bytes}");
+    println!(
+        "structurals: {n}, records: {recs}, raw bytes: {raw_bytes}, clean bytes: {clean_bytes}"
+    );
     println!();
     println!("stage                          total ms     GiB/s    delta ms (stage cost)");
     let rows = [

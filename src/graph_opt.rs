@@ -16,7 +16,7 @@
 
 use crate::formats::DelimitedParts;
 use crate::ir::{CharClass, Graph, NodeId, Op};
-use crate::synth::{graph_cost, CostModel};
+use crate::synth::{CostModel, graph_cost};
 use std::collections::HashMap;
 
 /// Largest fused class produced by `Or`/`Xor` class fusion. Classes up to 8
@@ -517,11 +517,7 @@ fn depths(graph: &Graph) -> Vec<u32> {
 }
 
 fn ordered(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
-    if a.0 <= b.0 {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a.0 <= b.0 { (a, b) } else { (b, a) }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]

@@ -3,7 +3,7 @@
 
 use crate::formats::{DelimitedParts, Dialect, Escape};
 use crate::synth::{
-    synthesize_multi, Budget, CostModel, Leaf, MultiOutcome, MultiSpec, Order, Spec, Stats,
+    Budget, CostModel, Leaf, MultiOutcome, MultiSpec, Order, Spec, Stats, synthesize_multi,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};

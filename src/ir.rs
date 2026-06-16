@@ -221,7 +221,12 @@ impl Graph {
         self.push(Op::ShiftLeft1Seeded(a))
     }
 
-    pub fn regions(&mut self, quotes: NodeId, comment_starts: NodeId, terminators: NodeId) -> NodeId {
+    pub fn regions(
+        &mut self,
+        quotes: NodeId,
+        comment_starts: NodeId,
+        terminators: NodeId,
+    ) -> NodeId {
         self.check(quotes);
         self.check(comment_starts);
         self.check(terminators);

@@ -50,15 +50,24 @@ pub enum LeafKind {
 
 impl Leaf {
     pub fn class(name: &str, bytes: &[u8]) -> Self {
-        Self { name: name.into(), kind: LeafKind::Class(CharClass::from_bytes(bytes)) }
+        Self {
+            name: name.into(),
+            kind: LeafKind::Class(CharClass::from_bytes(bytes)),
+        }
     }
 
     pub fn constant(name: &str, pattern: u64) -> Self {
-        Self { name: name.into(), kind: LeafKind::Const(pattern) }
+        Self {
+            name: name.into(),
+            kind: LeafKind::Const(pattern),
+        }
     }
 
     pub fn derived(name: &str, graph: Graph) -> Self {
-        Self { name: name.into(), kind: LeafKind::Derived(graph) }
+        Self {
+            name: name.into(),
+            kind: LeafKind::Derived(graph),
+        }
     }
 }
 
@@ -80,11 +89,17 @@ pub struct Spec<'a> {
 
 impl<'a> Spec<'a> {
     pub fn exact(reference: MaskFn<'a>) -> Self {
-        Self { reference, care: None }
+        Self {
+            reference,
+            care: None,
+        }
     }
 
     pub fn with_care(reference: MaskFn<'a>, care: MaskFn<'a>) -> Self {
-        Self { reference, care: Some(care) }
+        Self {
+            reference,
+            care: Some(care),
+        }
     }
 }
 
@@ -107,18 +122,42 @@ impl CostModel {
     /// The dispatched kernel: classes are a couple of compares, constants
     /// are free registers, PrefixXor is PCLMULQDQ plus GPR/XMM round trips.
     pub fn avx2() -> Self {
-        Self { class: 2, constant: 0, bitwise: 1, shift: 2, add: 2, prefix_xor: 10, regions: 50 }
+        Self {
+            class: 2,
+            constant: 0,
+            bitwise: 1,
+            shift: 2,
+            add: 2,
+            prefix_xor: 10,
+            regions: 50,
+        }
     }
 
     /// The portable fallback: classes walk 64 bytes, PrefixXor is the
     /// log-step XOR cascade.
     pub fn scalar() -> Self {
-        Self { class: 20, constant: 0, bitwise: 1, shift: 2, add: 2, prefix_xor: 12, regions: 50 }
+        Self {
+            class: 20,
+            constant: 0,
+            bitwise: 1,
+            shift: 2,
+            add: 2,
+            prefix_xor: 12,
+            regions: 50,
+        }
     }
 
     /// Uniform weights: plain DAG node count.
     pub fn nodes() -> Self {
-        Self { class: 1, constant: 1, bitwise: 1, shift: 1, add: 1, prefix_xor: 1, regions: 1 }
+        Self {
+            class: 1,
+            constant: 1,
+            bitwise: 1,
+            shift: 1,
+            add: 1,
+            prefix_xor: 1,
+            regions: 1,
+        }
     }
 }
 
@@ -278,18 +317,23 @@ pub enum Outcome {
 /// inputs must be multiples of 64 bytes so block masks need no pad
 /// handling. Among equivalent solutions, the cheapest under the budget's
 /// cost model wins.
-pub fn synthesize(
-    leaves: &[Leaf],
-    corpus: &[Vec<u8>],
-    spec: &Spec,
-    budget: &Budget,
-) -> Outcome {
+pub fn synthesize(leaves: &[Leaf], corpus: &[Vec<u8>], spec: &Spec, budget: &Budget) -> Outcome {
     let start = Instant::now();
     let mut inputs = corpus.to_vec();
     let mut candidates = 0u64;
     let mut restarts = 0usize;
     loop {
-        match attempt(leaves, &[], &inputs, spec, budget, &mut candidates, restarts, start, false) {
+        match attempt(
+            leaves,
+            &[],
+            &inputs,
+            spec,
+            budget,
+            &mut candidates,
+            restarts,
+            start,
+            false,
+        ) {
             Attempt::Found(solution) => return Outcome::Found(solution),
             Attempt::Exhausted(stats, _) => return Outcome::NotFound(stats),
             Attempt::Counterexample(input) => {
@@ -342,11 +386,7 @@ pub struct MultiSpec<'a> {
 /// the solved streams, keeping every search small. The merged graph
 /// shares all common subexpressions; `shared_cost` vs `separate_cost` is
 /// the fusion win.
-pub fn synthesize_multi(
-    corpus: &[Vec<u8>],
-    specs: &[MultiSpec],
-    budget: &Budget,
-) -> MultiOutcome {
+pub fn synthesize_multi(corpus: &[Vec<u8>], specs: &[MultiSpec], budget: &Budget) -> MultiOutcome {
     let mut derived: Vec<Leaf> = Vec::new();
     let mut solutions: Vec<Solution> = Vec::new();
     for (k, multi_spec) in specs.iter().enumerate() {
@@ -358,21 +398,34 @@ pub fn synthesize_multi(
                 solutions.push(*solution);
             }
             Outcome::NotFound(stats) => {
-                return MultiOutcome::NotFound { failed_spec: k, stats };
+                return MultiOutcome::NotFound {
+                    failed_spec: k,
+                    stats,
+                };
             }
         }
     }
     let mut graph = Graph::new();
     let mut cse: HashMap<CseKey, NodeId> = HashMap::new();
-    let outputs: Vec<NodeId> =
-        solutions.iter().map(|sol| splice(&mut graph, &mut cse, &sol.graph)).collect();
+    let outputs: Vec<NodeId> = solutions
+        .iter()
+        .map(|sol| splice(&mut graph, &mut cse, &sol.graph))
+        .collect();
     graph.set_output(outputs[0]);
     let shared_cost = graph_cost(&graph, &budget.cost);
     let separate_cost = solutions.iter().map(|sol| sol.cost).sum();
     let stats = Stats {
         candidates: solutions.iter().map(|sol| sol.stats.candidates).sum(),
-        bank_unique: solutions.iter().map(|sol| sol.stats.bank_unique).max().unwrap_or(0),
-        completed_level: solutions.iter().map(|sol| sol.stats.completed_level).min().unwrap_or(0),
+        bank_unique: solutions
+            .iter()
+            .map(|sol| sol.stats.bank_unique)
+            .max()
+            .unwrap_or(0),
+        completed_level: solutions
+            .iter()
+            .map(|sol| sol.stats.completed_level)
+            .min()
+            .unwrap_or(0),
         restarts: solutions.iter().map(|sol| sol.stats.restarts).sum(),
         bank_saturated: solutions.iter().any(|sol| sol.stats.bank_saturated),
         elapsed_ms: solutions.iter().map(|sol| sol.stats.elapsed_ms).sum(),
@@ -436,8 +489,15 @@ pub fn synthesize_auto(
         let mut restarts = 0usize;
         let (stats, dump) = loop {
             match attempt(
-                &leaves, &templates, &inputs, spec, &auto.per_round, &mut candidates, restarts,
-                start, true,
+                &leaves,
+                &templates,
+                &inputs,
+                spec,
+                &auto.per_round,
+                &mut candidates,
+                restarts,
+                start,
+                true,
             ) {
                 Attempt::Found(solution) => return AutoOutcome::Found(solution, reports),
                 Attempt::Exhausted(stats, dump) => {
@@ -450,14 +510,24 @@ pub fn synthesize_auto(
                 }
             }
         };
-        let room = auto.max_leaves.saturating_sub(leaves.len()).min(auto.promotions);
+        let room = auto
+            .max_leaves
+            .saturating_sub(leaves.len())
+            .min(auto.promotions);
         let (picked_leaves, picked_templates) =
             promote(&leaves, &templates, &dump, &Corpus::new(&inputs), room);
         let mut promoted: Vec<String> =
             picked_leaves.iter().map(|leaf| leaf.name.clone()).collect();
-        promoted
-            .extend(picked_templates.iter().map(|tpl| format!("template {}", tpl.name)));
-        reports.push(RoundReport { round, stats, promoted });
+        promoted.extend(
+            picked_templates
+                .iter()
+                .map(|tpl| format!("template {}", tpl.name)),
+        );
+        reports.push(RoundReport {
+            round,
+            stats,
+            promoted,
+        });
         if picked_leaves.is_empty() && picked_templates.is_empty() {
             break; // No new vocabulary: further rounds would repeat this one.
         }
@@ -512,8 +582,7 @@ fn promote(
             }
             Term::Tpl(t, a) => {
                 child_count[a as usize] += 1;
-                stateful[i] =
-                    existing_templates[t as usize].stateful || stateful[a as usize];
+                stateful[i] = existing_templates[t as usize].stateful || stateful[a as usize];
             }
         }
     }
@@ -648,8 +717,10 @@ fn promote(
     // nearest misses. Recurring structure beats concrete instantiations —
     // one template transfers across every stream it could wrap.
     let mut mined: HashMap<TTree, u32> = HashMap::new();
-    let near: Vec<u32> =
-        by_distance[..by_distance.len().min(32)].iter().map(|&(_, i)| i).collect();
+    let near: Vec<u32> = by_distance[..by_distance.len().min(32)]
+        .iter()
+        .map(|&(_, i)| i)
+        .collect();
     for (ai, &a) in near.iter().enumerate() {
         for &b in &near[ai + 1..] {
             let pattern = lgg(bank, &bank[a as usize].term, &bank[b as usize].term);
@@ -671,7 +742,11 @@ fn promote(
         .map(|(body, _)| {
             let name = body.pattern(existing);
             let stateful = body.stateful();
-            Template { body, name, stateful }
+            Template {
+                body,
+                name,
+                stateful,
+            }
         })
         .collect();
     (picks, templates)
@@ -750,9 +825,7 @@ impl TTree {
         match self {
             TTree::Hole | TTree::Leaf(_) => false,
             TTree::Un(op, a) => !matches!(op, UnOp::Not) || a.stateful(),
-            TTree::Bin(op, a, b) => {
-                matches!(op, BinOp::Add) || a.stateful() || b.stateful()
-            }
+            TTree::Bin(op, a, b) => matches!(op, BinOp::Add) || a.stateful() || b.stateful(),
         }
     }
 
@@ -762,7 +835,12 @@ impl TTree {
             TTree::Leaf(li) => leaves[*li as usize].name.clone(),
             TTree::Un(op, a) => format!("{}({})", un_name(*op), a.pattern(leaves)),
             TTree::Bin(op, a, b) => {
-                format!("{}({}, {})", bin_name(*op), a.pattern(leaves), b.pattern(leaves))
+                format!(
+                    "{}({}, {})",
+                    bin_name(*op),
+                    a.pattern(leaves),
+                    b.pattern(leaves)
+                )
             }
         }
     }
@@ -859,7 +937,11 @@ impl Corpus {
             })
             .collect();
         let total_blocks = blocks.iter().sum();
-        Self { inputs: inputs.to_vec(), blocks, total_blocks }
+        Self {
+            inputs: inputs.to_vec(),
+            blocks,
+            total_blocks,
+        }
     }
 }
 
@@ -1141,7 +1223,10 @@ fn masked_eq(eval: &[u64], target: &[u64], care: Option<&[u64]>) -> bool {
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "internal driver shared by two front doors")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal driver shared by two front doors"
+)]
 fn attempt(
     leaves: &[Leaf],
     templates: &[Template],
@@ -1157,14 +1242,22 @@ fn attempt(
     let mut target = Vec::with_capacity(corpus.total_blocks);
     for input in &corpus.inputs {
         let masks = (spec.reference)(input);
-        assert_eq!(masks.len(), input.len() / 64, "reference returned wrong block count");
+        assert_eq!(
+            masks.len(),
+            input.len() / 64,
+            "reference returned wrong block count"
+        );
         target.extend_from_slice(&masks);
     }
     let care = spec.care.map(|care_fn| {
         let mut masks = Vec::with_capacity(corpus.total_blocks);
         for input in &corpus.inputs {
             let blocks = care_fn(input);
-            assert_eq!(blocks.len(), input.len() / 64, "care returned wrong block count");
+            assert_eq!(
+                blocks.len(),
+                input.len() / 64,
+                "care returned wrong block count"
+            );
             masks.extend_from_slice(&blocks);
         }
         masks
@@ -1232,8 +1325,7 @@ impl Search<'_> {
                 continue; // Too expensive to ever appear in a solution.
             }
             eval_leaf(&self.leaves[li], &self.corpus, &mut scratch);
-            if let Verdict::Stop(outcome) = self.consider(Term::Leaf(li as u16), &scratch, level)
-            {
+            if let Verdict::Stop(outcome) = self.consider(Term::Leaf(li as u16), &scratch, level) {
                 return outcome;
             }
         }
@@ -1340,11 +1432,16 @@ impl Search<'_> {
                     if self.bank.len() >= self.budget.max_bank {
                         break;
                     }
-                    if let std::collections::hash_map::Entry::Vacant(slot) =
-                        self.seen.entry(hash)
-                    {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = self.seen.entry(hash) {
                         slot.insert(());
-                        eval_term(self.leaves, self.templates, &self.evals, &self.corpus, term, scratch);
+                        eval_term(
+                            self.leaves,
+                            self.templates,
+                            &self.evals,
+                            &self.corpus,
+                            term,
+                            scratch,
+                        );
                         let idx = self.bank.len() as u32;
                         let size = term_size(&self.bank, &term);
                         self.bank.push(Entry { term, size });
@@ -1367,7 +1464,9 @@ impl Search<'_> {
     /// Parallel phase: evaluate every candidate in the given rows. Returns
     /// one shard output per thread, in deterministic shard order.
     fn evaluate_rows(&self, level: usize, rows: &[Row]) -> Vec<ShardOut> {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(16);
         let total: u64 = rows.len() as u64;
         let per_shard = total.div_ceil(threads as u64).max(1) as usize;
         let order = self.budget.order;
@@ -1406,14 +1505,12 @@ impl Search<'_> {
                         for &row in chunk {
                             match row {
                                 Row::Un(op, ii) => {
-                                    let child =
-                                        by_level[level - un_weight(op, order, &model)][ii];
+                                    let child = by_level[level - un_weight(op, order, &model)][ii];
                                     eval_un(op, eval_of(child), corpus, &mut scratch);
                                     emit(Term::Un(op, child), &scratch, &mut out);
                                 }
                                 Row::Tpl(ti, ii) => {
-                                    let child =
-                                        by_level[level - template_weights[ti as usize]][ii];
+                                    let child = by_level[level - template_weights[ti as usize]][ii];
                                     let applied = eval_ttree(
                                         &templates[ti as usize].body,
                                         leaves,
@@ -1437,7 +1534,10 @@ impl Search<'_> {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("shard panicked")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("shard panicked"))
+                .collect()
         })
     }
 
@@ -1447,7 +1547,8 @@ impl Search<'_> {
         let stats = self.stats(completed_level);
         match self.best.take() {
             Some(mut solution) => {
-                self.alternates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                self.alternates
+                    .sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
                 solution.alternates = std::mem::take(&mut self.alternates);
                 solution.stats = stats;
                 RunOutcome::Found(solution)
@@ -1525,15 +1626,19 @@ impl Search<'_> {
             let expected = (self.spec.reference)(&input);
             let care = self.spec.care.map(|care_fn| care_fn(&input));
             let actual = graph_masks(graph, &input);
-            let agree = expected.iter().zip(&actual).enumerate().all(|(block, (&e, &a))| {
-                let mut relevant = care.as_ref().map_or(!0, |masks| masks[block]);
-                // Pad bits beyond the input are never compared.
-                let tail = input.len() - block * 64;
-                if tail < 64 {
-                    relevant &= (1u64 << tail) - 1;
-                }
-                (e ^ a) & relevant == 0
-            });
+            let agree = expected
+                .iter()
+                .zip(&actual)
+                .enumerate()
+                .all(|(block, (&e, &a))| {
+                    let mut relevant = care.as_ref().map_or(!0, |masks| masks[block]);
+                    // Pad bits beyond the input are never compared.
+                    let tail = input.len() - block * 64;
+                    if tail < 64 {
+                        relevant &= (1u64 << tail) - 1;
+                    }
+                    (e ^ a) & relevant == 0
+                });
             if !agree {
                 // Pad the witness to a whole block with a byte the corpus
                 // already uses as filler so it can join the corpus.
@@ -1579,7 +1684,6 @@ impl Search<'_> {
             );
         }
     }
-
 }
 
 // --- Reconstruction as a shared-subexpression IR graph ---
@@ -1699,7 +1803,11 @@ fn term_expr(leaves: &[Leaf], templates: &[Template], bank: &[Entry], term: &Ter
     match *term {
         Term::Leaf(li) => leaves[li as usize].name.clone(),
         Term::Un(op, a) => {
-            format!("{}({})", un_name(op), term_expr(leaves, templates, bank, &bank[a as usize].term))
+            format!(
+                "{}({})",
+                un_name(op),
+                term_expr(leaves, templates, bank, &bank[a as usize].term)
+            )
         }
         Term::Bin(op, a, b) => {
             format!(
@@ -1789,23 +1897,33 @@ fn splice(g: &mut Graph, cse: &mut HashMap<CseKey, NodeId>, sub: &Graph) -> Node
             }
             Op::And(a, b) => {
                 let (a, b) = (map[a.0 as usize], map[b.0 as usize]);
-                keyed(g, cse, CseKey::And(a.0.min(b.0), a.0.max(b.0)), |g| g.and(a, b))
+                keyed(g, cse, CseKey::And(a.0.min(b.0), a.0.max(b.0)), |g| {
+                    g.and(a, b)
+                })
             }
             Op::Or(a, b) => {
                 let (a, b) = (map[a.0 as usize], map[b.0 as usize]);
-                keyed(g, cse, CseKey::Or(a.0.min(b.0), a.0.max(b.0)), |g| g.or(a, b))
+                keyed(g, cse, CseKey::Or(a.0.min(b.0), a.0.max(b.0)), |g| {
+                    g.or(a, b)
+                })
             }
             Op::Xor(a, b) => {
                 let (a, b) = (map[a.0 as usize], map[b.0 as usize]);
-                keyed(g, cse, CseKey::Xor(a.0.min(b.0), a.0.max(b.0)), |g| g.xor(a, b))
+                keyed(g, cse, CseKey::Xor(a.0.min(b.0), a.0.max(b.0)), |g| {
+                    g.xor(a, b)
+                })
             }
             Op::Add(a, b) => {
                 let (a, b) = (map[a.0 as usize], map[b.0 as usize]);
-                keyed(g, cse, CseKey::Add(a.0.min(b.0), a.0.max(b.0)), |g| g.add(a, b))
+                keyed(g, cse, CseKey::Add(a.0.min(b.0), a.0.max(b.0)), |g| {
+                    g.add(a, b)
+                })
             }
             Op::Regions(q, s, n) => {
                 let (q, s, n) = (map[q.0 as usize], map[s.0 as usize], map[n.0 as usize]);
-                keyed(g, cse, CseKey::Regions(q.0, s.0, n.0), |g| g.regions(q, s, n))
+                keyed(g, cse, CseKey::Regions(q.0, s.0, n.0), |g| {
+                    g.regions(q, s, n)
+                })
             }
         };
         map.push(id);
@@ -1854,7 +1972,11 @@ pub enum ProveOutcome {
 /// Panics on graphs containing `Regions` (sequential, out of scope).
 pub fn prove(graph: &Graph, fsm: &Fsm) -> ProveOutcome {
     const MAX_STATES: usize = 1 << 22;
-    let initial = ByteState { carries: seed_carries(graph), pos: 0, machine: fsm.initial };
+    let initial = ByteState {
+        carries: seed_carries(graph),
+        pos: 0,
+        machine: fsm.initial,
+    };
     let mut parents: HashMap<ByteState, Option<(ByteState, u8)>> = HashMap::new();
     parents.insert(initial, None);
     let mut queue = std::collections::VecDeque::from([initial]);
@@ -1863,7 +1985,8 @@ pub fn prove(graph: &Graph, fsm: &Fsm) -> ProveOutcome {
     while let Some(state) = queue.pop_front() {
         for byte in 0..=255u8 {
             transitions += 1;
-            let (next_carries, graph_out) = step_byte(graph, state.carries, state.pos, byte, &mut values);
+            let (next_carries, graph_out) =
+                step_byte(graph, state.carries, state.pos, byte, &mut values);
             let (next_machine, machine_out) = (fsm.step)(state.machine, byte);
             if graph_out != machine_out {
                 // Rebuild the shortest input reaching this disagreement.
@@ -1884,14 +2007,19 @@ pub fn prove(graph: &Graph, fsm: &Fsm) -> ProveOutcome {
             let occupancy = parents.len();
             if let std::collections::hash_map::Entry::Vacant(slot) = parents.entry(next) {
                 if occupancy >= MAX_STATES {
-                    return ProveOutcome::Aborted { explored: occupancy };
+                    return ProveOutcome::Aborted {
+                        explored: occupancy,
+                    };
                 }
                 slot.insert(Some((state, byte)));
                 queue.push_back(next);
             }
         }
     }
-    ProveOutcome::Proven(Proof { product_states: parents.len(), transitions })
+    ProveOutcome::Proven(Proof {
+        product_states: parents.len(),
+        transitions,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1904,7 +2032,10 @@ struct ByteState {
 }
 
 fn seed_carries(graph: &Graph) -> u64 {
-    assert!(graph.nodes().len() <= 64, "prover packs node carries into a u64");
+    assert!(
+        graph.nodes().len() <= 64,
+        "prover packs node carries into a u64"
+    );
     let mut carries = 0u64;
     for (i, op) in graph.nodes().iter().enumerate() {
         if matches!(op, Op::ShiftLeft1Seeded(_)) {
@@ -1916,13 +2047,7 @@ fn seed_carries(graph: &Graph) -> u64 {
 
 /// One byte of byte-serial graph execution. `values` is caller-provided
 /// scratch (one bool per node).
-fn step_byte(
-    graph: &Graph,
-    carries: u64,
-    pos: u8,
-    byte: u8,
-    values: &mut [bool],
-) -> (u64, bool) {
+fn step_byte(graph: &Graph, carries: u64, pos: u8, byte: u8, values: &mut [bool]) -> (u64, bool) {
     let mut next = carries;
     for (i, op) in graph.nodes().iter().enumerate() {
         let bit = 1u64 << i;
@@ -1952,8 +2077,11 @@ fn step_byte(
                 out
             }
             Op::Add(a, b) => {
-                let (x, y, c) =
-                    (values[a.0 as usize], values[b.0 as usize], carries & bit != 0);
+                let (x, y, c) = (
+                    values[a.0 as usize],
+                    values[b.0 as usize],
+                    carries & bit != 0,
+                );
                 let carry_out = (x & y) | (x & c) | (y & c);
                 if carry_out {
                     next |= bit;
@@ -2135,8 +2263,10 @@ mod tests {
     /// cheapest escape form under quote-only care costs 7 (avx2 model).
     #[test]
     fn cost_order_finds_cheapest_care_form_directly() {
-        let leaves =
-            [Leaf::class("B", b"\\"), Leaf::constant("EVEN", 0x5555_5555_5555_5555)];
+        let leaves = [
+            Leaf::class("B", b"\\"),
+            Leaf::constant("EVEN", 0x5555_5555_5555_5555),
+        ];
         let mut inputs = corpus(b"\\x\"", 0x1357_9BDF_2468_ACE0, 6, 2);
         inputs.push(vec![b'\\'; 128]);
         let reference = |data: &[u8]| {
@@ -2162,9 +2292,19 @@ mod tests {
             order: Order::Cost,
             progress: false,
         };
-        match synthesize(&leaves, &inputs, &Spec::with_care(&reference, &care), &budget) {
+        match synthesize(
+            &leaves,
+            &inputs,
+            &Spec::with_care(&reference, &care),
+            &budget,
+        ) {
             Outcome::Found(sol) => {
-                assert!(sol.cost <= 7, "expected cost <= 7, got {} ({})", sol.cost, sol.expr);
+                assert!(
+                    sol.cost <= 7,
+                    "expected cost <= 7, got {} ({})",
+                    sol.cost,
+                    sol.expr
+                );
             }
             Outcome::NotFound(stats) => panic!("not found: {stats:?}"),
         }
@@ -2197,8 +2337,14 @@ mod tests {
         match synthesize_multi(
             &corpus,
             &[
-                MultiSpec { leaves: &leaves, spec: Spec::exact(&inside_ref) },
-                MultiSpec { leaves: &[], spec: Spec::exact(&outside_ref) },
+                MultiSpec {
+                    leaves: &leaves,
+                    spec: Spec::exact(&inside_ref),
+                },
+                MultiSpec {
+                    leaves: &[],
+                    spec: Spec::exact(&outside_ref),
+                },
             ],
             &budget(4),
         ) {
@@ -2239,8 +2385,9 @@ mod tests {
         let mut rng = Rng(0xA5A5_5A5A_A5A5_5A5A);
         for _ in 0..500 {
             let len = (rng.next() % 300) as usize;
-            let input: Vec<u8> =
-                (0..len).map(|_| [b'\\', b'x', b'"'][(rng.next() % 3) as usize]).collect();
+            let input: Vec<u8> = (0..len)
+                .map(|_| [b'\\', b'x', b'"'][(rng.next() % 3) as usize])
+                .collect();
             let serial = byte_serial_masks(&g, &input);
             let mut positions = Vec::new();
             interp::run(&g, &input, &mut positions);
@@ -2264,7 +2411,13 @@ mod tests {
             let next = if byte == b'"' { state ^ 1 } else { state };
             (next, next == 1)
         };
-        match prove(&g, &Fsm { initial: 0, step: &step }) {
+        match prove(
+            &g,
+            &Fsm {
+                initial: 0,
+                step: &step,
+            },
+        ) {
             ProveOutcome::Proven(proof) => assert!(proof.product_states <= 256),
             ProveOutcome::Refuted(witness) => panic!("refuted by {witness:?}"),
             ProveOutcome::Aborted { explored } => panic!("aborted at {explored}"),
@@ -2282,9 +2435,18 @@ mod tests {
             let next = if byte == b'"' { state ^ 1 } else { state };
             (next, next == 1)
         };
-        match prove(&g, &Fsm { initial: 0, step: &step }) {
+        match prove(
+            &g,
+            &Fsm {
+                initial: 0,
+                step: &step,
+            },
+        ) {
             ProveOutcome::Refuted(witness) => {
-                assert!(!witness.is_empty() && witness.len() <= 2, "witness {witness:?}")
+                assert!(
+                    !witness.is_empty() && witness.len() <= 2,
+                    "witness {witness:?}"
+                )
             }
             ProveOutcome::Proven(_) => panic!("wrong graph proven equal"),
             ProveOutcome::Aborted { explored } => panic!("aborted at {explored}"),

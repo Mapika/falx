@@ -22,8 +22,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 
     while offset + 64 <= data.len() {
         // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
-        let structural =
-            unsafe { classify_block(data.as_ptr().add(offset), &mut carry_inside) };
+        let structural = unsafe { classify_block(data.as_ptr().add(offset), &mut carry_inside) };
         push_indexes(structural, offset as u32, out);
         offset += 64;
     }

@@ -76,7 +76,11 @@ fn main() {
         let (tv, ref tbytes) = expected_titles[r];
         assert_eq!(title.is_valid(r), tv, "title validity mismatch at row {r}");
         if tv {
-            assert_eq!(title.value(r), tbytes.as_slice(), "title bytes mismatch at row {r}");
+            assert_eq!(
+                title.value(r),
+                tbytes.as_slice(),
+                "title bytes mismatch at row {r}"
+            );
         }
         let (vv, vval) = expected_values[r];
         assert_eq!(value.is_valid(r), vv, "value validity mismatch at row {r}");
@@ -90,14 +94,22 @@ fn main() {
             } else {
                 "null".to_string()
             },
-            if value.is_valid(r) { value.value(r).to_string() } else { "null".to_string() },
+            if value.is_valid(r) {
+                value.value(r).to_string()
+            } else {
+                "null".to_string()
+            },
         );
     }
 
     // Row 0 is the header (title "title" is a fine string; value "value"
     // is not a number), row 3 has an empty-but-valid title, row 5 has one
     // field so both title and value are null there.
-    assert_eq!(value.null_count(), 3, "header + not-a-number + one-field rows");
+    assert_eq!(
+        value.null_count(),
+        3,
+        "header + not-a-number + one-field rows"
+    );
     assert_eq!(title.null_count(), 1, "the one-field row");
     println!("\nOK: falx columns became Float64Array + BinaryArray without copying any buffer.");
 }

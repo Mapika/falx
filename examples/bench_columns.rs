@@ -37,15 +37,12 @@ fn generate_csv(target_bytes: usize) -> Vec<u8> {
 
     // Two-letter country codes (26 * 26 = 676 choices)
     let countries: Vec<&str> = vec![
-        "US", "CA", "GB", "FR", "DE", "IT", "ES", "AU", "JP", "CN",
-        "IN", "BR", "MX", "RU", "ZA", "NG", "EG", "TR", "SA", "AE",
-        "KR", "SG", "NZ", "AR", "CL", "CO", "PE", "VE", "NL", "BE",
-        "CH", "AT", "SE", "NO", "FI", "DK", "PL", "CZ", "HU", "RO",
-        "GR", "PT", "IE", "IL", "TH", "MY", "PH", "ID", "VN", "PK",
-        "BD", "IR", "IQ", "AF", "KZ", "UZ", "TM", "TJ", "KG", "AZ",
-        "AM", "GE", "UA", "BY", "MD", "LT", "LV", "EE", "HR", "BA",
-        "RS", "BG", "SK", "SI", "CY", "MT", "LU", "IS", "FO", "GL",
-        "PA", "CR", "GT", "HN", "SV", "NI", "BZ", "CU", "DO", "HT",
+        "US", "CA", "GB", "FR", "DE", "IT", "ES", "AU", "JP", "CN", "IN", "BR", "MX", "RU", "ZA",
+        "NG", "EG", "TR", "SA", "AE", "KR", "SG", "NZ", "AR", "CL", "CO", "PE", "VE", "NL", "BE",
+        "CH", "AT", "SE", "NO", "FI", "DK", "PL", "CZ", "HU", "RO", "GR", "PT", "IE", "IL", "TH",
+        "MY", "PH", "ID", "VN", "PK", "BD", "IR", "IQ", "AF", "KZ", "UZ", "TM", "TJ", "KG", "AZ",
+        "AM", "GE", "UA", "BY", "MD", "LT", "LV", "EE", "HR", "BA", "RS", "BG", "SK", "SI", "CY",
+        "MT", "LU", "IS", "FO", "GL", "PA", "CR", "GT", "HN", "SV", "NI", "BZ", "CU", "DO", "HT",
     ];
 
     while buf.len() < target_bytes {
@@ -144,7 +141,11 @@ struct BenchResult {
 fn bench_file(data: &[u8], label: &str, has_header: bool) {
     let file_size = data.len();
     println!("File: {}", label);
-    println!("Size: {} bytes ({:.2} MiB)", file_size, file_size as f64 / (1024.0 * 1024.0));
+    println!(
+        "Size: {} bytes ({:.2} MiB)",
+        file_size,
+        file_size as f64 / (1024.0 * 1024.0)
+    );
     println!();
 
     const WARMUP: usize = 2;
@@ -162,7 +163,11 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
         for _ in 0..RUNS {
             let start = Instant::now();
             let cols = falx::kernels::csv_geo::parse_columns(black_box(data));
-            let valid_count = cols.latitude_valid.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+            let valid_count = cols
+                .latitude_valid
+                .iter()
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>();
             let sum_lat = black_box(cols.latitude.iter().copied().sum::<f64>());
             let sum_lon = black_box(cols.longitude.iter().copied().sum::<f64>());
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -185,7 +190,9 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
 
     // ========== falx::kernels::csv_geo::parse_columns_par ==========
     {
-        let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
         let mut times = Vec::new();
         for _ in 0..WARMUP {
             let _cols = falx::kernels::csv_geo::parse_columns_par(black_box(data), threads);
@@ -194,7 +201,11 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
         for _ in 0..RUNS {
             let start = Instant::now();
             let cols = falx::kernels::csv_geo::parse_columns_par(black_box(data), threads);
-            let valid_count = cols.latitude_valid.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+            let valid_count = cols
+                .latitude_valid
+                .iter()
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>();
             let sum_lat = black_box(cols.latitude.iter().copied().sum::<f64>());
             let sum_lon = black_box(cols.longitude.iter().copied().sum::<f64>());
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -236,17 +247,20 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
             let mut sum_lon = 0.0f64;
             for record in reader.byte_records() {
                 if let Ok(rec) = record
-                    && rec.len() > 6 {
-                        if let Ok(lat_str) = std::str::from_utf8(&rec[5])
-                            && let Ok(lat) = lat_str.parse::<f64>() {
-                                sum_lat += lat;
-                                valid_count += 1;
-                            }
-                        if let Ok(lon_str) = std::str::from_utf8(&rec[6])
-                            && let Ok(lon) = lon_str.parse::<f64>() {
-                                sum_lon += lon;
-                            }
+                    && rec.len() > 6
+                {
+                    if let Ok(lat_str) = std::str::from_utf8(&rec[5])
+                        && let Ok(lat) = lat_str.parse::<f64>()
+                    {
+                        sum_lat += lat;
+                        valid_count += 1;
                     }
+                    if let Ok(lon_str) = std::str::from_utf8(&rec[6])
+                        && let Ok(lon) = lon_str.parse::<f64>()
+                    {
+                        sum_lon += lon;
+                    }
+                }
             }
             let valid = black_box(valid_count);
             let lat = black_box(sum_lat);
@@ -338,7 +352,8 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
                 times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 let (best_ms, valid_count, sum_lat, sum_lon) = times[0];
                 let median_ms = times[RUNS / 2].0;
-                let throughput = file_size as f64 / (1024.0 * 1024.0 * 1024.0) / (median_ms / 1000.0);
+                let throughput =
+                    file_size as f64 / (1024.0 * 1024.0 * 1024.0) / (median_ms / 1000.0);
                 results.push(BenchResult {
                     name: "arrow-csv",
                     valid_count,
@@ -363,7 +378,12 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
     for result in &results {
         println!(
             "{:<25} {:>10.3} {:>10.3} {:>10.2} GiB/s {:>12} {:>12.2}",
-            result.name, result.best_ms, result.median_ms, result.throughput, result.valid_count, result.sum_lat
+            result.name,
+            result.best_ms,
+            result.median_ms,
+            result.throughput,
+            result.valid_count,
+            result.sum_lat
         );
     }
     println!();
@@ -386,8 +406,13 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
 
     // Row tuples: (elapsed_ms, valid_cities, city_bytes, sum_lat).
     // ---- falx serial / parallel ----
-    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-    for (name, par) in [("falx parse_columns", false), ("falx parse_columns_par", true)] {
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    for (name, par) in [
+        ("falx parse_columns", false),
+        ("falx parse_columns_par", true),
+    ] {
         let mut times = Vec::new();
         for run in 0..WARMUP + RUNS {
             let start = Instant::now();
@@ -396,7 +421,11 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
             } else {
                 falx::kernels::csv_geo_text::parse_columns(black_box(data))
             };
-            let valid = cols.city_valid.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+            let valid = cols
+                .city_valid
+                .iter()
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>();
             let city_bytes = cols.city_data.len();
             let sum_lat = cols.latitude.iter().copied().sum::<f64>();
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -407,7 +436,12 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
         }
         times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let median = times[RUNS / 2];
-        results.push((name, times[0].0, median, file_size as f64 / 1073741824.0 / (median.0 / 1000.0)));
+        results.push((
+            name,
+            times[0].0,
+            median,
+            file_size as f64 / 1073741824.0 / (median.0 / 1000.0),
+        ));
     }
 
     // ---- csv crate: unescaped city into owned offsets+data, str::parse lat/lon ----
@@ -430,9 +464,10 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
                 }
                 offsets.push(city_data.len() as i32);
                 if let Some(cell) = record.get(5)
-                    && let Ok(lat) = std::str::from_utf8(cell).unwrap_or("").parse::<f64>() {
-                        sum_lat += lat;
-                    }
+                    && let Ok(lat) = std::str::from_utf8(cell).unwrap_or("").parse::<f64>()
+                {
+                    sum_lat += lat;
+                }
                 if let Some(cell) = record.get(6) {
                     let _ = black_box(std::str::from_utf8(cell).unwrap_or("").parse::<f64>().ok());
                 }
@@ -446,7 +481,12 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
         }
         times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let median = times[RUNS / 2];
-        results.push(("csv crate", times[0].0, median, file_size as f64 / 1073741824.0 / (median.0 / 1000.0)));
+        results.push((
+            "csv crate",
+            times[0].0,
+            median,
+            file_size as f64 / 1073741824.0 / (median.0 / 1000.0),
+        ));
     }
 
     // ---- arrow-csv: projection [1, 5, 6] ----
@@ -473,10 +513,18 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
             let (mut valid, mut city_bytes, mut sum_lat) = (0usize, 0usize, 0.0f64);
             for batch in reader {
                 let batch = batch?;
-                let city = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().expect("city utf8");
+                let city = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .expect("city utf8");
                 valid += city.len() - city.null_count();
                 city_bytes += city.value_data().len();
-                let lat = batch.column(1).as_any().downcast_ref::<arrow_array::Float64Array>().expect("lat f64");
+                let lat = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .expect("lat f64");
                 sum_lat += lat.iter().flatten().sum::<f64>();
             }
             Ok((valid, city_bytes, sum_lat))
@@ -496,12 +544,20 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
                 }
                 times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 let median = times[RUNS / 2];
-                results.push(("arrow-csv", times[0].0, median, file_size as f64 / 1073741824.0 / (median.0 / 1000.0)));
+                results.push((
+                    "arrow-csv",
+                    times[0].0,
+                    median,
+                    file_size as f64 / 1073741824.0 / (median.0 / 1000.0),
+                ));
             }
         }
     }
 
-    println!("{:<26} {:>9} {:>11} {:>10}  {:>12} {:>12} {:>14}", "Contender", "Best (ms)", "Median (ms)", "GiB/s", "Valid city", "City bytes", "Sum lat");
+    println!(
+        "{:<26} {:>9} {:>11} {:>10}  {:>12} {:>12} {:>14}",
+        "Contender", "Best (ms)", "Median (ms)", "GiB/s", "Valid city", "City bytes", "Sum lat"
+    );
     for (name, best, median, gibs) in &results {
         println!(
             "{:<26} {:>9.3} {:>11.3} {:>10.2}  {:>12} {:>12} {:>14.2}",
@@ -509,7 +565,9 @@ fn bench_text(data: &[u8], label: &str, has_header: bool) {
         );
     }
     if has_header {
-        println!("(arrow-csv skips the header row; falx/csv count its city cell as one valid string — hence exactly one row / a few bytes of difference)");
+        println!(
+            "(arrow-csv skips the header row; falx/csv count its city cell as one valid string — hence exactly one row / a few bytes of difference)"
+        );
     }
     println!();
 }

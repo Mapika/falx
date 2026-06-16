@@ -458,11 +458,11 @@ fn emit_with(
         Some(d) if d.escape == crate::formats::Escape::None
             && !(d.comment.is_some() && d.quote.is_some())
     );
-    // Structural/tape parallelism now covers comment dialects (line-ownership);
-    // the columns/cells parallel path keeps its record-ownership driver, not yet
-    // validated against comment lines, so it stays gated off for comment
-    // dialects (their serial `parse_columns` is unaffected).
-    let col_par = par_mode && !matches!(dialect, Some(d) if d.comment.is_some());
+    // Structural/tape and column parallelism both use line ownership for
+    // comment dialects: each nonzero worker starts emitting only after the
+    // first terminator it owns, and comment records are discarded by the
+    // sink during flush.
+    let col_par = par_mode;
     let seed_init = if carry_count == 1 {
         "        let mut carries = [seed];\n".to_string()
     } else if carry_count == 0 {
@@ -586,6 +586,71 @@ fn emit_with(
     } else {
         String::new()
     };
+    let quote_parity_mode = par_mode
+        && dialect.is_some_and(|d| d.quote.is_some())
+        && carry_count > 0
+        && (!columns.is_empty() || format_name == "csv");
+    let quote_parity_dispatch = if quote_parity_mode {
+        r#"fn quote_parity_dispatch(data: &[u8], seed: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::quote_parity(data, seed) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::quote_parity(data, seed) };
+    }
+    unsupported_cpu();
+}
+
+"#
+        .to_string()
+    } else {
+        String::new()
+    };
+    let quote_parity_tpl = r#"
+    /// Scan a chunk only far enough to recover the generated quote-region
+    /// carry. Used by parallel fused stats paths to seed workers without a
+    /// scalar quote-count prepass.
+@ATTR@    pub fn quote_parity(data: &[u8], seed: u64) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        carries[0] = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+@LOAD@            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+@LOAD2@        }
+        carries[0]
+    }
+"#;
+    let avx512_quote_parity = if quote_parity_mode {
+        quote_parity_tpl
+            .replace("@ATTR@", "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n")
+            .replace("@LOAD@", &format!("            // SAFETY: offset + 64 <= data.len().\n            let _ = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};\n"))
+            .replace("@LOAD2@", &format!("            // SAFETY: block is a readable 64-byte buffer.\n            let _ = unsafe {{ step(block.as_ptr(){carry_arg}) }};\n"))
+    } else {
+        String::new()
+    };
+    let avx2_quote_parity = if quote_parity_mode {
+        quote_parity_tpl
+            .replace("@ATTR@", "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
+            .replace("@LOAD@", &format!("            // SAFETY: offset + 64 <= data.len().\n            let _ = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};\n"))
+            .replace("@LOAD2@", &format!("            // SAFETY: block is a readable 64-byte buffer.\n            let _ = unsafe {{ step(block.as_ptr(){carry_arg}) }};\n"))
+    } else {
+        String::new()
+    };
     // Fused projection drivers (only when columns are declared): identical
     // loop shape to index_tape, but masks feed the column sink directly —
     // nothing is materialized in between. Parallel-capable dialects get a
@@ -665,6 +730,117 @@ fn emit_with(
     } else {
         String::new()
     };
+    let vcf_stats_mode = format_name == "vcf_typed";
+    let vcf_stats_cells = |code: String| {
+        code.replace("index_cells", "index_vcf_stats")
+            .replace("ColumnSink", "VcfStatsSink")
+            .replace("column sink", "VCF stats sink")
+    };
+    let avx512_vcf_stats = if vcf_stats_mode {
+        vcf_stats_cells(cells_fill(
+            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+            &format!(
+                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+            ),
+            &format!(
+                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+            ),
+        ))
+    } else {
+        String::new()
+    };
+    let avx2_vcf_stats = if vcf_stats_mode {
+        vcf_stats_cells(cells_fill(
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
+            &format!(
+                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+            ),
+            &format!(
+                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+            ),
+        ))
+    } else {
+        String::new()
+    };
+    let csv_geo_stats_mode = format_name == "csv_geo" || format_name == "csv_geo_text";
+    let csv_geo_stats_index = if format_name == "csv_geo_text" {
+        "index_csv_geo_text_stats"
+    } else {
+        "index_csv_geo_stats"
+    };
+    let csv_geo_stats_sink = if format_name == "csv_geo_text" {
+        "CsvGeoTextStatsSink"
+    } else {
+        "CsvGeoStatsSink"
+    };
+    let csv_geo_stats_doc = if format_name == "csv_geo_text" {
+        "CSV geo text stats sink"
+    } else {
+        "CSV geo stats sink"
+    };
+    let csv_geo_stats_cells = |code: String| {
+        code.replace("index_cells", csv_geo_stats_index)
+            .replace("ColumnSink", csv_geo_stats_sink)
+            .replace("column sink", csv_geo_stats_doc)
+    };
+    let avx512_csv_geo_stats = if csv_geo_stats_mode {
+        csv_geo_stats_cells(cells_fill(
+            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+            &format!(
+                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+            ),
+            &format!(
+                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+            ),
+        ))
+    } else {
+        String::new()
+    };
+    let avx2_csv_geo_stats = if csv_geo_stats_mode {
+        csv_geo_stats_cells(cells_fill(
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
+            &format!(
+                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+            ),
+            &format!(
+                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+            ),
+        ))
+    } else {
+        String::new()
+    };
+    let field_byte_stats_mode = format_name == "csv" || format_name == "tsv";
+    let field_byte_stats_cells = |code: String| {
+        code.replace("index_cells", "index_field_bytes")
+            .replace("ColumnSink", "FieldByteSink")
+            .replace("column sink", "field-byte stats sink")
+    };
+    let avx512_field_byte_stats = if field_byte_stats_mode {
+        field_byte_stats_cells(cells_fill(
+            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+            &format!(
+                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+            ),
+            &format!(
+                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+            ),
+        ))
+    } else {
+        String::new()
+    };
+    let avx2_field_byte_stats = if field_byte_stats_mode {
+        field_byte_stats_cells(cells_fill(
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
+            &format!(
+                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+            ),
+            &format!(
+                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+            ),
+        ))
+    } else {
+        String::new()
+    };
     let carry_fwd = if carry_count > 0 { ", carries" } else { "" };
     // Streaming building block: index only the full blocks of a slice with
     // caller-owned carries; the sub-block remainder stays unconsumed.
@@ -713,8 +889,16 @@ fn emit_with(
         // Comment-without-quote dialects (VCF/BED/GFF/SAM/MTX …) parallelize by
         // line ownership; quote/plain dialects by speculative entry-parity.
         let has_comment = dialect.is_some_and(|d| d.comment.is_some());
-        let index_par_body = if has_comment { COMMENT_INDEX_PAR } else { SPEC_INDEX_PAR };
-        let parse_par_body = if has_comment { COMMENT_PARSE_PAR } else { SPEC_PARSE_PAR };
+        let index_par_body = if has_comment {
+            COMMENT_INDEX_PAR
+        } else {
+            SPEC_INDEX_PAR
+        };
+        let parse_par_body = if has_comment {
+            COMMENT_PARSE_PAR
+        } else {
+            SPEC_PARSE_PAR
+        };
         format!(
             r#"
 {tape_part}
@@ -969,6 +1153,183 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         String::new()
     };
 
+    let fastq_mode = format_name == "fastq";
+    let fastq_tpl = r#"
+    /// Fused FASTQ stats driver: newline masks come from the generated
+    /// line-kernel step and feed the FASTQ validation/stat sink directly.
+@BLOCK_ATTR@    pub fn fastq_blocks(data: &[u8], sink: &mut super::FastqSink) -> Result<(), super::FastqError> {
+@CARRY_DECL@@ACC_INIT@
+        let mut offset = 0usize;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, _) = unsafe { step(data.as_ptr().add(offset)@CARRY_ARG@) };
+            let (m1, _) = unsafe { step(data.as_ptr().add(offset + 64)@CARRY_ARG@) };
+            let error = unsafe { sink.@DRIVE_PAIR@(data, m0, m1, offset, &mut checksum_acc) };
+            if error != 0 {
+                return Err(sink.take_error(error));
+            }
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, _) = unsafe { step(data.as_ptr().add(offset)@CARRY_ARG@) };
+            let error = unsafe { sink.@DRIVE@(data, mask, offset, &mut checksum_acc) };
+            if error != 0 {
+                return Err(sink.take_error(error));
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, _) = unsafe { step(block.as_ptr()@CARRY_ARG@) };
+            let error = unsafe { sink.@DRIVE@(data, mask & live, offset, &mut checksum_acc) };
+            if error != 0 {
+                return Err(sink.take_error(error));
+            }
+        }
+@ACC_STORE@        Ok(())
+    }
+
+"#;
+    let fastq_fill =
+        |block_attr: &str, acc_init: &str, acc_store: &str, drive_pair: &str, drive: &str| {
+            fastq_tpl
+                .replace("@BLOCK_ATTR@", block_attr)
+                .replace("@CARRY_DECL@", &carry_decl)
+                .replace("@CARRY_ARG@", carry_arg)
+                .replace("@ACC_INIT@", acc_init)
+                .replace("@ACC_STORE@", acc_store)
+                .replace("@DRIVE_PAIR@", drive_pair)
+                .replace("@DRIVE@", drive)
+        };
+    let avx512_fastq = if fastq_mode {
+        fastq_fill(
+            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+            "        // SAFETY: __m512i and [u64; 8] are both 64-byte vector storage here.\n        let mut checksum_acc: __m512i = unsafe {\n            std::mem::transmute::<[u64; 8], __m512i>(sink.checksum_lanes)\n        };\n",
+            "        // SAFETY: __m512i and [u64; 8] are both 64-byte vector storage here.\n        sink.checksum_lanes = unsafe { std::mem::transmute::<__m512i, [u64; 8]>(checksum_acc) };\n",
+            "drive_pair_avx512",
+            "drive_avx512",
+        )
+    } else {
+        String::new()
+    };
+    let avx2_fastq = if fastq_mode {
+        fastq_fill(
+            "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n",
+            "        // SAFETY: __m256i and [u64; 4] are both 32-byte vector storage here.\n        let mut checksum_acc: __m256i = unsafe {\n            std::mem::transmute::<[u64; 4], __m256i>([\n                sink.checksum_lanes[0],\n                sink.checksum_lanes[1],\n                sink.checksum_lanes[2],\n                sink.checksum_lanes[3],\n            ])\n        };\n",
+            "        // SAFETY: __m256i and [u64; 4] are both 32-byte vector storage here.\n        let checksum_lanes: [u64; 4] = unsafe {\n            std::mem::transmute::<__m256i, [u64; 4]>(checksum_acc)\n        };\n        sink.checksum_lanes[..4].copy_from_slice(&checksum_lanes);\n",
+            "drive_pair_avx2",
+            "drive_avx2",
+        )
+    } else {
+        String::new()
+    };
+
+    let ndjson_lines_mode = format_name == "ndjson";
+    let ndjson_lines_tpl = r#"
+    /// Count NDJSON line terminators with the generated quote/escape-aware
+    /// newline step.
+@ATTR@    pub fn index_ndjson_lines(data: &[u8]) -> u64 {
+@CARRY_DECL@        let mut offset = 0usize;
+        let mut count = 0u64;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (_, t0) = unsafe { step(data.as_ptr().add(offset)@CARRY_ARG@) };
+            let (_, t1) = unsafe { step(data.as_ptr().add(offset + 64)@CARRY_ARG@) };
+            count += t0.count_ones() as u64 + t1.count_ones() as u64;
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (_, term) = unsafe { step(data.as_ptr().add(offset)@CARRY_ARG@) };
+            count += term.count_ones() as u64;
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (_, term) = unsafe { step(block.as_ptr()@CARRY_ARG@) };
+            count += (term & live).count_ones() as u64;
+        }
+        count
+    }
+"#;
+    let ndjson_lines_fill = |attr: &str| {
+        ndjson_lines_tpl
+            .replace("@ATTR@", attr)
+            .replace("@CARRY_DECL@", &carry_decl)
+            .replace("@CARRY_ARG@", carry_arg)
+    };
+    let avx512_ndjson_lines = if ndjson_lines_mode {
+        ndjson_lines_fill(
+            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+        )
+    } else {
+        String::new()
+    };
+    let avx2_ndjson_lines = if ndjson_lines_mode {
+        ndjson_lines_fill("    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
+    } else {
+        String::new()
+    };
+
+    let logfmt_mode = format_name == "logfmt";
+    let logfmt_tpl = r#"
+    /// Fused logfmt pair-stat driver: structural masks feed the pair sink
+    /// directly, avoiding the generic separator/end tape for this domain API.
+@ATTR@    pub fn logfmt_blocks(data: &[u8], sink: &mut super::LogfmtSink) {
+@CARRY_DECL@        let mut offset = 0usize;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe { step(data.as_ptr().add(offset)@CARRY_ARG@) };
+            sink.drive(data, m0, t0, offset);
+            let (m1, t1) = unsafe { step(data.as_ptr().add(offset + 64)@CARRY_ARG@) };
+            sink.drive(data, m1, t1, offset + 64);
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)@CARRY_ARG@) };
+            sink.drive(data, mask, term, offset);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr()@CARRY_ARG@) };
+            sink.drive(data, mask & live, term & live, offset);
+        }
+    }
+"#;
+    let logfmt_fill = |attr: &str| {
+        logfmt_tpl
+            .replace("@ATTR@", attr)
+            .replace("@CARRY_DECL@", &carry_decl)
+            .replace("@CARRY_ARG@", carry_arg)
+    };
+    let avx512_logfmt = if logfmt_mode {
+        logfmt_fill(
+            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+        )
+    } else {
+        String::new()
+    };
+    let avx2_logfmt = if logfmt_mode {
+        logfmt_fill("    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
+    } else {
+        String::new()
+    };
+
     // Fused nested-tape drivers (emitted when the dialect declares bracket
     // pairs): blocks stream straight from step() into the bracket matcher,
     // no intermediate position vector. The matcher itself (push_nested) is
@@ -1209,6 +1570,8 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
 // the format's output bitstream (its structural positions). Self-contained:
 // depends only on std.
 {parser_doc}
+#[rustfmt::skip]
+mod generated {{
 {carry_init_const}/// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
     #[cfg(target_arch = "x86_64")]
@@ -1236,6 +1599,7 @@ fn unsupported_cpu() -> ! {{
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }}
 
+{quote_parity_dispatch}
 "#
     );
 
@@ -1243,11 +1607,32 @@ fn unsupported_cpu() -> ! {{
 
     if let Some(dialect) = dialect {
         push_span_api(&mut code, dialect, carry_count);
+        if format_name == "logfmt" {
+            push_logfmt_api(&mut code);
+        }
+        if format_name == "ndjson" {
+            push_ndjson_lines_api(&mut code);
+        }
+        if format_name == "csv" || format_name == "tsv" {
+            push_field_byte_stats_api(&mut code, dialect);
+        }
         if !columns.is_empty() {
             push_columns_api(&mut code, dialect, columns, par_mode);
+            if format_name == "csv_geo" {
+                push_csv_geo_stats_api(&mut code, false);
+            }
+            if format_name == "csv_geo_text" {
+                push_csv_geo_stats_api(&mut code, true);
+            }
+            if format_name == "vcf_typed" {
+                push_vcf_stats_api(&mut code);
+            }
         }
         if !dialect.nesting.is_empty() {
             push_nested_api(&mut code, dialect, carry_count);
+        }
+        if fastq_mode {
+            push_fastq_api(&mut code);
         }
     }
 
@@ -1286,7 +1671,7 @@ mod avx512 {{
         }}
     }}
 
-{avx512_tape}{avx512_nested}{avx512_seeded}{avx512_tape_seeded}{avx512_partial}{avx512_cells}
+{avx512_tape}{avx512_nested}{avx512_seeded}{avx512_tape_seeded}{avx512_quote_parity}{avx512_partial}{avx512_cells}{avx512_vcf_stats}{avx512_csv_geo_stats}{avx512_field_byte_stats}{avx512_fastq}{avx512_ndjson_lines}{avx512_logfmt}
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
@@ -1419,7 +1804,7 @@ mod avx2 {{
         }}
     }}
 
-{avx2_tape}{avx2_nested}{avx2_seeded}{avx2_tape_seeded}{avx2_partial}{avx2_cells}
+{avx2_tape}{avx2_nested}{avx2_seeded}{avx2_tape_seeded}{avx2_quote_parity}{avx2_partial}{avx2_cells}{avx2_vcf_stats}{avx2_csv_geo_stats}{avx2_field_byte_stats}{avx2_fastq}{avx2_ndjson_lines}{avx2_logfmt}
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
@@ -1538,6 +1923,8 @@ mod avx2 {{
 }
 "#,
     );
+
+    code.push_str("\n}\n\npub use self::generated::*;\n");
 
     Ok(code)
 }
@@ -1753,7 +2140,7 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
 
 fn par_seed_parts(quote: Option<u8>, chunk: &str) -> (String, String, String) {
     match quote {
-        Some(q) => (
+        Some(_) => (
             "    // Quote seeds are resolved inside the indexing scope: each thread\n\
              \x20   // contributes its chunk's quote-byte parity, then reads the parity\n\
              \x20   // of all preceding chunks after one barrier (doubled-quote escapes\n\
@@ -1767,7 +2154,7 @@ fn par_seed_parts(quote: Option<u8>, chunk: &str) -> (String, String, String) {
                 .to_string(),
             format!(
                 "                    use std::sync::atomic::Ordering::Relaxed;\n\
-             \x20                   parity[t].store({chunk}.iter().filter(|&&b| b == {q}u8).count() as u64 & 1, Relaxed);\n\
+             \x20                   parity[t].store(quote_parity_dispatch(&{chunk}, 0) & 1, Relaxed);\n\
              \x20                   barrier.wait();\n\
              \x20                   // Seed = quote parity of every preceding chunk.\n\
              \x20                   let seed = parity[..t]\n\
@@ -2170,16 +2557,831 @@ impl<'p> Iterator for FieldsRaw<'p> {
 /// values Vec plus an Arrow-style validity bitmap per declared column,
 /// filled by walking the structural tape so unrequested fields are never
 /// read, cleaned, or copied.
+fn push_fastq_api(code: &mut String) {
+    code.push_str(
+        r#"
+/// FASTQ parser summary emitted by [`parse_fastq`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FastqStats {
+    pub records: u64,
+    pub sequence_bytes: u64,
+    pub quality_bytes: u64,
+    pub checksum: u64,
+}
+
+/// FASTQ validation error from the generated fixed-four-line parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastqError {
+    IncompleteRecord,
+    BadHeader {
+        offset: usize,
+    },
+    BadSeparator {
+        offset: usize,
+    },
+    LengthMismatch {
+        record: u64,
+        sequence: usize,
+        quality: usize,
+    },
+    TrailingBytes {
+        offset: usize,
+    },
+}
+
+/// Parse FASTQ records and return validated summary counters.
+///
+/// This is a generated domain API over the generated newline kernel: the SIMD
+/// step emits newline masks, and a fixed-four-line sink validates FASTQ shape
+/// while accumulating counters.
+pub fn parse_fastq(data: &[u8]) -> Result<FastqStats, FastqError> {
+    let mut sink = FastqSink::new(data.len());
+    fastq_blocks_dispatch(data, &mut sink)?;
+    sink.finish()
+}
+
+/// Parallel FASTQ parser using generated mask streaming over record chunks.
+///
+/// A SIMD newline-count prepass finds true FASTQ record boundaries for worker
+/// splits; each worker then streams generated newline masks directly into a
+/// chunk-local [`FastqSink`]. This keeps the parallel path allocation-light:
+/// it never materializes a full newline-position vector.
+pub fn parse_fastq_par(data: &[u8], threads: usize) -> Result<FastqStats, FastqError> {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 || data.len() < (1 << 20) {
+        return parse_fastq(data);
+    }
+
+    let Some(bounds) = fastq_record_bounds(data, threads) else {
+        return parse_fastq(data);
+    };
+    let ranges: Vec<(usize, usize)> = bounds
+        .windows(2)
+        .filter_map(|w| (w[0] < w[1]).then_some((w[0], w[1])))
+        .collect();
+    if ranges.len() <= 1 {
+        return parse_fastq(data);
+    }
+
+    let results: Vec<Result<FastqStats, FastqError>> = std::thread::scope(|s| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(start, end)| {
+                let slice = &data[start..end];
+                s.spawn(move || {
+                    let mut sink = FastqSink::new(slice.len());
+                    fastq_blocks_dispatch(slice, &mut sink)?;
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("fastq parse thread ok"))
+            .collect()
+    });
+
+    let mut merged = FastqStats::default();
+    for result in results {
+        match result {
+            Ok(stats) => merged.merge(stats),
+            Err(_) => return parse_fastq(data),
+        }
+    }
+    Ok(merged)
+}
+
+fn fastq_blocks_dispatch(data: &[u8], sink: &mut FastqSink) -> Result<(), FastqError> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::fastq_blocks(data, sink) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::fastq_blocks(data, sink) };
+    }
+    unsupported_cpu()
+}
+
+fn fastq_record_bounds(data: &[u8], threads: usize) -> Option<Vec<usize>> {
+    if data.is_empty() {
+        return Some(vec![0]);
+    }
+    if data.last().copied() != Some(b'\n') {
+        return None;
+    }
+
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return Some(vec![0, data.len()]);
+    }
+
+    let approx: Vec<usize> = (0..=threads)
+        .map(|t| {
+            if t == threads {
+                data.len()
+            } else {
+                (t * chunk).min(data.len())
+            }
+        })
+        .collect();
+
+    let mut bounds = Vec::with_capacity(threads + 1);
+    bounds.push(0);
+    for &target in approx.iter().take(threads).skip(1) {
+        let bound = fastq_find_record_boundary(data, target)?;
+        if bound > *bounds.last().expect("initial bound") && bound < data.len() {
+            bounds.push(bound);
+        }
+    }
+    bounds.push(data.len());
+    Some(bounds)
+}
+
+fn fastq_find_record_boundary(data: &[u8], offset: usize) -> Option<usize> {
+    if offset == 0 {
+        return Some(0);
+    }
+    if offset >= data.len() {
+        return Some(data.len());
+    }
+
+    let mut pos = offset;
+    if data[pos - 1] != b'\n' {
+        while pos < data.len() && data[pos] != b'\n' {
+            pos += 1;
+        }
+        pos = pos.saturating_add(1);
+    }
+
+    while pos < data.len() {
+        if data[pos] == b'@' && fastq_record_end_at(data, pos).is_some() {
+            return Some(pos);
+        }
+        while pos < data.len() && data[pos] != b'\n' {
+            pos += 1;
+        }
+        pos = pos.saturating_add(1);
+    }
+    Some(data.len())
+}
+
+fn fastq_record_end_at(data: &[u8], start: usize) -> Option<usize> {
+    if data.get(start).copied() != Some(b'@') {
+        return None;
+    }
+    let header_end = fastq_line_end(data, start)?;
+    let sequence_start = header_end + 1;
+    let sequence_end = fastq_line_end(data, sequence_start)?;
+    let separator_start = sequence_end + 1;
+    if data.get(separator_start).copied() != Some(b'+') {
+        return None;
+    }
+    let separator_end = fastq_line_end(data, separator_start)?;
+    let quality_start = separator_end + 1;
+    let quality_end = fastq_line_end(data, quality_start)?;
+    let sequence_len = sequence_end.checked_sub(sequence_start)?;
+    let quality_len = quality_end.checked_sub(quality_start)?;
+    (sequence_len == quality_len).then_some(quality_end + 1)
+}
+
+fn fastq_line_end(data: &[u8], start: usize) -> Option<usize> {
+    data.get(start..)?
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map(|end| start + end)
+}
+
+struct FastqSink {
+    data_len: usize,
+    line_start: usize,
+    line_in_record: u8,
+    sequence_start: usize,
+    sequence_len: usize,
+    error_quality_len: usize,
+    checksum_lanes: [u64; 8],
+    stats: FastqStats,
+}
+
+impl FastqSink {
+    fn new(data_len: usize) -> Self {
+        Self {
+            data_len,
+            line_start: 0,
+            line_in_record: 0,
+            sequence_start: 0,
+            sequence_len: 0,
+            error_quality_len: 0,
+            checksum_lanes: [0; 8],
+            stats: FastqStats::default(),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    unsafe fn drive_avx512(
+        &mut self,
+        data: &[u8],
+        mut mask: u64,
+        base: usize,
+        checksum_acc: &mut std::arch::x86_64::__m512i,
+    ) -> u8 {
+        while mask != 0 {
+            let end = base + mask.trailing_zeros() as usize;
+            let error = unsafe { self.line_avx512(data, end, checksum_acc) };
+            if error != 0 {
+                return error;
+            }
+            self.line_start = end + 1;
+            mask &= mask - 1;
+        }
+        0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    unsafe fn drive_pair_avx512(
+        &mut self,
+        data: &[u8],
+        m0: u64,
+        m1: u64,
+        base: usize,
+        checksum_acc: &mut std::arch::x86_64::__m512i,
+    ) -> u8 {
+        let error = unsafe { self.drive_avx512(data, m0, base, checksum_acc) };
+        if error != 0 {
+            return error;
+        }
+        unsafe { self.drive_avx512(data, m1, base + 64, checksum_acc) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    unsafe fn line_avx512(
+        &mut self,
+        data: &[u8],
+        end: usize,
+        checksum_acc: &mut std::arch::x86_64::__m512i,
+    ) -> u8 {
+        match self.line_in_record {
+            0 => {
+                if unsafe { *data.get_unchecked(self.line_start) } != b'@' {
+                    return 1;
+                }
+                self.line_in_record = 1;
+            }
+            1 => {
+                self.sequence_start = self.line_start;
+                self.sequence_len = end - self.line_start;
+                self.line_in_record = 2;
+            }
+            2 => {
+                if unsafe { *data.get_unchecked(self.line_start) } != b'+' {
+                    return 2;
+                }
+                self.line_in_record = 3;
+            }
+            _ => {
+                return unsafe { self.record_avx512(data, end, checksum_acc) };
+            }
+        }
+        0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f", enable = "avx512bw")]
+    unsafe fn record_avx512(
+        &mut self,
+        data: &[u8],
+        end: usize,
+        checksum_acc: &mut std::arch::x86_64::__m512i,
+    ) -> u8 {
+        let quality_len = end - self.line_start;
+        if quality_len != self.sequence_len {
+            self.error_quality_len = quality_len;
+            return 3;
+        }
+        let sequence = unsafe {
+            data.get_unchecked(self.sequence_start..self.sequence_start + self.sequence_len)
+        };
+        let quality = unsafe { data.get_unchecked(self.line_start..end) };
+        self.stats.records += 1;
+        self.stats.sequence_bytes += sequence.len() as u64;
+        self.stats.quality_bytes += quality.len() as u64;
+        unsafe { checksum_fastq_record_avx512_acc(checksum_acc, sequence, quality) };
+        self.line_in_record = 0;
+        0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn drive_avx2(
+        &mut self,
+        data: &[u8],
+        mut mask: u64,
+        base: usize,
+        checksum_acc: &mut std::arch::x86_64::__m256i,
+    ) -> u8 {
+        while mask != 0 {
+            let end = base + mask.trailing_zeros() as usize;
+            let error = unsafe { self.line_avx2(data, end, checksum_acc) };
+            if error != 0 {
+                return error;
+            }
+            self.line_start = end + 1;
+            mask &= mask - 1;
+        }
+        0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn drive_pair_avx2(
+        &mut self,
+        data: &[u8],
+        m0: u64,
+        m1: u64,
+        base: usize,
+        checksum_acc: &mut std::arch::x86_64::__m256i,
+    ) -> u8 {
+        let error = unsafe { self.drive_avx2(data, m0, base, checksum_acc) };
+        if error != 0 {
+            return error;
+        }
+        unsafe { self.drive_avx2(data, m1, base + 64, checksum_acc) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn line_avx2(
+        &mut self,
+        data: &[u8],
+        end: usize,
+        checksum_acc: &mut std::arch::x86_64::__m256i,
+    ) -> u8 {
+        match self.line_in_record {
+            0 => {
+                if unsafe { *data.get_unchecked(self.line_start) } != b'@' {
+                    return 1;
+                }
+                self.line_in_record = 1;
+            }
+            1 => {
+                self.sequence_start = self.line_start;
+                self.sequence_len = end - self.line_start;
+                self.line_in_record = 2;
+            }
+            2 => {
+                if unsafe { *data.get_unchecked(self.line_start) } != b'+' {
+                    return 2;
+                }
+                self.line_in_record = 3;
+            }
+            _ => {
+                return unsafe { self.record_avx2(data, end, checksum_acc) };
+            }
+        }
+        0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn record_avx2(
+        &mut self,
+        data: &[u8],
+        end: usize,
+        checksum_acc: &mut std::arch::x86_64::__m256i,
+    ) -> u8 {
+        let quality_len = end - self.line_start;
+        if quality_len != self.sequence_len {
+            self.error_quality_len = quality_len;
+            return 3;
+        }
+        let sequence = unsafe {
+            data.get_unchecked(self.sequence_start..self.sequence_start + self.sequence_len)
+        };
+        let quality = unsafe { data.get_unchecked(self.line_start..end) };
+        self.stats.records += 1;
+        self.stats.sequence_bytes += sequence.len() as u64;
+        self.stats.quality_bytes += quality.len() as u64;
+        unsafe { checksum_fastq_record_avx2_acc(checksum_acc, sequence, quality) };
+        self.line_in_record = 0;
+        0
+    }
+
+    #[cold]
+    fn take_error(&self, code: u8) -> FastqError {
+        match code {
+            1 => FastqError::BadHeader {
+                offset: self.line_start,
+            },
+            2 => FastqError::BadSeparator {
+                offset: self.line_start,
+            },
+            3 => FastqError::LengthMismatch {
+                record: self.stats.records,
+                sequence: self.sequence_len,
+                quality: self.error_quality_len,
+            },
+            _ => unreachable!("fastq sink error code"),
+        }
+    }
+
+    fn finish(mut self) -> Result<FastqStats, FastqError> {
+        if self.line_in_record != 0 {
+            return Err(FastqError::IncompleteRecord);
+        }
+        if self.line_start != self.data_len {
+            return Err(FastqError::TrailingBytes {
+                offset: self.line_start,
+            });
+        }
+        self.stats.checksum = finish_fastq_checksum(&self.checksum_lanes);
+        Ok(self.stats)
+    }
+}
+
+impl FastqStats {
+    fn merge(&mut self, other: Self) {
+        self.records += other.records;
+        self.sequence_bytes += other.sequence_bytes;
+        self.quality_bytes += other.quality_bytes;
+        self.checksum = self.checksum.wrapping_add(other.checksum);
+    }
+}
+
+#[inline]
+fn finish_fastq_checksum(checksum_lanes: &[u64; 8]) -> u64 {
+    checksum_lanes
+        .iter()
+        .fold(0u64, |checksum, lane| checksum.wrapping_add(*lane))
+}
+
+#[inline]
+fn checksum_bytes_scalar(mut checksum: u64, bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        let pairs = (word & 0x00ff_00ff_00ff_00ff) + ((word >> 8) & 0x00ff_00ff_00ff_00ff);
+        let quads = (pairs & 0x0000_ffff_0000_ffff) + ((pairs >> 16) & 0x0000_ffff_0000_ffff);
+        checksum = checksum.wrapping_add((quads & 0x0000_0000_ffff_ffff) + (quads >> 32));
+    }
+    for &byte in chunks.remainder() {
+        checksum = checksum.wrapping_add(byte as u64);
+    }
+    checksum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw")]
+unsafe fn checksum_fastq_record_avx512_acc(
+    acc: &mut std::arch::x86_64::__m512i,
+    sequence: &[u8],
+    quality: &[u8],
+) {
+    use std::arch::x86_64::{
+        __m512i, __mmask64, _mm512_add_epi64, _mm512_loadu_si512, _mm512_maskz_loadu_epi8,
+        _mm512_sad_epu8, _mm512_setzero_si512,
+    };
+
+    debug_assert_eq!(sequence.len(), quality.len());
+    let zero = _mm512_setzero_si512();
+    let mut local = *acc;
+    let mut offset = 0usize;
+    while offset + 64 <= sequence.len() {
+        // SAFETY: offset + 64 <= both input lengths, so both unaligned loads are readable.
+        let seq = unsafe { _mm512_loadu_si512(sequence.as_ptr().add(offset) as *const __m512i) };
+        let qual = unsafe { _mm512_loadu_si512(quality.as_ptr().add(offset) as *const __m512i) };
+        local = _mm512_add_epi64(local, _mm512_sad_epu8(seq, zero));
+        local = _mm512_add_epi64(local, _mm512_sad_epu8(qual, zero));
+        offset += 64;
+    }
+    let rem = sequence.len() - offset;
+    if rem > 0 {
+        let mask = ((1u64 << rem) - 1) as __mmask64;
+        // SAFETY: the mask limits both loads to bytes within each slice.
+        let seq = unsafe { _mm512_maskz_loadu_epi8(mask, sequence.as_ptr().add(offset) as *const i8) };
+        let qual = unsafe { _mm512_maskz_loadu_epi8(mask, quality.as_ptr().add(offset) as *const i8) };
+        local = _mm512_add_epi64(local, _mm512_sad_epu8(seq, zero));
+        local = _mm512_add_epi64(local, _mm512_sad_epu8(qual, zero));
+    }
+    *acc = local;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn checksum_fastq_record_avx2_acc(
+    acc: &mut std::arch::x86_64::__m256i,
+    sequence: &[u8],
+    quality: &[u8],
+) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_sad_epu8, _mm256_setzero_si256,
+    };
+
+    debug_assert_eq!(sequence.len(), quality.len());
+    let zero = _mm256_setzero_si256();
+    let mut local = *acc;
+    let mut offset = 0usize;
+    while offset + 32 <= sequence.len() {
+        // SAFETY: offset + 32 <= both input lengths, so both unaligned loads are readable.
+        let seq = unsafe { _mm256_loadu_si256(sequence.as_ptr().add(offset) as *const __m256i) };
+        let qual = unsafe { _mm256_loadu_si256(quality.as_ptr().add(offset) as *const __m256i) };
+        local = _mm256_add_epi64(local, _mm256_sad_epu8(seq, zero));
+        local = _mm256_add_epi64(local, _mm256_sad_epu8(qual, zero));
+        offset += 32;
+    }
+    *acc = local;
+    checksum_lanes_tail(acc, &sequence[offset..], &quality[offset..]);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn checksum_lanes_tail(
+    acc: &mut std::arch::x86_64::__m256i,
+    sequence: &[u8],
+    quality: &[u8],
+) {
+    use std::arch::x86_64::__m256i;
+
+    // SAFETY: __m256i and [u64; 4] are both 32-byte vector storage here.
+    let mut lanes: [u64; 4] = unsafe { std::mem::transmute::<__m256i, [u64; 4]>(*acc) };
+    lanes[0] = checksum_bytes_scalar(lanes[0], sequence);
+    lanes[0] = checksum_bytes_scalar(lanes[0], quality);
+    // SAFETY: __m256i and [u64; 4] are both 32-byte vector storage here.
+    *acc = unsafe { std::mem::transmute::<[u64; 4], __m256i>(lanes) };
+}
+
+"#,
+    );
+}
+
+fn push_logfmt_api(code: &mut String) {
+    code.push_str(
+        r#"
+/// logfmt key/value summary emitted by [`parse_logfmt_pairs`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogfmtStats {
+    pub pairs: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    pub checksum: u64,
+}
+
+/// Parse logfmt pairs and return cleaned key/value counters.
+///
+/// This is a generated domain API over the generated structural kernel:
+/// spaces, `=`, and record terminators outside quote regions are streamed
+/// directly into a pair sink, avoiding the generic separator/end tape.
+pub fn parse_logfmt_pairs(data: &[u8]) -> LogfmtStats {
+    let mut sink = LogfmtSink::new(data.len());
+    logfmt_blocks_dispatch(data, &mut sink);
+    sink.finish(data)
+}
+
+/// Parallel [`parse_logfmt_pairs`] over newline-aligned chunks.
+///
+/// The comparable logfmt parser is line-oriented, so every worker owns whole
+/// lines and starts with the normal generated quote/escape carries.
+pub fn parse_logfmt_pairs_par(data: &[u8], threads: usize) -> LogfmtStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 || data.len() < (1 << 20) {
+        return parse_logfmt_pairs(data);
+    }
+
+    let bounds = logfmt_line_bounds(data, threads);
+    let parts: Vec<LogfmtStats> = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .filter_map(|w| {
+                let start = w[0];
+                let end = w[1];
+                (start < end).then(|| {
+                    let slice = &data[start..end];
+                    s.spawn(move || parse_logfmt_pairs(slice))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("logfmt parse thread ok"))
+            .collect()
+    });
+
+    let mut merged = LogfmtStats::default();
+    for part in parts {
+        merged.merge(part);
+    }
+    merged
+}
+
+fn logfmt_line_bounds(data: &[u8], threads: usize) -> Vec<usize> {
+    let approx = data.len() / threads;
+    let mut bounds = vec![0usize; threads + 1];
+    bounds[threads] = data.len();
+    for (i, slot) in bounds[1..threads].iter_mut().enumerate() {
+        let from = ((i + 1) * approx).min(data.len());
+        *slot = match data[from..].iter().position(|&byte| byte == b'\n') {
+            Some(pos) => from + pos + 1,
+            None => data.len(),
+        };
+    }
+    bounds
+}
+
+fn logfmt_blocks_dispatch(data: &[u8], sink: &mut LogfmtSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::logfmt_blocks(data, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::logfmt_blocks(data, sink) };
+        return;
+    }
+    unsupported_cpu()
+}
+
+struct LogfmtSink {
+    data_len: usize,
+    record_start: usize,
+    field_start: usize,
+    key_start: usize,
+    key_end: usize,
+    has_key: bool,
+    stats: LogfmtStats,
+}
+
+impl LogfmtSink {
+    fn new(data_len: usize) -> Self {
+        Self {
+            data_len,
+            record_start: 0,
+            field_start: 0,
+            key_start: 0,
+            key_end: 0,
+            has_key: false,
+            stats: LogfmtStats::default(),
+        }
+    }
+
+    #[inline(always)]
+    fn drive(&mut self, data: &[u8], mut structural: u64, term: u64, base: usize) {
+        while structural != 0 {
+            let bit = structural & structural.wrapping_neg();
+            let idx = bit.trailing_zeros() as usize;
+            let end = base + idx;
+            let is_term = (term & bit) != 0;
+            let field_end =
+                if is_term && end > self.record_start && data[end.saturating_sub(1)] == b'\r' {
+                    end - 1
+                } else {
+                    end
+                };
+            self.field(data, field_end);
+            self.field_start = end + 1;
+            if is_term {
+                self.has_key = false;
+                self.record_start = end + 1;
+            }
+            structural &= structural - 1;
+        }
+    }
+
+    #[inline(always)]
+    fn field(&mut self, data: &[u8], end: usize) {
+        if self.has_key {
+            // SAFETY: all offsets come from structural positions in `data`;
+            // `finish` passes at most `data_len`.
+            let key = unsafe { data.get_unchecked(self.key_start..self.key_end) };
+            // SAFETY: `field_start` and `end` are in the same bounded record.
+            let value = unsafe { data.get_unchecked(self.field_start..end) };
+            add_logfmt_pair(
+                &mut self.stats,
+                key,
+                value,
+            );
+            self.has_key = false;
+        } else {
+            self.key_start = self.field_start;
+            self.key_end = end;
+            self.has_key = true;
+        }
+    }
+
+    fn finish(mut self, data: &[u8]) -> LogfmtStats {
+        if self.field_start < self.data_len
+            || (self.data_len > 0 && data[self.data_len - 1] != b'\n')
+        {
+            let end = if self.data_len > self.record_start && data[self.data_len - 1] == b'\r' {
+                self.data_len - 1
+            } else {
+                self.data_len
+            };
+            self.field(data, end);
+        }
+        self.stats
+    }
+}
+
+impl LogfmtStats {
+    fn merge(&mut self, other: Self) {
+        self.pairs += other.pairs;
+        self.key_bytes += other.key_bytes;
+        self.value_bytes += other.value_bytes;
+        self.checksum = self.checksum.wrapping_add(other.checksum);
+    }
+}
+
+#[inline(always)]
+fn add_logfmt_pair(stats: &mut LogfmtStats, key: &[u8], value: &[u8]) {
+    stats.pairs += 1;
+    stats.key_bytes += key.len() as u64;
+    stats.checksum = logfmt_checksum_bytes(stats.checksum, key);
+    add_logfmt_value(stats, value);
+}
+
+#[inline]
+fn add_logfmt_value(stats: &mut LogfmtStats, value: &[u8]) {
+    const Q: u8 = b'"';
+    const E: u8 = b'\\';
+    if value.first() != Some(&Q) {
+        stats.value_bytes += value.len() as u64;
+        stats.checksum = logfmt_checksum_bytes(stats.checksum, value);
+        return;
+    }
+
+    let body = if value.len() >= 2 && value[value.len() - 1] == Q {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if !contains_byte(body, E) {
+        stats.value_bytes += body.len() as u64;
+        stats.checksum = logfmt_checksum_bytes(stats.checksum, body);
+        return;
+    }
+    
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == E && i + 1 < body.len() {
+            stats.value_bytes += 1;
+            stats.checksum = stats.checksum.wrapping_add(body[i + 1] as u64);
+            i += 2;
+        } else {
+            stats.value_bytes += 1;
+            stats.checksum = stats.checksum.wrapping_add(body[i] as u64);
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn logfmt_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        let pairs = (word & 0x00ff_00ff_00ff_00ff) + ((word >> 8) & 0x00ff_00ff_00ff_00ff);
+        let quads = (pairs & 0x0000_ffff_0000_ffff) + ((pairs >> 16) & 0x0000_ffff_0000_ffff);
+        checksum = checksum.wrapping_add((quads & 0x0000_0000_ffff_ffff) + (quads >> 32));
+    }
+    for &byte in chunks.remainder() {
+        checksum = checksum.wrapping_add(byte as u64);
+    }
+    checksum
+}
+
+"#,
+    );
+}
+
 fn push_columns_api(
     code: &mut String,
     dialect: &crate::formats::Dialect,
     columns: &[Column],
     par_mode: bool,
 ) {
-    // The columns/cells parallel path keeps its record-ownership driver, which
-    // is not yet validated against comment lines; gate it off for comment
-    // dialects (serial `parse_columns` still works for them).
-    let col_par = par_mode && dialect.comment.is_none();
+    // The columns/cells parallel path uses the same record ownership as
+    // parse_par. Comment lines are skipped in the sink, so comment-only
+    // dialects can expose parallel projection too.
+    let col_par = par_mode;
     let any_i64 = columns.iter().any(|c| c.ty == ColumnType::I64);
     let any_f64 = columns.iter().any(|c| c.ty == ColumnType::F64);
     let any_bytes = columns.iter().any(|c| c.ty == ColumnType::Bytes);
@@ -2662,6 +3864,1057 @@ fn push_columns_api(
     }
 }
 
+fn push_ndjson_lines_api(code: &mut String) {
+    code.push_str(
+        r#"
+/// NDJSON line-framing summary emitted by [`parse_ndjson_lines`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NdjsonLineStats {
+    pub records: u64,
+}
+
+/// Count NDJSON records directly from the generated quote/escape-aware
+/// newline stream without materializing the span tape.
+pub fn parse_ndjson_lines(data: &[u8]) -> NdjsonLineStats {
+    let mut records = index_ndjson_lines_dispatch(data);
+    if ndjson_has_trailing_record(data) {
+        records += 1;
+    }
+    NdjsonLineStats { records }
+}
+
+/// Parallel [`parse_ndjson_lines`] over newline-aligned chunks.
+///
+/// NDJSON records are JSON texts separated by raw newlines; a valid record
+/// cannot contain an unescaped newline inside a string. Aligning chunks just
+/// after raw newlines therefore lets every worker start from the normal
+/// generated quote/escape state while still using the generated scanner.
+pub fn parse_ndjson_lines_par(data: &[u8], threads: usize) -> NdjsonLineStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 || data.is_empty() {
+        return parse_ndjson_lines(data);
+    }
+    let bounds = ndjson_line_bounds(data, threads);
+    if bounds.len() <= 2 {
+        return parse_ndjson_lines(data);
+    }
+    let records: u64 = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .map(|range| {
+                let slice = &data[range[0]..range[1]];
+                s.spawn(move || index_ndjson_lines_dispatch(slice))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("ndjson line thread ok"))
+            .sum()
+    });
+    NdjsonLineStats {
+        records: records + ndjson_has_trailing_record(data) as u64,
+    }
+}
+
+fn index_ndjson_lines_dispatch(data: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::index_ndjson_lines(data) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::index_ndjson_lines(data) };
+    }
+    unsupported_cpu();
+}
+
+fn ndjson_has_trailing_record(data: &[u8]) -> bool {
+    !data.is_empty() && data.last().copied() != Some(b'\n')
+}
+
+fn ndjson_line_bounds(data: &[u8], threads: usize) -> Vec<usize> {
+    if data.is_empty() {
+        return vec![0];
+    }
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return vec![0, data.len()];
+    }
+    let mut bounds = Vec::with_capacity(threads + 1);
+    bounds.push(0);
+    for t in 1..threads {
+        let mut bound = (t * chunk).min(data.len());
+        while bound < data.len() && data[bound - 1] != b'\n' {
+            bound += 1;
+        }
+        if bound > *bounds.last().expect("initial bound") && bound < data.len() {
+            bounds.push(bound);
+        }
+    }
+    bounds.push(data.len());
+    bounds
+}
+
+"#,
+    );
+}
+
+fn push_field_byte_stats_api(code: &mut String, dialect: &crate::formats::Dialect) {
+    let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.quote, "data[start..end]");
+    let field_len_helper = if dialect.quote.is_some() {
+        r#"#[inline]
+fn field_byte_len(raw: &[u8]) -> u64 {
+    const Q: u8 = 34u8;
+    if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {
+        let inner = &raw[1..raw.len() - 1];
+        if !contains_byte(inner, Q) {
+            return inner.len() as u64;
+        }
+        let mut len = 0u64;
+        let mut i = 0;
+        while i < inner.len() {
+            len += 1;
+            if inner[i] == Q && i + 1 < inner.len() && inner[i + 1] == Q {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        return len;
+    }
+    raw.len() as u64
+}
+
+"#
+    } else {
+        r#"#[inline]
+fn field_byte_len(raw: &[u8]) -> u64 {
+    raw.len() as u64
+}
+
+"#
+    };
+    let api = r#"
+/// Fused field-byte summary emitted by [`parse_field_bytes`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FieldByteStats {
+    pub fields: u64,
+    pub bytes: u64,
+}
+
+/// Sum decoded field byte lengths directly from the generated structural
+/// stream.
+///
+/// This keeps the benchmark on the same semantic surface as
+/// `records().flat_map(fields...)`, but avoids building a tape and then
+/// walking it again.
+pub fn parse_field_bytes(data: &[u8]) -> FieldByteStats {
+    let mut sink = FieldByteSink::new(data, 0, data.len() as u32, true);
+    index_field_bytes_dispatch(data, 0, 0, &mut sink);
+    sink.finish()
+}
+
+/// Parallel [`parse_field_bytes`] using the same record-ownership contract as
+/// [`parse_par`].
+pub fn parse_field_bytes_par(data: &[u8], threads: usize) -> FieldByteStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse_field_bytes(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| {
+            if t == threads {
+                data.len()
+            } else {
+                (t * chunk).min(data.len())
+            }
+        })
+        .collect();
+@PAR_SHARED@    let parts: Vec<FieldByteStats> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (start, end) = (bounds[t], bounds[t + 1]);
+@PAR_REFS@                s.spawn(move || {
+@PAR_SEED@                    let mut sink = FieldByteSink::new(data, start as u32, end as u32, t == 0);
+                    index_field_bytes_dispatch(data, seed, start, &mut sink);
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("field-byte stats thread ok"))
+            .collect()
+    });
+    let mut stats = FieldByteStats::default();
+    for part in parts {
+        stats.merge(part);
+    }
+    stats
+}
+
+fn index_field_bytes_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut FieldByteSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_field_bytes(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_field_bytes(data, seed, start, sink) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+pub(crate) struct FieldByteSink<'a> {
+    data: &'a [u8],
+    stats: FieldByteStats,
+    field_start: u32,
+    record_start: u32,
+    end: u32,
+    emitting: bool,
+    pub(crate) done: bool,
+}
+
+impl<'a> FieldByteSink<'a> {
+    fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> Self {
+        Self {
+            data,
+            stats: FieldByteStats::default(),
+            field_start: start,
+            record_start: start,
+            end,
+            emitting,
+            done: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {
+        let mut m = mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros();
+            if term & bit != 0 {
+                if self.emitting {
+                    self.flush_field(p, true);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                self.flush_field(p, false);
+                self.field_start = p + 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    #[inline]
+    fn flush_field(&mut self, end: u32, record_end: bool) {
+        let data = self.data;
+        let to = if record_end && end > self.record_start && data[end as usize - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        self.stats.fields += 1;
+        self.stats.bytes += field_byte_len(&data[self.field_start as usize..to as usize]);
+    }
+
+    fn finish(mut self) -> FieldByteStats {
+        let len = self.data.len() as u32;
+        if self.emitting && !self.done && self.record_start < len {
+            self.flush_field(len, true);
+        }
+        self.stats
+    }
+}
+
+impl FieldByteStats {
+    fn merge(&mut self, other: Self) {
+        self.fields += other.fields;
+        self.bytes += other.bytes;
+    }
+}
+
+@FIELD_LEN_HELPER@"#
+        .replace("@PAR_SHARED@", &par_shared)
+        .replace("@PAR_REFS@", &par_refs)
+        .replace("@PAR_SEED@", &par_seed)
+        .replace("@FIELD_LEN_HELPER@", field_len_helper);
+
+    code.push_str(&api);
+}
+
+fn push_csv_geo_stats_api(code: &mut String, text: bool) {
+    let (struct_name, sink_name, parse_fn, parse_par_fn, dispatch_fn, index_fn, thread_msg) =
+        if text {
+            (
+                "CsvGeoTextStats",
+                "CsvGeoTextStatsSink",
+                "parse_csv_geo_text_stats",
+                "parse_csv_geo_text_stats_par",
+                "index_csv_geo_text_stats_dispatch",
+                "index_csv_geo_text_stats",
+                "csv geo text stats thread ok",
+            )
+        } else {
+            (
+                "CsvGeoStats",
+                "CsvGeoStatsSink",
+                "parse_csv_geo_stats",
+                "parse_csv_geo_stats_par",
+                "index_csv_geo_stats_dispatch",
+                "index_csv_geo_stats",
+                "csv geo stats thread ok",
+            )
+        };
+
+    let (
+        text_struct_fields,
+        pending_count,
+        text_drive_arm,
+        text_last_arm,
+        text_flush_body,
+        text_merge_body,
+        text_helpers,
+        lat_idx,
+        lat_bit,
+        lon_idx,
+        lon_bit,
+    ) = if text {
+        (
+            "\
+    pub city_values: u64,\n\
+    pub city_bytes: u64,\n\
+    pub city_checksum: u64,\n",
+            "3",
+            "\
+                    1 => {\n\
+                        self.pending[0] = (self.field_start, p);\n\
+                        self.found |= 1;\n\
+                    }\n",
+            "\
+            1 => {\n\
+                self.pending[0] = (self.field_start, to);\n\
+                self.found |= 1;\n\
+            }\n",
+            "\
+        let (from, to) = self.pending[0];\n\
+        if self.found & 1 != 0 {\n\
+            let (bytes, checksum) = csv_geo_checksum_clean_field(&data[from as usize..to as usize]);\n\
+            self.stats.city_values += 1;\n\
+            self.stats.city_bytes += bytes;\n\
+            self.stats.city_checksum = self.stats.city_checksum.wrapping_add(checksum);\n\
+        }\n",
+            "\
+        self.city_values += other.city_values;\n\
+        self.city_bytes += other.city_bytes;\n\
+        self.city_checksum = self.city_checksum.wrapping_add(other.city_checksum);\n",
+            r#"
+fn csv_geo_checksum_clean_field(raw: &[u8]) -> (u64, u64) {
+    const Q: u8 = 34u8;
+    if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {
+        let inner = &raw[1..raw.len() - 1];
+        if !contains_byte(inner, Q) {
+            return (inner.len() as u64, csv_geo_checksum_bytes(inner));
+        }
+        let mut bytes = 0u64;
+        let mut checksum = 0u64;
+        let mut i = 0;
+        while i < inner.len() {
+            bytes += 1;
+            checksum = checksum.wrapping_add(inner[i] as u64);
+            if inner[i] == Q && i + 1 < inner.len() && inner[i + 1] == Q {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        return (bytes, checksum);
+    }
+    (raw.len() as u64, csv_geo_checksum_bytes(raw))
+}
+
+#[inline]
+fn csv_geo_checksum_bytes(bytes: &[u8]) -> u64 {
+    match bytes.len() {
+        0 => 0,
+        1 => bytes[0] as u64,
+        2 => bytes[0] as u64 + bytes[1] as u64,
+        3 => bytes[0] as u64 + bytes[1] as u64 + bytes[2] as u64,
+        4 => bytes[0] as u64 + bytes[1] as u64 + bytes[2] as u64 + bytes[3] as u64,
+        5 => {
+            bytes[0] as u64
+                + bytes[1] as u64
+                + bytes[2] as u64
+                + bytes[3] as u64
+                + bytes[4] as u64
+        }
+        6 => {
+            bytes[0] as u64
+                + bytes[1] as u64
+                + bytes[2] as u64
+                + bytes[3] as u64
+                + bytes[4] as u64
+                + bytes[5] as u64
+        }
+        7 => {
+            bytes[0] as u64
+                + bytes[1] as u64
+                + bytes[2] as u64
+                + bytes[3] as u64
+                + bytes[4] as u64
+                + bytes[5] as u64
+                + bytes[6] as u64
+        }
+        8 => csv_geo_checksum_first_8(bytes),
+        9 => csv_geo_checksum_first_8(bytes) + bytes[8] as u64,
+        10 => csv_geo_checksum_first_8(bytes) + bytes[8] as u64 + bytes[9] as u64,
+        11 => csv_geo_checksum_first_8(bytes) + bytes[8] as u64 + bytes[9] as u64 + bytes[10] as u64,
+        12 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+        }
+        13 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+                + bytes[12] as u64
+        }
+        14 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+                + bytes[12] as u64
+                + bytes[13] as u64
+        }
+        15 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+                + bytes[12] as u64
+                + bytes[13] as u64
+                + bytes[14] as u64
+        }
+        16 => csv_geo_checksum_first_8(bytes) + csv_geo_checksum_first_8(&bytes[8..]),
+        _ => csv_geo_checksum_long(bytes),
+    }
+}
+
+#[inline]
+fn csv_geo_checksum_first_8(bytes: &[u8]) -> u64 {
+    debug_assert!(bytes.len() >= 8);
+    // SAFETY: callers pass at least 8 bytes; unaligned loads are allowed.
+    let word = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<u64>()) };
+    csv_geo_checksum_word(word)
+}
+
+#[inline]
+fn csv_geo_checksum_long(bytes: &[u8]) -> u64 {
+    let mut checksum = 0u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        checksum = checksum.wrapping_add(csv_geo_checksum_word(word));
+    }
+    for &byte in chunks.remainder() {
+        checksum = checksum.wrapping_add(byte as u64);
+    }
+    checksum
+}
+
+#[inline]
+fn csv_geo_checksum_word(word: u64) -> u64 {
+    let pairs = (word & 0x00ff_00ff_00ff_00ff) + ((word >> 8) & 0x00ff_00ff_00ff_00ff);
+    let quads = (pairs & 0x0000_ffff_0000_ffff) + ((pairs >> 16) & 0x0000_ffff_0000_ffff);
+    (quads & 0x0000_0000_ffff_ffff) + (quads >> 32)
+}
+
+"#,
+            "1",
+            "2",
+            "2",
+            "4",
+        )
+    } else {
+        ("", "2", "", "", "", "", "", "0", "1", "1", "2")
+    };
+    let api = r#"
+/// CSV geo projection summary emitted by [`@PARSE@`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct @STRUCT@ {
+    pub records: u64,
+@TEXT_STRUCT_FIELDS@    pub latitude_values: u64,
+    pub longitude_values: u64,
+    pub latitude_checksum: u64,
+    pub longitude_checksum: u64,
+}
+
+/// Parse CSV geo rows and accumulate the benchmark projection directly.
+///
+/// This generated domain API uses the same SIMD structural stream as
+/// [`parse_columns`], but avoids materializing column vectors, string
+/// offsets, and validity bitmaps that aggregate benchmarks immediately
+/// walk again.
+pub fn @PARSE@(data: &[u8]) -> @STRUCT@ {
+    let mut sink = @SINK@::new(data, 0, data.len() as u32, true);
+    @DISPATCH@(data, 0, 0, &mut sink);
+    sink.finish()
+}
+
+/// Parallel [`@PARSE@`] using the same record-ownership contract as
+/// [`parse_columns_par`].
+pub fn @PARSE_PAR@(data: &[u8], threads: usize) -> @STRUCT@ {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return @PARSE@(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| {
+            if t == threads {
+                data.len()
+            } else {
+                (t * chunk).min(data.len())
+            }
+        })
+        .collect();
+    let parity: Vec<std::sync::atomic::AtomicU64> =
+        (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let barrier = std::sync::Barrier::new(threads);
+    let parts: Vec<@STRUCT@> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (start, end) = (bounds[t], bounds[t + 1]);
+                let parity = &parity;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    parity[t].store(quote_parity_dispatch(&data[start..end], 0) & 1, Relaxed);
+                    barrier.wait();
+                    let seed = parity[..t]
+                        .iter()
+                        .fold(0u64, |acc, p| acc ^ p.load(Relaxed))
+                        .wrapping_neg();
+                    let mut sink = @SINK@::new(data, start as u32, end as u32, t == 0);
+                    @DISPATCH@(data, seed, start, &mut sink);
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("@THREAD_MSG@"))
+            .collect()
+    });
+    let mut stats = @STRUCT@::default();
+    for part in parts {
+        stats.merge(part);
+    }
+    stats
+}
+
+fn @DISPATCH@(data: &[u8], seed: u64, start: usize, sink: &mut @SINK@) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::@INDEX@(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::@INDEX@(data, seed, start, sink) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+pub(crate) struct @SINK@<'a> {
+    data: &'a [u8],
+    stats: @STRUCT@,
+    field_start: u32,
+    record_start: u32,
+    ordinal: u32,
+    pending: [(u32, u32); @PENDING_COUNT@],
+    found: u32,
+    end: u32,
+    emitting: bool,
+    pub(crate) done: bool,
+}
+
+impl<'a> @SINK@<'a> {
+    fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> Self {
+        Self {
+            data,
+            stats: @STRUCT@::default(),
+            field_start: start,
+            record_start: start,
+            ordinal: 0,
+            pending: [(0, 0); @PENDING_COUNT@],
+            found: 0,
+            end,
+            emitting,
+            done: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {
+        let mut m = mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros();
+            if term & bit != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+@TEXT_DRIVE_ARM@                    5 => {
+                        self.pending[@LAT_IDX@] = (self.field_start, p);
+                        self.found |= @LAT_BIT@;
+                    }
+                    6 => {
+                        self.pending[@LON_IDX@] = (self.field_start, p);
+                        self.found |= @LON_BIT@;
+                    }
+                    _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    fn flush(&mut self, end: u32) {
+        let data = self.data;
+        let to = if end > self.record_start && data[end as usize - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        match self.ordinal {
+@TEXT_LAST_ARM@            5 => {
+                self.pending[@LAT_IDX@] = (self.field_start, to);
+                self.found |= @LAT_BIT@;
+            }
+            6 => {
+                self.pending[@LON_IDX@] = (self.field_start, to);
+                self.found |= @LON_BIT@;
+            }
+            _ => {}
+        }
+
+        self.stats.records += 1;
+@TEXT_FLUSH_BODY@        let (from, to) = self.pending[@LAT_IDX@];
+        if self.found & @LAT_BIT@ != 0
+            && let Some(value) = parse_f64_field(&data[from as usize..to as usize])
+        {
+            self.stats.latitude_values += 1;
+            self.stats.latitude_checksum = self.stats.latitude_checksum.wrapping_add(value.to_bits());
+        }
+        let (from, to) = self.pending[@LON_IDX@];
+        if self.found & @LON_BIT@ != 0
+            && let Some(value) = parse_f64_field(&data[from as usize..to as usize])
+        {
+            self.stats.longitude_values += 1;
+            self.stats.longitude_checksum =
+                self.stats.longitude_checksum.wrapping_add(value.to_bits());
+        }
+    }
+
+    fn finish(mut self) -> @STRUCT@ {
+        let len = self.data.len() as u32;
+        if self.emitting && !self.done && self.record_start < len {
+            self.flush(len);
+        }
+        self.stats
+    }
+}
+
+impl @STRUCT@ {
+    fn merge(&mut self, other: Self) {
+        self.records += other.records;
+@TEXT_MERGE_BODY@        self.latitude_values += other.latitude_values;
+        self.longitude_values += other.longitude_values;
+        self.latitude_checksum = self.latitude_checksum.wrapping_add(other.latitude_checksum);
+        self.longitude_checksum = self.longitude_checksum.wrapping_add(other.longitude_checksum);
+    }
+}
+
+@TEXT_HELPERS@"#
+        .replace("@STRUCT@", struct_name)
+        .replace("@SINK@", sink_name)
+        .replace("@PARSE@", parse_fn)
+        .replace("@PARSE_PAR@", parse_par_fn)
+        .replace("@DISPATCH@", dispatch_fn)
+        .replace("@INDEX@", index_fn)
+        .replace("@THREAD_MSG@", thread_msg)
+        .replace("@TEXT_STRUCT_FIELDS@", text_struct_fields)
+        .replace("@PENDING_COUNT@", pending_count)
+        .replace("@TEXT_DRIVE_ARM@", text_drive_arm)
+        .replace("@TEXT_LAST_ARM@", text_last_arm)
+        .replace("@TEXT_FLUSH_BODY@", text_flush_body)
+        .replace("@TEXT_MERGE_BODY@", text_merge_body)
+        .replace("@TEXT_HELPERS@", text_helpers)
+        .replace("@LAT_IDX@", lat_idx)
+        .replace("@LAT_BIT@", lat_bit)
+        .replace("@LON_IDX@", lon_idx)
+        .replace("@LON_BIT@", lon_bit);
+
+    code.push_str(&api);
+}
+
+fn push_vcf_stats_api(code: &mut String) {
+    code.push_str(
+        r#"
+/// VCF typed projection summary emitted by [`parse_vcf_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VcfStats {
+    pub records: u64,
+    pub primary_bytes: u64,
+    pub pos_values: u64,
+    pub checksum: u64,
+}
+
+/// Parse VCF records and accumulate the benchmark projection directly.
+///
+/// This generated domain API uses the same SIMD structural stream as
+/// [`parse_columns`], but avoids materializing column vectors that the
+/// sustained benchmark immediately walks again.
+pub fn parse_vcf_stats(data: &[u8]) -> VcfStats {
+    let mut sink = VcfStatsSink::new(data, 0, data.len() as u32, true);
+    index_vcf_stats_dispatch(data, 0, 0, &mut sink);
+    sink.finish()
+}
+
+/// Parallel [`parse_vcf_stats`] using the same record-ownership contract as
+/// [`parse_columns_par`].
+pub fn parse_vcf_stats_par(data: &[u8], threads: usize) -> VcfStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse_vcf_stats(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| {
+            if t == threads {
+                data.len()
+            } else {
+                (t * chunk).min(data.len())
+            }
+        })
+        .collect();
+    let parts: Vec<VcfStats> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (start, end) = (bounds[t], bounds[t + 1]);
+                s.spawn(move || {
+                    let mut sink = VcfStatsSink::new(data, start as u32, end as u32, t == 0);
+                    index_vcf_stats_dispatch(data, 0, start, &mut sink);
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("vcf stats thread ok"))
+            .collect()
+    });
+    let mut stats = VcfStats::default();
+    for part in parts {
+        stats.merge(part);
+    }
+    stats
+}
+
+fn index_vcf_stats_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut VcfStatsSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_vcf_stats(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_vcf_stats(data, seed, start, sink) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+pub(crate) struct VcfStatsSink<'a> {
+    data: &'a [u8],
+    stats: VcfStats,
+    field_start: u32,
+    record_start: u32,
+    ordinal: u32,
+    pending: [(u32, u32); 4],
+    found: u32,
+    end: u32,
+    emitting: bool,
+    pub(crate) done: bool,
+}
+
+impl<'a> VcfStatsSink<'a> {
+    fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> Self {
+        Self {
+            data,
+            stats: VcfStats::default(),
+            field_start: start,
+            record_start: start,
+            ordinal: 0,
+            pending: [(0, 0); 4],
+            found: 0,
+            end,
+            emitting,
+            done: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {
+        let mut m = mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros();
+            if term & bit != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+                    1 => {
+                        self.pending[0] = (self.field_start, p);
+                        self.found |= 1;
+                    }
+                    3 => {
+                        self.pending[1] = (self.field_start, p);
+                        self.found |= 2;
+                    }
+                    4 => {
+                        self.pending[2] = (self.field_start, p);
+                        self.found |= 4;
+                    }
+                    5 => {
+                        self.pending[3] = (self.field_start, p);
+                        self.found |= 8;
+                    }
+                    _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    fn flush(&mut self, end: u32) {
+        let data = self.data;
+        if end > self.record_start && data[self.record_start as usize] == b'#' {
+            return;
+        }
+        let to = if end > self.record_start && data[end as usize - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        match self.ordinal {
+            1 => {
+                self.pending[0] = (self.field_start, to);
+                self.found |= 1;
+            }
+            3 => {
+                self.pending[1] = (self.field_start, to);
+                self.found |= 2;
+            }
+            4 => {
+                self.pending[2] = (self.field_start, to);
+                self.found |= 4;
+            }
+            5 => {
+                self.pending[3] = (self.field_start, to);
+                self.found |= 8;
+            }
+            _ => {}
+        }
+
+        self.stats.records += 1;
+        let (from, to) = self.pending[0];
+        if self.found & 1 != 0
+            && let Some(pos) = parse_vcf_pos_cell(&data[from as usize..to as usize])
+        {
+            self.stats.pos_values += 1;
+            self.stats.checksum = vcf_checksum_u64(self.stats.checksum, pos as u64);
+        }
+        let (from, to) = self.pending[1];
+        if self.found & 2 != 0 && from != to {
+            let bytes = &data[from as usize..to as usize];
+            self.stats.primary_bytes += bytes.len() as u64;
+            self.stats.checksum = vcf_checksum_primary_bytes(self.stats.checksum, bytes);
+        }
+        let (from, to) = self.pending[2];
+        if self.found & 4 != 0 && from != to {
+            let bytes = &data[from as usize..to as usize];
+            self.stats.primary_bytes += bytes.len() as u64;
+            self.stats.checksum = vcf_checksum_primary_bytes(self.stats.checksum, bytes);
+        }
+        let (from, to) = self.pending[3];
+        if self.found & 8 != 0
+            && let Some(quality) = parse_f64_cell(&data[from as usize..to as usize])
+        {
+            self.stats.checksum =
+                vcf_checksum_u64(self.stats.checksum, (quality as f32).to_bits() as u64);
+        }
+    }
+
+    fn finish(mut self) -> VcfStats {
+        let len = self.data.len() as u32;
+        if self.emitting && !self.done && self.record_start < len {
+            self.flush(len);
+        }
+        self.stats
+    }
+}
+
+#[inline(always)]
+fn parse_vcf_pos_cell(s: &[u8]) -> Option<i64> {
+    match s.len() {
+        8 => {
+            let word = u64::from_le_bytes(s.try_into().unwrap());
+            is_8_digits(word).then(|| parse_8_digits(word) as i64)
+        }
+        9 => {
+            let first = s[0].wrapping_sub(b'0');
+            if first > 9 {
+                return None;
+            }
+            let tail = u64::from_le_bytes(s[1..9].try_into().unwrap());
+            is_8_digits(tail).then(|| first as i64 * 100_000_000 + parse_8_digits(tail) as i64)
+        }
+        1..=7 => {
+            let mut value = 0i64;
+            for &byte in s {
+                let digit = byte.wrapping_sub(b'0');
+                if digit > 9 {
+                    return None;
+                }
+                value = value * 10 + digit as i64;
+            }
+            Some(value)
+        }
+        _ => parse_i64_cell(s),
+    }
+}
+
+impl VcfStats {
+    fn merge(&mut self, other: Self) {
+        self.records += other.records;
+        self.primary_bytes += other.primary_bytes;
+        self.pos_values += other.pos_values;
+        self.checksum = self.checksum.wrapping_add(other.checksum);
+    }
+}
+
+fn vcf_checksum_primary_bytes(checksum: u64, bytes: &[u8]) -> u64 {
+    match bytes {
+        [byte] => checksum.wrapping_add(*byte as u64),
+        _ => vcf_checksum_bytes(checksum, bytes),
+    }
+}
+
+fn vcf_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        let pairs = (word & 0x00ff_00ff_00ff_00ff) + ((word >> 8) & 0x00ff_00ff_00ff_00ff);
+        let quads = (pairs & 0x0000_ffff_0000_ffff) + ((pairs >> 16) & 0x0000_ffff_0000_ffff);
+        checksum = checksum.wrapping_add((quads & 0x0000_0000_ffff_ffff) + (quads >> 32));
+    }
+    for &byte in chunks.remainder() {
+        checksum = checksum.wrapping_add(byte as u64);
+    }
+    checksum
+}
+
+fn vcf_checksum_u64(checksum: u64, value: u64) -> u64 {
+    vcf_checksum_bytes(checksum, &value.to_le_bytes())
+}
+
+"#,
+    );
+}
+
 /// Integer cell parser template: SWAR 8-digit blocks (Lemire) for the
 /// common lengths, checked scalar arithmetic for 17+ digit tails.
 const INT_CELL_TPL: &str = r#"/// Parse an integer cell with the exact acceptance rules of
@@ -2739,11 +4992,16 @@ const FLOAT_CELL_TPL: &str = r#"/// Parse a float cell with the exact semantics 
 /// else (long mantissas, big exponents, inf/nan spellings, malformed
 /// cells) falls through to `str::parse`, which has been Eisel-Lemire in
 /// std since Rust 1.55 -- the fallback is rarely taken, not slow.
+#[inline(always)]
 fn parse_f64_cell(s: &[u8]) -> Option<f64> {
     const POW10: [f64; 23] = [
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
         1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
     ];
+    if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s) {
+        let value = mantissa as f64 / 1_000_000.0;
+        return Some(if neg { -value } else { value });
+    }
     let (neg, rest) = match s.split_first() {
         Some((&b'-', rest)) => (true, rest),
         Some((&b'+', rest)) => (false, rest),
@@ -2811,6 +5069,73 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
 #[cold]
 fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
     std::str::from_utf8(s).ok()?.parse::<f64>().ok()
+}
+
+#[inline]
+fn parse_fixed_6_decimal_signed(s: &[u8]) -> Option<(bool, u64)> {
+    match s.len() {
+        8 if s[1] == b'.' => {
+            let mantissa = parse_decimal_digit(s[0])? * 1_000_000 + parse_6_digits(&s[2..8])?;
+            Some((false, mantissa))
+        }
+        9 if s[2] == b'.' => {
+            let (neg, whole) = if s[0] == b'-' {
+                (true, parse_decimal_digit(s[1])?)
+            } else {
+                (
+                    false,
+                    parse_decimal_digit(s[0])? * 10 + parse_decimal_digit(s[1])?,
+                )
+            };
+            Some((neg, whole * 1_000_000 + parse_6_digits(&s[3..9])?))
+        }
+        10 if s[3] == b'.' => {
+            let (neg, whole) = if s[0] == b'-' {
+                (
+                    true,
+                    parse_decimal_digit(s[1])? * 10 + parse_decimal_digit(s[2])?,
+                )
+            } else {
+                (
+                    false,
+                    parse_decimal_digit(s[0])? * 100
+                        + parse_decimal_digit(s[1])? * 10
+                        + parse_decimal_digit(s[2])?,
+                )
+            };
+            Some((neg, whole * 1_000_000 + parse_6_digits(&s[4..10])?))
+        }
+        11 if s[0] == b'-' && s[4] == b'.' => {
+            let whole = parse_decimal_digit(s[1])? * 100
+                + parse_decimal_digit(s[2])? * 10
+                + parse_decimal_digit(s[3])?;
+            Some((true, whole * 1_000_000 + parse_6_digits(&s[5..11])?))
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_6_digits(s: &[u8]) -> Option<u64> {
+    debug_assert_eq!(s.len(), 6);
+    Some(
+        parse_decimal_digit(s[0])? * 100_000
+            + parse_decimal_digit(s[1])? * 10_000
+            + parse_decimal_digit(s[2])? * 1_000
+            + parse_decimal_digit(s[3])? * 100
+            + parse_decimal_digit(s[4])? * 10
+            + parse_decimal_digit(s[5])?,
+    )
+}
+
+#[inline]
+fn parse_decimal_digit(b: u8) -> Option<u64> {
+    let digit = b.wrapping_sub(b'0');
+    if digit <= 9 {
+        Some(digit as u64)
+    } else {
+        None
+    }
 }
 
 "#;

@@ -61,16 +61,12 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
 
     let mut structural = Vec::new();
     for (idx, item) in structural_arr.iter().enumerate() {
-        let s = item
-            .as_str()
-            .ok_or(format!(
-                "structural[{}]: expected string, got {}",
-                idx,
-                value_type_name(item)
-            ))?;
-        let byte = parse_string_as_byte(s).map_err(|e| {
-            format!("structural[{}]: {}", idx, e)
-        })?;
+        let s = item.as_str().ok_or(format!(
+            "structural[{}]: expected string, got {}",
+            idx,
+            value_type_name(item)
+        ))?;
+        let byte = parse_string_as_byte(s).map_err(|e| format!("structural[{}]: {}", idx, e))?;
         structural.push(byte);
     }
 
@@ -94,8 +90,8 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         .get("escape_char")
         .and_then(|v| v.as_str())
         .unwrap_or("\\");
-    let escape_char = parse_string_as_byte(escape_char_str)
-        .map_err(|e| format!("'escape_char': {}", e))?;
+    let escape_char =
+        parse_string_as_byte(escape_char_str).map_err(|e| format!("'escape_char': {}", e))?;
 
     let escape = match escape_str {
         "none" | "doubled" => Escape::None,
@@ -104,7 +100,7 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
             return Err(format!(
                 "Invalid 'escape' value: '{}' (must be 'none', 'doubled', or 'backslash')",
                 other
-            ))
+            ));
         }
     };
 
@@ -146,9 +142,7 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
             }
             let (open, close) = (bytes[0], bytes[1]);
             if open == close {
-                return Err(format!(
-                    "nesting[{i}]: open and close byte must differ"
-                ));
+                return Err(format!("nesting[{i}]: open and close byte must differ"));
             }
             for byte in [open, close] {
                 if Some(byte) == quote {
@@ -161,9 +155,7 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
                     return Err(format!("nesting[{i}]: '\\n' cannot be a nesting byte"));
                 }
                 if nesting.iter().any(|&(o, c)| o == byte || c == byte) {
-                    return Err(format!(
-                        "nesting[{i}]: byte appears in more than one pair"
-                    ));
+                    return Err(format!("nesting[{i}]: byte appears in more than one pair"));
                 }
                 if !structural.contains(&byte) {
                     structural.push(byte);
@@ -196,7 +188,9 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
             let index = table
                 .get("index")
                 .and_then(|v| v.as_integer())
-                .ok_or(format!("columns[{i}]: missing required field 'index' (integer)"))?;
+                .ok_or(format!(
+                    "columns[{i}]: missing required field 'index' (integer)"
+                ))?;
             let index = usize::try_from(index)
                 .map_err(|_| format!("columns[{i}]: 'index' must be non-negative"))?;
             let ty = match table.get("type").and_then(|v| v.as_str()) {
@@ -207,12 +201,12 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
                 Some(other) => {
                     return Err(format!(
                         "columns[{i}]: invalid 'type' value '{other}' (must be 'i64', 'f64', 'bytes', or 'string')"
-                    ))
+                    ));
                 }
                 None => {
                     return Err(format!(
                         "columns[{i}]: missing required field 'type' (string)"
-                    ))
+                    ));
                 }
             };
             let name = match table.get("name") {
@@ -227,7 +221,11 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         }
     }
 
-    Ok(Spec { name, dialect, columns })
+    Ok(Spec {
+        name,
+        dialect,
+        columns,
+    })
 }
 
 /// Parse a TOML string value as a single byte using Rust's escape sequences.
@@ -249,7 +247,8 @@ fn parse_string_as_byte(s: &str) -> Result<u8, String> {
     } else {
         return Err(format!(
             "String '{}' is not a single byte (interpreted as {} bytes)",
-            s, bytes.len()
+            s,
+            bytes.len()
         ));
     };
 

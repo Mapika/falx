@@ -8,6 +8,8 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+#[rustfmt::skip]
+mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
 const CARRY_INIT: [u64; 1] = [0];
@@ -38,6 +40,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 fn unsupported_cpu() -> ! {
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
+
 
 
 /// One chunk's tape: separator positions and end entries.
@@ -1274,3 +1277,7 @@ mod avx2 {
         }
     }
 }
+
+}
+
+pub use self::generated::*;

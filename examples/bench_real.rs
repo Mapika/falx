@@ -14,7 +14,11 @@ fn main() -> io::Result<()> {
     let file_size = data.len();
 
     println!("File: {}", file_path);
-    println!("Size: {} bytes ({:.2} MiB)", file_size, file_size as f64 / (1024.0 * 1024.0));
+    println!(
+        "Size: {} bytes ({:.2} MiB)",
+        file_size,
+        file_size as f64 / (1024.0 * 1024.0)
+    );
     println!();
 
     // Warm up + 5 runs

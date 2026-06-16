@@ -10,11 +10,23 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        include:
+          - runner: ubuntu-latest
+            runtime_tests: true
+          - runner: macos-latest
+            runtime_tests: true
+          - runner: ubuntu-24.04-arm
+            runtime_tests: false
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --features cli
+        if: matrix.runtime_tests
+      - run: cargo test --lib --features cli
+        if: ${{ !matrix.runtime_tests }}
       - run: cargo build --release --features cli

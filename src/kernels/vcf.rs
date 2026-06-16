@@ -8,6 +8,8 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+#[rustfmt::skip]
+mod generated {
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
     #[cfg(target_arch = "x86_64")]
@@ -34,6 +36,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 fn unsupported_cpu() -> ! {
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
+
 
 
 /// One chunk's tape: separator positions and end entries.
@@ -1149,3 +1152,7 @@ mod avx2 {
         }
     }
 }
+
+}
+
+pub use self::generated::*;

@@ -8,6 +8,8 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+#[rustfmt::skip]
+mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
 const CARRY_INIT: [u64; 2] = [0, 0];
@@ -38,6 +40,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 fn unsupported_cpu() -> ! {
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
+
 
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
@@ -565,6 +568,248 @@ fn contains_byte(hay: &[u8], needle: u8) -> bool {
     chunks.remainder().contains(&needle)
 }
 
+
+/// logfmt key/value summary emitted by [`parse_logfmt_pairs`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogfmtStats {
+    pub pairs: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    pub checksum: u64,
+}
+
+/// Parse logfmt pairs and return cleaned key/value counters.
+///
+/// This is a generated domain API over the generated structural kernel:
+/// spaces, `=`, and record terminators outside quote regions are streamed
+/// directly into a pair sink, avoiding the generic separator/end tape.
+pub fn parse_logfmt_pairs(data: &[u8]) -> LogfmtStats {
+    let mut sink = LogfmtSink::new(data.len());
+    logfmt_blocks_dispatch(data, &mut sink);
+    sink.finish(data)
+}
+
+/// Parallel [`parse_logfmt_pairs`] over newline-aligned chunks.
+///
+/// The comparable logfmt parser is line-oriented, so every worker owns whole
+/// lines and starts with the normal generated quote/escape carries.
+pub fn parse_logfmt_pairs_par(data: &[u8], threads: usize) -> LogfmtStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 || data.len() < (1 << 20) {
+        return parse_logfmt_pairs(data);
+    }
+
+    let bounds = logfmt_line_bounds(data, threads);
+    let parts: Vec<LogfmtStats> = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .filter_map(|w| {
+                let start = w[0];
+                let end = w[1];
+                (start < end).then(|| {
+                    let slice = &data[start..end];
+                    s.spawn(move || parse_logfmt_pairs(slice))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("logfmt parse thread ok"))
+            .collect()
+    });
+
+    let mut merged = LogfmtStats::default();
+    for part in parts {
+        merged.merge(part);
+    }
+    merged
+}
+
+fn logfmt_line_bounds(data: &[u8], threads: usize) -> Vec<usize> {
+    let approx = data.len() / threads;
+    let mut bounds = vec![0usize; threads + 1];
+    bounds[threads] = data.len();
+    for (i, slot) in bounds[1..threads].iter_mut().enumerate() {
+        let from = ((i + 1) * approx).min(data.len());
+        *slot = match data[from..].iter().position(|&byte| byte == b'\n') {
+            Some(pos) => from + pos + 1,
+            None => data.len(),
+        };
+    }
+    bounds
+}
+
+fn logfmt_blocks_dispatch(data: &[u8], sink: &mut LogfmtSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::logfmt_blocks(data, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::logfmt_blocks(data, sink) };
+        return;
+    }
+    unsupported_cpu()
+}
+
+struct LogfmtSink {
+    data_len: usize,
+    record_start: usize,
+    field_start: usize,
+    key_start: usize,
+    key_end: usize,
+    has_key: bool,
+    stats: LogfmtStats,
+}
+
+impl LogfmtSink {
+    fn new(data_len: usize) -> Self {
+        Self {
+            data_len,
+            record_start: 0,
+            field_start: 0,
+            key_start: 0,
+            key_end: 0,
+            has_key: false,
+            stats: LogfmtStats::default(),
+        }
+    }
+
+    #[inline(always)]
+    fn drive(&mut self, data: &[u8], mut structural: u64, term: u64, base: usize) {
+        while structural != 0 {
+            let bit = structural & structural.wrapping_neg();
+            let idx = bit.trailing_zeros() as usize;
+            let end = base + idx;
+            let is_term = (term & bit) != 0;
+            let field_end =
+                if is_term && end > self.record_start && data[end.saturating_sub(1)] == b'\r' {
+                    end - 1
+                } else {
+                    end
+                };
+            self.field(data, field_end);
+            self.field_start = end + 1;
+            if is_term {
+                self.has_key = false;
+                self.record_start = end + 1;
+            }
+            structural &= structural - 1;
+        }
+    }
+
+    #[inline(always)]
+    fn field(&mut self, data: &[u8], end: usize) {
+        if self.has_key {
+            // SAFETY: all offsets come from structural positions in `data`;
+            // `finish` passes at most `data_len`.
+            let key = unsafe { data.get_unchecked(self.key_start..self.key_end) };
+            // SAFETY: `field_start` and `end` are in the same bounded record.
+            let value = unsafe { data.get_unchecked(self.field_start..end) };
+            add_logfmt_pair(
+                &mut self.stats,
+                key,
+                value,
+            );
+            self.has_key = false;
+        } else {
+            self.key_start = self.field_start;
+            self.key_end = end;
+            self.has_key = true;
+        }
+    }
+
+    fn finish(mut self, data: &[u8]) -> LogfmtStats {
+        if self.field_start < self.data_len
+            || (self.data_len > 0 && data[self.data_len - 1] != b'\n')
+        {
+            let end = if self.data_len > self.record_start && data[self.data_len - 1] == b'\r' {
+                self.data_len - 1
+            } else {
+                self.data_len
+            };
+            self.field(data, end);
+        }
+        self.stats
+    }
+}
+
+impl LogfmtStats {
+    fn merge(&mut self, other: Self) {
+        self.pairs += other.pairs;
+        self.key_bytes += other.key_bytes;
+        self.value_bytes += other.value_bytes;
+        self.checksum = self.checksum.wrapping_add(other.checksum);
+    }
+}
+
+#[inline(always)]
+fn add_logfmt_pair(stats: &mut LogfmtStats, key: &[u8], value: &[u8]) {
+    stats.pairs += 1;
+    stats.key_bytes += key.len() as u64;
+    stats.checksum = logfmt_checksum_bytes(stats.checksum, key);
+    add_logfmt_value(stats, value);
+}
+
+#[inline]
+fn add_logfmt_value(stats: &mut LogfmtStats, value: &[u8]) {
+    const Q: u8 = b'"';
+    const E: u8 = b'\\';
+    if value.first() != Some(&Q) {
+        stats.value_bytes += value.len() as u64;
+        stats.checksum = logfmt_checksum_bytes(stats.checksum, value);
+        return;
+    }
+
+    let body = if value.len() >= 2 && value[value.len() - 1] == Q {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if !contains_byte(body, E) {
+        stats.value_bytes += body.len() as u64;
+        stats.checksum = logfmt_checksum_bytes(stats.checksum, body);
+        return;
+    }
+    
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == E && i + 1 < body.len() {
+            stats.value_bytes += 1;
+            stats.checksum = stats.checksum.wrapping_add(body[i + 1] as u64);
+            i += 2;
+        } else {
+            stats.value_bytes += 1;
+            stats.checksum = stats.checksum.wrapping_add(body[i] as u64);
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn logfmt_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        let pairs = (word & 0x00ff_00ff_00ff_00ff) + ((word >> 8) & 0x00ff_00ff_00ff_00ff);
+        let quads = (pairs & 0x0000_ffff_0000_ffff) + ((pairs >> 16) & 0x0000_ffff_0000_ffff);
+        checksum = checksum.wrapping_add((quads & 0x0000_0000_ffff_ffff) + (quads >> 32));
+    }
+    for &byte in chunks.remainder() {
+        checksum = checksum.wrapping_add(byte as u64);
+    }
+    checksum
+}
+
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use std::arch::x86_64::*;
@@ -666,6 +911,37 @@ mod avx512 {
         // SAFETY: block is a readable 64-byte buffer.
         let (mask, term) = unsafe { step(block.as_ptr(), carries) };
         push_tape(mask & live, term & live, base, seps, ends);
+    }
+
+    /// Fused logfmt pair-stat driver: structural masks feed the pair sink
+    /// directly, avoiding the generic separator/end tape for this domain API.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub fn logfmt_blocks(data: &[u8], sink: &mut super::LogfmtSink) {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(data, m0, t0, offset);
+            let (m1, t1) = unsafe { step(data.as_ptr().add(offset + 64), &mut carries) };
+            sink.drive(data, m1, t1, offset + 64);
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(data, mask, term, offset);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(data, mask & live, term & live, offset);
+        }
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
@@ -842,6 +1118,37 @@ mod avx2 {
         push_tape(mask & live, term & live, base, seps, ends);
     }
 
+    /// Fused logfmt pair-stat driver: structural masks feed the pair sink
+    /// directly, avoiding the generic separator/end tape for this domain API.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn logfmt_blocks(data: &[u8], sink: &mut super::LogfmtSink) {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(data, m0, t0, offset);
+            let (m1, t1) = unsafe { step(data.as_ptr().add(offset + 64), &mut carries) };
+            sink.drive(data, m1, t1, offset + 64);
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(data, mask, term, offset);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(data, mask & live, term & live, offset);
+        }
+    }
+
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
@@ -912,3 +1219,7 @@ mod avx2 {
         }
     }
 }
+
+}
+
+pub use self::generated::*;

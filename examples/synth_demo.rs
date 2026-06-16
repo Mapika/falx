@@ -12,8 +12,8 @@
 use falx::interp;
 use falx::ir::Graph;
 use falx::synth::{
-    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, MultiSpec, Order,
-    Outcome, ProveOutcome, Solution, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
+    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, MultiSpec, Order, Outcome,
+    ProveOutcome, Solution, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
 };
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
@@ -198,7 +198,11 @@ fn prove_report(graph: &Graph, fsm: &Fsm) {
 
 /// The escaped-positions serial machine, as an explicit FSM for the prover.
 fn escaped_fsm_step(state: u32, byte: u8) -> (u32, bool) {
-    if byte == b'\\' { (state ^ 1, false) } else { (0, state == 1) }
+    if byte == b'\\' {
+        (state ^ 1, false)
+    } else {
+        (0, state == 1)
+    }
 }
 
 /// falx's hand-derived `escaped_positions` graph (formats.rs history),
@@ -262,7 +266,13 @@ fn main() {
             let next = if byte == b'"' { state ^ 1 } else { state };
             (next, next == 1)
         };
-        prove_report(&sol.graph, &Fsm { initial: 0, step: &step });
+        prove_report(
+            &sol.graph,
+            &Fsm {
+                initial: 0,
+                step: &step,
+            },
+        );
     }
 
     // --- Rung 2: unquoted structurals (the CSV core) ------------------------
@@ -453,7 +463,13 @@ fn main() {
     );
     if let Some(sol) = report("escaped positions (continued)", "as above", outcome) {
         check_vs_hand(&sol);
-        prove_report(&sol.graph, &Fsm { initial: 0, step: &escaped_fsm_step });
+        prove_report(
+            &sol.graph,
+            &Fsm {
+                initial: 0,
+                step: &escaped_fsm_step,
+            },
+        );
     }
 
     // --- Rung 6b: same target, but the system invents its own vocabulary ---
@@ -501,11 +517,7 @@ fn main() {
     }
     match solution {
         Some(sol) => {
-            println!(
-                "  FOUND in round {}: {}",
-                reports.len() + 1,
-                sol.expr
-            );
+            println!("  FOUND in round {}: {}", reports.len() + 1, sol.expr);
             println!(
                 "         tree {}, {} graph nodes, verified on {} fresh inputs, {:.1}s total",
                 sol.tree_size,
@@ -514,10 +526,19 @@ fn main() {
                 sol.stats.elapsed_ms as f64 / 1000.0,
             );
             check_vs_hand(&sol);
-            prove_report(&sol.graph, &Fsm { initial: 0, step: &escaped_fsm_step });
+            prove_report(
+                &sol.graph,
+                &Fsm {
+                    initial: 0,
+                    step: &escaped_fsm_step,
+                },
+            );
         }
         None => {
-            println!("  NOT FOUND within {} rounds — honest frontier above.", auto.rounds);
+            println!(
+                "  NOT FOUND within {} rounds — honest frontier above.",
+                auto.rounds
+            );
             println!();
         }
     }
@@ -548,8 +569,11 @@ fn main() {
             progress: false,
         },
     );
-    if let Some(sol) = report("escaped positions, quote-only care (continued)", "as above", care_outcome)
-    {
+    if let Some(sol) = report(
+        "escaped positions, quote-only care (continued)",
+        "as above",
+        care_outcome,
+    ) {
         // Equality vs the hand graph holds only at quote bytes; compare there.
         let hand = hand_escape_graph();
         let mut rng = Rng(0xC0FF_EE00_C0FF_EE00);
@@ -563,7 +587,10 @@ fn main() {
             interp::run(&sol.graph, &input, &mut a);
             interp::run(&hand, &input, &mut b);
             let quotes_only = |v: &[u32]| -> Vec<u32> {
-                v.iter().copied().filter(|&p| input[p as usize] == b'"').collect()
+                v.iter()
+                    .copied()
+                    .filter(|&p| input[p as usize] == b'"')
+                    .collect()
             };
             assert_eq!(
                 quotes_only(&a),
@@ -658,7 +685,10 @@ fn main() {
                 leaves: &[Leaf::class("Q", b"\"")],
                 spec: Spec::exact(&real_quotes_ref),
             },
-            MultiSpec { leaves: &[], spec: Spec::exact(&in_string_json_ref) },
+            MultiSpec {
+                leaves: &[],
+                spec: Spec::exact(&in_string_json_ref),
+            },
             MultiSpec {
                 leaves: &[Leaf::class("Struct", b"{}[],:")],
                 spec: Spec::exact(&json_structurals_ref),

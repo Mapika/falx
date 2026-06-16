@@ -5,8 +5,8 @@
 
 use falx::ir::Graph;
 use falx::synth::{
-    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, MultiSpec, Order,
-    Outcome, ProveOutcome, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
+    AutoBudget, AutoOutcome, Budget, CostModel, Fsm, Leaf, MultiOutcome, MultiSpec, Order, Outcome,
+    ProveOutcome, Spec, prove, synthesize, synthesize_auto, synthesize_multi,
 };
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
@@ -132,7 +132,7 @@ fn assisted_escape_rediscovery_stays_green() {
             max_bank: 2_000_000,
             settle_levels: 0,
             cost: CostModel::avx2(),
-        order: Order::TreeSize,
+            order: Order::TreeSize,
             progress: false,
         },
     );
@@ -140,9 +140,11 @@ fn assisted_escape_rediscovery_stays_green() {
     match outcome {
         Outcome::Found(solution) => {
             // Must succeed.
-            assert!(solution.dag_nodes <= 12,
+            assert!(
+                solution.dag_nodes <= 12,
                 "solution has {} nodes, expected <= 12",
-                solution.dag_nodes);
+                solution.dag_nodes
+            );
         }
         Outcome::NotFound(stats) => {
             panic!(
@@ -200,7 +202,7 @@ fn found_escape_kernel_is_proven() {
             max_bank: 2_000_000,
             settle_levels: 0,
             cost: CostModel::avx2(),
-        order: Order::TreeSize,
+            order: Order::TreeSize,
             progress: false,
         },
     );
@@ -266,7 +268,7 @@ fn from_scratch_discovery_stays_green() {
                 max_bank: 4_000_000,
                 settle_levels: 1,
                 cost: CostModel::avx2(),
-        order: Order::TreeSize,
+                order: Order::TreeSize,
                 progress: false,
             },
             promotions: 8,
@@ -276,9 +278,11 @@ fn from_scratch_discovery_stays_green() {
 
     match outcome {
         AutoOutcome::Found(solution, _reports) => {
-            assert!(solution.dag_nodes <= 12,
+            assert!(
+                solution.dag_nodes <= 12,
                 "automatic solution has {} nodes, expected <= 12",
-                solution.dag_nodes);
+                solution.dag_nodes
+            );
         }
         AutoOutcome::NotFound(_reports) => {
             panic!("automatic abstraction discovery failed");
@@ -304,9 +308,19 @@ fn dont_care_escape_form_is_exact_on_non_escape_bytes() {
     let masked = g.and(not_b, form);
     g.set_output(masked);
     let step = |state: u32, byte: u8| -> (u32, bool) {
-        if byte == b'\\' { (state ^ 1, false) } else { (0, state == 1) }
+        if byte == b'\\' {
+            (state ^ 1, false)
+        } else {
+            (0, state == 1)
+        }
     };
-    match prove(&g, &Fsm { initial: 0, step: &step }) {
+    match prove(
+        &g,
+        &Fsm {
+            initial: 0,
+            step: &step,
+        },
+    ) {
         ProveOutcome::Proven(proof) => assert!(proof.product_states <= 1024),
         ProveOutcome::Refuted(witness) => panic!("refuted by {witness:?}"),
         ProveOutcome::Aborted { explored } => panic!("aborted at {explored}"),
@@ -354,12 +368,18 @@ fn csv_trio_multi_output_stays_green() {
     match synthesize_multi(
         &corpus,
         &[
-            MultiSpec { leaves: &[Leaf::class("Q", b"\"")], spec: Spec::exact(&in_string_ref) },
+            MultiSpec {
+                leaves: &[Leaf::class("Q", b"\"")],
+                spec: Spec::exact(&in_string_ref),
+            },
             MultiSpec {
                 leaves: &[Leaf::class("Struct", b",\n")],
                 spec: Spec::exact(&structural_ref),
             },
-            MultiSpec { leaves: &[Leaf::class("N", b"\n")], spec: Spec::exact(&terminator_ref) },
+            MultiSpec {
+                leaves: &[Leaf::class("N", b"\n")],
+                spec: Spec::exact(&terminator_ref),
+            },
         ],
         &Budget {
             max_level: 6,

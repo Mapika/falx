@@ -77,13 +77,14 @@ fn main() {
     };
 
     // Generate the full parser (indexer + span API + any declared columns).
-    let generated = match codegen::emit_parser_with_columns(&spec.dialect, &spec.name, &spec.columns) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("Error generating code: {}", e);
-            process::exit(1);
-        }
-    };
+    let generated =
+        match codegen::emit_parser_with_columns(&spec.dialect, &spec.name, &spec.columns) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("Error generating code: {}", e);
+                process::exit(1);
+            }
+        };
 
     // Write output.
     if let Some(out_path) = output_path {

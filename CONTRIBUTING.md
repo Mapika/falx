@@ -21,6 +21,8 @@ pub fn pipe_dialect() -> Dialect {
         structural: vec![b'|', b'\n'],
         quote: Some(b'"'),
         escape: Escape::None,  // Doubled-quote (RFC 4180 style)
+        comment: None,
+        nesting: vec![],
     }
 }
 ```

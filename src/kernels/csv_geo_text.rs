@@ -8,6 +8,8 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+#[rustfmt::skip]
+mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
 const CARRY_INIT: [u64; 1] = [0];
@@ -38,6 +40,27 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 fn unsupported_cpu() -> ! {
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
+
+fn quote_parity_dispatch(data: &[u8], seed: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::quote_parity(data, seed) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::quote_parity(data, seed) };
+    }
+    unsupported_cpu();
+}
+
 
 
 /// One chunk's tape: separator positions and end entries.
@@ -1081,7 +1104,7 @@ pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
                 let barrier = &barrier;
                 s.spawn(move || {
                     use std::sync::atomic::Ordering::Relaxed;
-                    parity[t].store(data[start..end].iter().filter(|&&b| b == 34u8).count() as u64 & 1, Relaxed);
+                    parity[t].store(quote_parity_dispatch(&data[start..end], 0) & 1, Relaxed);
                     barrier.wait();
                     // Seed = quote parity of every preceding chunk.
                     let seed = parity[..t]
@@ -1142,11 +1165,16 @@ fn append_bitmap(dst: &mut Vec<u64>, dst_rows: usize, src: &[u64], src_rows: usi
 /// else (long mantissas, big exponents, inf/nan spellings, malformed
 /// cells) falls through to `str::parse`, which has been Eisel-Lemire in
 /// std since Rust 1.55 -- the fallback is rarely taken, not slow.
+#[inline(always)]
 fn parse_f64_cell(s: &[u8]) -> Option<f64> {
     const POW10: [f64; 23] = [
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
         1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
     ];
+    if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s) {
+        let value = mantissa as f64 / 1_000_000.0;
+        return Some(if neg { -value } else { value });
+    }
     let (neg, rest) = match s.split_first() {
         Some((&b'-', rest)) => (true, rest),
         Some((&b'+', rest)) => (false, rest),
@@ -1216,6 +1244,73 @@ fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
     std::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
+#[inline]
+fn parse_fixed_6_decimal_signed(s: &[u8]) -> Option<(bool, u64)> {
+    match s.len() {
+        8 if s[1] == b'.' => {
+            let mantissa = parse_decimal_digit(s[0])? * 1_000_000 + parse_6_digits(&s[2..8])?;
+            Some((false, mantissa))
+        }
+        9 if s[2] == b'.' => {
+            let (neg, whole) = if s[0] == b'-' {
+                (true, parse_decimal_digit(s[1])?)
+            } else {
+                (
+                    false,
+                    parse_decimal_digit(s[0])? * 10 + parse_decimal_digit(s[1])?,
+                )
+            };
+            Some((neg, whole * 1_000_000 + parse_6_digits(&s[3..9])?))
+        }
+        10 if s[3] == b'.' => {
+            let (neg, whole) = if s[0] == b'-' {
+                (
+                    true,
+                    parse_decimal_digit(s[1])? * 10 + parse_decimal_digit(s[2])?,
+                )
+            } else {
+                (
+                    false,
+                    parse_decimal_digit(s[0])? * 100
+                        + parse_decimal_digit(s[1])? * 10
+                        + parse_decimal_digit(s[2])?,
+                )
+            };
+            Some((neg, whole * 1_000_000 + parse_6_digits(&s[4..10])?))
+        }
+        11 if s[0] == b'-' && s[4] == b'.' => {
+            let whole = parse_decimal_digit(s[1])? * 100
+                + parse_decimal_digit(s[2])? * 10
+                + parse_decimal_digit(s[3])?;
+            Some((true, whole * 1_000_000 + parse_6_digits(&s[5..11])?))
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_6_digits(s: &[u8]) -> Option<u64> {
+    debug_assert_eq!(s.len(), 6);
+    Some(
+        parse_decimal_digit(s[0])? * 100_000
+            + parse_decimal_digit(s[1])? * 10_000
+            + parse_decimal_digit(s[2])? * 1_000
+            + parse_decimal_digit(s[3])? * 100
+            + parse_decimal_digit(s[4])? * 10
+            + parse_decimal_digit(s[5])?,
+    )
+}
+
+#[inline]
+fn parse_decimal_digit(b: u8) -> Option<u64> {
+    let digit = b.wrapping_sub(b'0');
+    if digit <= 9 {
+        Some(digit as u64)
+    } else {
+        None
+    }
+}
+
 /// Append `raw` cleaned: outer quotes stripped, doubled quotes
 /// collapsed. Unquoted cells are one memcpy.
 fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
@@ -1245,6 +1340,377 @@ fn parse_f64_field(raw: &[u8]) -> Option<f64> {
     } else {
         parse_f64_cell(raw)
     }
+}
+
+
+/// CSV geo projection summary emitted by [`parse_csv_geo_text_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CsvGeoTextStats {
+    pub records: u64,
+pub city_values: u64,
+pub city_bytes: u64,
+pub city_checksum: u64,
+    pub latitude_values: u64,
+    pub longitude_values: u64,
+    pub latitude_checksum: u64,
+    pub longitude_checksum: u64,
+}
+
+/// Parse CSV geo rows and accumulate the benchmark projection directly.
+///
+/// This generated domain API uses the same SIMD structural stream as
+/// [`parse_columns`], but avoids materializing column vectors, string
+/// offsets, and validity bitmaps that aggregate benchmarks immediately
+/// walk again.
+pub fn parse_csv_geo_text_stats(data: &[u8]) -> CsvGeoTextStats {
+    let mut sink = CsvGeoTextStatsSink::new(data, 0, data.len() as u32, true);
+    index_csv_geo_text_stats_dispatch(data, 0, 0, &mut sink);
+    sink.finish()
+}
+
+/// Parallel [`parse_csv_geo_text_stats`] using the same record-ownership contract as
+/// [`parse_columns_par`].
+pub fn parse_csv_geo_text_stats_par(data: &[u8], threads: usize) -> CsvGeoTextStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse_csv_geo_text_stats(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| {
+            if t == threads {
+                data.len()
+            } else {
+                (t * chunk).min(data.len())
+            }
+        })
+        .collect();
+    let parity: Vec<std::sync::atomic::AtomicU64> =
+        (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let barrier = std::sync::Barrier::new(threads);
+    let parts: Vec<CsvGeoTextStats> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (start, end) = (bounds[t], bounds[t + 1]);
+                let parity = &parity;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    parity[t].store(quote_parity_dispatch(&data[start..end], 0) & 1, Relaxed);
+                    barrier.wait();
+                    let seed = parity[..t]
+                        .iter()
+                        .fold(0u64, |acc, p| acc ^ p.load(Relaxed))
+                        .wrapping_neg();
+                    let mut sink = CsvGeoTextStatsSink::new(data, start as u32, end as u32, t == 0);
+                    index_csv_geo_text_stats_dispatch(data, seed, start, &mut sink);
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("csv geo text stats thread ok"))
+            .collect()
+    });
+    let mut stats = CsvGeoTextStats::default();
+    for part in parts {
+        stats.merge(part);
+    }
+    stats
+}
+
+fn index_csv_geo_text_stats_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut CsvGeoTextStatsSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_csv_geo_text_stats(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_csv_geo_text_stats(data, seed, start, sink) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+pub(crate) struct CsvGeoTextStatsSink<'a> {
+    data: &'a [u8],
+    stats: CsvGeoTextStats,
+    field_start: u32,
+    record_start: u32,
+    ordinal: u32,
+    pending: [(u32, u32); 3],
+    found: u32,
+    end: u32,
+    emitting: bool,
+    pub(crate) done: bool,
+}
+
+impl<'a> CsvGeoTextStatsSink<'a> {
+    fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> Self {
+        Self {
+            data,
+            stats: CsvGeoTextStats::default(),
+            field_start: start,
+            record_start: start,
+            ordinal: 0,
+            pending: [(0, 0); 3],
+            found: 0,
+            end,
+            emitting,
+            done: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {
+        let mut m = mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros();
+            if term & bit != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+1 => {
+self.pending[0] = (self.field_start, p);
+self.found |= 1;
+}
+                    5 => {
+                        self.pending[1] = (self.field_start, p);
+                        self.found |= 2;
+                    }
+                    6 => {
+                        self.pending[2] = (self.field_start, p);
+                        self.found |= 4;
+                    }
+                    _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    fn flush(&mut self, end: u32) {
+        let data = self.data;
+        let to = if end > self.record_start && data[end as usize - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        match self.ordinal {
+1 => {
+self.pending[0] = (self.field_start, to);
+self.found |= 1;
+}
+            5 => {
+                self.pending[1] = (self.field_start, to);
+                self.found |= 2;
+            }
+            6 => {
+                self.pending[2] = (self.field_start, to);
+                self.found |= 4;
+            }
+            _ => {}
+        }
+
+        self.stats.records += 1;
+let (from, to) = self.pending[0];
+if self.found & 1 != 0 {
+let (bytes, checksum) = csv_geo_checksum_clean_field(&data[from as usize..to as usize]);
+self.stats.city_values += 1;
+self.stats.city_bytes += bytes;
+self.stats.city_checksum = self.stats.city_checksum.wrapping_add(checksum);
+}
+        let (from, to) = self.pending[1];
+        if self.found & 2 != 0
+            && let Some(value) = parse_f64_field(&data[from as usize..to as usize])
+        {
+            self.stats.latitude_values += 1;
+            self.stats.latitude_checksum = self.stats.latitude_checksum.wrapping_add(value.to_bits());
+        }
+        let (from, to) = self.pending[2];
+        if self.found & 4 != 0
+            && let Some(value) = parse_f64_field(&data[from as usize..to as usize])
+        {
+            self.stats.longitude_values += 1;
+            self.stats.longitude_checksum =
+                self.stats.longitude_checksum.wrapping_add(value.to_bits());
+        }
+    }
+
+    fn finish(mut self) -> CsvGeoTextStats {
+        let len = self.data.len() as u32;
+        if self.emitting && !self.done && self.record_start < len {
+            self.flush(len);
+        }
+        self.stats
+    }
+}
+
+impl CsvGeoTextStats {
+    fn merge(&mut self, other: Self) {
+        self.records += other.records;
+self.city_values += other.city_values;
+self.city_bytes += other.city_bytes;
+self.city_checksum = self.city_checksum.wrapping_add(other.city_checksum);
+        self.latitude_values += other.latitude_values;
+        self.longitude_values += other.longitude_values;
+        self.latitude_checksum = self.latitude_checksum.wrapping_add(other.latitude_checksum);
+        self.longitude_checksum = self.longitude_checksum.wrapping_add(other.longitude_checksum);
+    }
+}
+
+
+fn csv_geo_checksum_clean_field(raw: &[u8]) -> (u64, u64) {
+    const Q: u8 = 34u8;
+    if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {
+        let inner = &raw[1..raw.len() - 1];
+        if !contains_byte(inner, Q) {
+            return (inner.len() as u64, csv_geo_checksum_bytes(inner));
+        }
+        let mut bytes = 0u64;
+        let mut checksum = 0u64;
+        let mut i = 0;
+        while i < inner.len() {
+            bytes += 1;
+            checksum = checksum.wrapping_add(inner[i] as u64);
+            if inner[i] == Q && i + 1 < inner.len() && inner[i + 1] == Q {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        return (bytes, checksum);
+    }
+    (raw.len() as u64, csv_geo_checksum_bytes(raw))
+}
+
+#[inline]
+fn csv_geo_checksum_bytes(bytes: &[u8]) -> u64 {
+    match bytes.len() {
+        0 => 0,
+        1 => bytes[0] as u64,
+        2 => bytes[0] as u64 + bytes[1] as u64,
+        3 => bytes[0] as u64 + bytes[1] as u64 + bytes[2] as u64,
+        4 => bytes[0] as u64 + bytes[1] as u64 + bytes[2] as u64 + bytes[3] as u64,
+        5 => {
+            bytes[0] as u64
+                + bytes[1] as u64
+                + bytes[2] as u64
+                + bytes[3] as u64
+                + bytes[4] as u64
+        }
+        6 => {
+            bytes[0] as u64
+                + bytes[1] as u64
+                + bytes[2] as u64
+                + bytes[3] as u64
+                + bytes[4] as u64
+                + bytes[5] as u64
+        }
+        7 => {
+            bytes[0] as u64
+                + bytes[1] as u64
+                + bytes[2] as u64
+                + bytes[3] as u64
+                + bytes[4] as u64
+                + bytes[5] as u64
+                + bytes[6] as u64
+        }
+        8 => csv_geo_checksum_first_8(bytes),
+        9 => csv_geo_checksum_first_8(bytes) + bytes[8] as u64,
+        10 => csv_geo_checksum_first_8(bytes) + bytes[8] as u64 + bytes[9] as u64,
+        11 => csv_geo_checksum_first_8(bytes) + bytes[8] as u64 + bytes[9] as u64 + bytes[10] as u64,
+        12 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+        }
+        13 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+                + bytes[12] as u64
+        }
+        14 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+                + bytes[12] as u64
+                + bytes[13] as u64
+        }
+        15 => {
+            csv_geo_checksum_first_8(bytes)
+                + bytes[8] as u64
+                + bytes[9] as u64
+                + bytes[10] as u64
+                + bytes[11] as u64
+                + bytes[12] as u64
+                + bytes[13] as u64
+                + bytes[14] as u64
+        }
+        16 => csv_geo_checksum_first_8(bytes) + csv_geo_checksum_first_8(&bytes[8..]),
+        _ => csv_geo_checksum_long(bytes),
+    }
+}
+
+#[inline]
+fn csv_geo_checksum_first_8(bytes: &[u8]) -> u64 {
+    debug_assert!(bytes.len() >= 8);
+    // SAFETY: callers pass at least 8 bytes; unaligned loads are allowed.
+    let word = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<u64>()) };
+    csv_geo_checksum_word(word)
+}
+
+#[inline]
+fn csv_geo_checksum_long(bytes: &[u8]) -> u64 {
+    let mut checksum = 0u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        checksum = checksum.wrapping_add(csv_geo_checksum_word(word));
+    }
+    for &byte in chunks.remainder() {
+        checksum = checksum.wrapping_add(byte as u64);
+    }
+    checksum
+}
+
+#[inline]
+fn csv_geo_checksum_word(word: u64) -> u64 {
+    let pairs = (word & 0x00ff_00ff_00ff_00ff) + ((word >> 8) & 0x00ff_00ff_00ff_00ff);
+    let quads = (pairs & 0x0000_ffff_0000_ffff) + ((pairs >> 16) & 0x0000_ffff_0000_ffff);
+    (quads & 0x0000_0000_ffff_ffff) + (quads >> 32)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1373,6 +1839,29 @@ mod avx512 {
         carries[0]
     }
 
+    /// Scan a chunk only far enough to recover the generated quote-region
+    /// carry. Used by parallel fused stats paths to seed workers without a
+    /// scalar quote-count prepass.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub fn quote_parity(data: &[u8], seed: u64) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        carries[0] = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let _ = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer.
+            let _ = unsafe { step(block.as_ptr(), &mut carries) };
+        }
+        carries[0]
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
@@ -1403,6 +1892,34 @@ mod avx512 {
     /// sink completes its record range.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(mask & live, term & live, offset as u32);
+        }
+    }
+
+    /// Fused projection driver: structural masks go straight into the
+    /// CSV geo text stats sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub(crate) fn index_csv_geo_text_stats(data: &[u8], seed: u64, start: usize, sink: &mut super::CsvGeoTextStatsSink) {
         let mut carries = [seed];
         let mut offset = start;
         while offset + 64 <= data.len() {
@@ -1616,6 +2133,29 @@ mod avx2 {
         carries[0]
     }
 
+    /// Scan a chunk only far enough to recover the generated quote-region
+    /// carry. Used by parallel fused stats paths to seed workers without a
+    /// scalar quote-count prepass.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn quote_parity(data: &[u8], seed: u64) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        carries[0] = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let _ = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer.
+            let _ = unsafe { step(block.as_ptr(), &mut carries) };
+        }
+        carries[0]
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
@@ -1646,6 +2186,34 @@ mod avx2 {
     /// sink completes its record range.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(mask & live, term & live, offset as u32);
+        }
+    }
+
+    /// Fused projection driver: structural masks go straight into the
+    /// CSV geo text stats sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub(crate) fn index_csv_geo_text_stats(data: &[u8], seed: u64, start: usize, sink: &mut super::CsvGeoTextStatsSink) {
         let mut carries = [seed];
         let mut offset = start;
         while offset + 64 <= data.len() {
@@ -1732,3 +2300,7 @@ mod avx2 {
         }
     }
 }
+
+}
+
+pub use self::generated::*;

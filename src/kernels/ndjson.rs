@@ -8,6 +8,8 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+#[rustfmt::skip]
+mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
 const CARRY_INIT: [u64; 2] = [0, 0];
@@ -38,6 +40,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 fn unsupported_cpu() -> ! {
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
+
 
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
@@ -565,6 +568,104 @@ fn contains_byte(hay: &[u8], needle: u8) -> bool {
     chunks.remainder().contains(&needle)
 }
 
+
+/// NDJSON line-framing summary emitted by [`parse_ndjson_lines`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NdjsonLineStats {
+    pub records: u64,
+}
+
+/// Count NDJSON records directly from the generated quote/escape-aware
+/// newline stream without materializing the span tape.
+pub fn parse_ndjson_lines(data: &[u8]) -> NdjsonLineStats {
+    let mut records = index_ndjson_lines_dispatch(data);
+    if ndjson_has_trailing_record(data) {
+        records += 1;
+    }
+    NdjsonLineStats { records }
+}
+
+/// Parallel [`parse_ndjson_lines`] over newline-aligned chunks.
+///
+/// NDJSON records are JSON texts separated by raw newlines; a valid record
+/// cannot contain an unescaped newline inside a string. Aligning chunks just
+/// after raw newlines therefore lets every worker start from the normal
+/// generated quote/escape state while still using the generated scanner.
+pub fn parse_ndjson_lines_par(data: &[u8], threads: usize) -> NdjsonLineStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 || data.is_empty() {
+        return parse_ndjson_lines(data);
+    }
+    let bounds = ndjson_line_bounds(data, threads);
+    if bounds.len() <= 2 {
+        return parse_ndjson_lines(data);
+    }
+    let records: u64 = std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .map(|range| {
+                let slice = &data[range[0]..range[1]];
+                s.spawn(move || index_ndjson_lines_dispatch(slice))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("ndjson line thread ok"))
+            .sum()
+    });
+    NdjsonLineStats {
+        records: records + ndjson_has_trailing_record(data) as u64,
+    }
+}
+
+fn index_ndjson_lines_dispatch(data: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::index_ndjson_lines(data) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::index_ndjson_lines(data) };
+    }
+    unsupported_cpu();
+}
+
+fn ndjson_has_trailing_record(data: &[u8]) -> bool {
+    !data.is_empty() && data.last().copied() != Some(b'\n')
+}
+
+fn ndjson_line_bounds(data: &[u8], threads: usize) -> Vec<usize> {
+    if data.is_empty() {
+        return vec![0];
+    }
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return vec![0, data.len()];
+    }
+    let mut bounds = Vec::with_capacity(threads + 1);
+    bounds.push(0);
+    for t in 1..threads {
+        let mut bound = (t * chunk).min(data.len());
+        while bound < data.len() && data[bound - 1] != b'\n' {
+            bound += 1;
+        }
+        if bound > *bounds.last().expect("initial bound") && bound < data.len() {
+            bounds.push(bound);
+        }
+    }
+    bounds.push(data.len());
+    bounds
+}
+
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use std::arch::x86_64::*;
@@ -666,6 +767,38 @@ mod avx512 {
         // SAFETY: block is a readable 64-byte buffer.
         let (mask, term) = unsafe { step(block.as_ptr(), carries) };
         push_tape(mask & live, term & live, base, seps, ends);
+    }
+
+    /// Count NDJSON line terminators with the generated quote/escape-aware
+    /// newline step.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub fn index_ndjson_lines(data: &[u8]) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        let mut count = 0u64;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (_, t0) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            let (_, t1) = unsafe { step(data.as_ptr().add(offset + 64), &mut carries) };
+            count += t0.count_ones() as u64 + t1.count_ones() as u64;
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (_, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            count += term.count_ones() as u64;
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (_, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            count += (term & live).count_ones() as u64;
+        }
+        count
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
@@ -841,6 +974,38 @@ mod avx2 {
         push_tape(mask & live, term & live, base, seps, ends);
     }
 
+    /// Count NDJSON line terminators with the generated quote/escape-aware
+    /// newline step.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn index_ndjson_lines(data: &[u8]) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        let mut count = 0u64;
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (_, t0) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            let (_, t1) = unsafe { step(data.as_ptr().add(offset + 64), &mut carries) };
+            count += t0.count_ones() as u64 + t1.count_ones() as u64;
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (_, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            count += term.count_ones() as u64;
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (_, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            count += (term & live).count_ones() as u64;
+        }
+        count
+    }
+
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
@@ -910,3 +1075,7 @@ mod avx2 {
         }
     }
 }
+
+}
+
+pub use self::generated::*;

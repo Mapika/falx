@@ -8,6 +8,8 @@
 // Also exposes a span API: `parse(data)` -> `records()` -> `field(i)`,
 // with dialect-aware quote stripping and escape resolution.
 
+#[rustfmt::skip]
+mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
 const CARRY_INIT: [u64; 1] = [0];
@@ -38,6 +40,27 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
 fn unsupported_cpu() -> ! {
     panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
 }
+
+fn quote_parity_dispatch(data: &[u8], seed: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::quote_parity(data, seed) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::quote_parity(data, seed) };
+    }
+    unsupported_cpu();
+}
+
 
 
 /// One chunk's tape: separator positions and end entries.
@@ -827,6 +850,205 @@ fn contains_byte(hay: &[u8], needle: u8) -> bool {
     chunks.remainder().contains(&needle)
 }
 
+
+/// Fused field-byte summary emitted by [`parse_field_bytes`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FieldByteStats {
+    pub fields: u64,
+    pub bytes: u64,
+}
+
+/// Sum decoded field byte lengths directly from the generated structural
+/// stream.
+///
+/// This keeps the benchmark on the same semantic surface as
+/// `records().flat_map(fields...)`, but avoids building a tape and then
+/// walking it again.
+pub fn parse_field_bytes(data: &[u8]) -> FieldByteStats {
+    let mut sink = FieldByteSink::new(data, 0, data.len() as u32, true);
+    index_field_bytes_dispatch(data, 0, 0, &mut sink);
+    sink.finish()
+}
+
+/// Parallel [`parse_field_bytes`] using the same record-ownership contract as
+/// [`parse_par`].
+pub fn parse_field_bytes_par(data: &[u8], threads: usize) -> FieldByteStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse_field_bytes(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| {
+            if t == threads {
+                data.len()
+            } else {
+                (t * chunk).min(data.len())
+            }
+        })
+        .collect();
+    // Quote seeds are resolved inside the indexing scope: each thread
+    // contributes its chunk's quote-byte parity, then reads the parity
+    // of all preceding chunks after one barrier (doubled-quote escapes
+    // self-cancel, so raw parity is exact).
+    let parity: Vec<std::sync::atomic::AtomicU64> =
+        (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let barrier = std::sync::Barrier::new(threads);
+    let parts: Vec<FieldByteStats> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (start, end) = (bounds[t], bounds[t + 1]);
+                let parity = &parity;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    parity[t].store(quote_parity_dispatch(&data[start..end], 0) & 1, Relaxed);
+                    barrier.wait();
+                    // Seed = quote parity of every preceding chunk.
+                    let seed = parity[..t]
+                        .iter()
+                        .fold(0u64, |acc, p| acc ^ p.load(Relaxed))
+                        .wrapping_neg();
+                    let mut sink = FieldByteSink::new(data, start as u32, end as u32, t == 0);
+                    index_field_bytes_dispatch(data, seed, start, &mut sink);
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("field-byte stats thread ok"))
+            .collect()
+    });
+    let mut stats = FieldByteStats::default();
+    for part in parts {
+        stats.merge(part);
+    }
+    stats
+}
+
+fn index_field_bytes_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut FieldByteSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_field_bytes(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_field_bytes(data, seed, start, sink) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+pub(crate) struct FieldByteSink<'a> {
+    data: &'a [u8],
+    stats: FieldByteStats,
+    field_start: u32,
+    record_start: u32,
+    end: u32,
+    emitting: bool,
+    pub(crate) done: bool,
+}
+
+impl<'a> FieldByteSink<'a> {
+    fn new(data: &'a [u8], start: u32, end: u32, emitting: bool) -> Self {
+        Self {
+            data,
+            stats: FieldByteStats::default(),
+            field_start: start,
+            record_start: start,
+            end,
+            emitting,
+            done: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drive(&mut self, mask: u64, term: u64, base: u32) {
+        let mut m = mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let p = base + m.trailing_zeros();
+            if term & bit != 0 {
+                if self.emitting {
+                    self.flush_field(p, true);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                self.flush_field(p, false);
+                self.field_start = p + 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    #[inline]
+    fn flush_field(&mut self, end: u32, record_end: bool) {
+        let data = self.data;
+        let to = if record_end && end > self.record_start && data[end as usize - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        self.stats.fields += 1;
+        self.stats.bytes += field_byte_len(&data[self.field_start as usize..to as usize]);
+    }
+
+    fn finish(mut self) -> FieldByteStats {
+        let len = self.data.len() as u32;
+        if self.emitting && !self.done && self.record_start < len {
+            self.flush_field(len, true);
+        }
+        self.stats
+    }
+}
+
+impl FieldByteStats {
+    fn merge(&mut self, other: Self) {
+        self.fields += other.fields;
+        self.bytes += other.bytes;
+    }
+}
+
+#[inline]
+fn field_byte_len(raw: &[u8]) -> u64 {
+    const Q: u8 = 34u8;
+    if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {
+        let inner = &raw[1..raw.len() - 1];
+        if !contains_byte(inner, Q) {
+            return inner.len() as u64;
+        }
+        let mut len = 0u64;
+        let mut i = 0;
+        while i < inner.len() {
+            len += 1;
+            if inner[i] == Q && i + 1 < inner.len() && inner[i + 1] == Q {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        return len;
+    }
+    raw.len() as u64
+}
+
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use std::arch::x86_64::*;
@@ -953,6 +1175,29 @@ mod avx512 {
         carries[0]
     }
 
+    /// Scan a chunk only far enough to recover the generated quote-region
+    /// carry. Used by parallel fused stats paths to seed workers without a
+    /// scalar quote-count prepass.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub fn quote_parity(data: &[u8], seed: u64) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        carries[0] = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let _ = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer.
+            let _ = unsafe { step(block.as_ptr(), &mut carries) };
+        }
+        carries[0]
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
@@ -975,6 +1220,34 @@ mod avx512 {
         // SAFETY: block is a readable 64-byte buffer.
         let (mask, term) = unsafe { step(block.as_ptr(), carries) };
         push_tape(mask & live, term & live, base, seps, ends);
+    }
+
+    /// Fused projection driver: structural masks go straight into the
+    /// field-byte stats sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub(crate) fn index_field_bytes(data: &[u8], seed: u64, start: usize, sink: &mut super::FieldByteSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(mask & live, term & live, offset as u32);
+        }
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
@@ -1168,6 +1441,29 @@ mod avx2 {
         carries[0]
     }
 
+    /// Scan a chunk only far enough to recover the generated quote-region
+    /// carry. Used by parallel fused stats paths to seed workers without a
+    /// scalar quote-count prepass.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn quote_parity(data: &[u8], seed: u64) -> u64 {
+        let mut carries = super::CARRY_INIT;
+        carries[0] = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let _ = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer.
+            let _ = unsafe { step(block.as_ptr(), &mut carries) };
+        }
+        carries[0]
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
@@ -1190,6 +1486,34 @@ mod avx2 {
         // SAFETY: block is a readable 64-byte buffer.
         let (mask, term) = unsafe { step(block.as_ptr(), carries) };
         push_tape(mask & live, term & live, base, seps, ends);
+    }
+
+    /// Fused projection driver: structural masks go straight into the
+    /// field-byte stats sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub(crate) fn index_field_bytes(data: &[u8], seed: u64, start: usize, sink: &mut super::FieldByteSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            sink.drive(mask, term, offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            sink.drive(mask & live, term & live, offset as u32);
+        }
     }
 
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
@@ -1256,3 +1580,7 @@ mod avx2 {
         }
     }
 }
+
+}
+
+pub use self::generated::*;

@@ -68,6 +68,306 @@ fn generated_kernels_emit_native_simd_without_fallback() {
     }
 }
 
+#[test]
+fn generated_fastq_target_exposes_domain_api() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "fastq")
+        .expect("fastq target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("fastq codegen should succeed");
+
+    assert!(generated.contains("pub struct FastqStats"));
+    assert!(generated.contains("pub enum FastqError"));
+    assert!(generated.contains("pub fn parse_fastq("));
+    assert!(generated.contains("pub fn parse_fastq_par("));
+}
+
+#[test]
+fn generated_fastq_parallel_streams_without_newline_vector() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "fastq")
+        .expect("fastq target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("fastq codegen should succeed");
+
+    assert!(generated.contains("fn fastq_record_bounds("));
+    assert!(generated.contains("fn fastq_find_record_boundary("));
+    assert!(
+        !generated.contains("fastq_count_newlines_dispatch("),
+        "parallel FASTQ should find local record boundaries instead of scanning the whole input in a newline-count prepass"
+    );
+    assert!(generated.contains("checksum_lanes: [u64; 8]"));
+    assert!(!generated.contains("checksum_adjust: u64"));
+    assert!(!generated.contains("fn subtract_block_newlines(&mut self, mask: u64)"));
+    assert!(!generated.contains("fn subtract_ignored_line_checksum(&mut self, bytes: &[u8])"));
+    assert!(
+        generated.contains("self.stats.checksum = finish_fastq_checksum(&self.checksum_lanes);")
+    );
+    assert!(!generated.contains("const FASTQ_BACKEND_AVX512: u8 = 1;"));
+    assert!(!generated.contains("const FASTQ_BACKEND_AVX2: u8 = 2;"));
+    assert!(!generated.contains("fn drive_backend<const BACKEND: u8>"));
+    assert!(!generated.contains("fn drive_pair_backend<const BACKEND: u8>"));
+    assert!(!generated.contains("fn line_backend<const BACKEND: u8>"));
+    assert!(!generated.contains("fn record_backend<const BACKEND: u8>"));
+    assert!(generated.contains("fn drive_pair_avx512("));
+    assert!(generated.contains("fn drive_pair_avx2("));
+    assert!(generated.contains("fn record_avx512("));
+    assert!(generated.contains("fn record_avx2("));
+    assert!(generated.contains("sink.drive_pair_avx512(data, m0, m1, offset, &mut checksum_acc)"));
+    assert!(generated.contains("sink.drive_pair_avx2(data, m0, m1, offset, &mut checksum_acc)"));
+    assert!(
+        !generated.contains("unsafe fn fastq_step("),
+        "FASTQ should not duplicate the generated step body for checksum work"
+    );
+    assert!(
+        !generated.contains("let error = sink.drive_pair(data, m0, m1, offset);"),
+        "FASTQ backend drivers should avoid per-record checksum feature dispatch"
+    );
+    assert!(generated.contains("fn finish(mut self) -> Result<FastqStats, FastqError>"));
+    assert!(generated.contains("error_quality_len: usize"));
+    assert!(generated.contains("fn take_error(&self, code: u8) -> FastqError"));
+    assert!(generated.contains("unsafe { *data.get_unchecked(self.line_start) } != b'@'"));
+    assert!(generated.contains("unsafe { *data.get_unchecked(self.line_start) } != b'+'"));
+    assert!(
+        !generated.contains("self.line_start >= data.len() || data[self.line_start]"),
+        "FASTQ tag checks run only on newline-delimited lines and should avoid hot bounds checks"
+    );
+    assert!(generated.contains(
+        "let error = unsafe { sink.drive_pair_avx512(data, m0, m1, offset, &mut checksum_acc) };\n            if error != 0 {\n                return Err(sink.take_error(error));\n            }"
+    ));
+    assert!(!generated.contains("fn checksum_fastq_record("));
+    assert!(!generated.contains("fn checksum_fastq_record_avx512("));
+    assert!(!generated.contains("fn checksum_fastq_record_avx2("));
+    assert!(generated.contains("fn checksum_fastq_record_avx512_acc("));
+    assert!(generated.contains("fn checksum_fastq_record_avx2_acc("));
+    assert!(generated.contains(
+        "data.get_unchecked(self.sequence_start..self.sequence_start + self.sequence_len)"
+    ));
+    assert!(generated.contains("data.get_unchecked(self.line_start..end)"));
+    assert!(generated.contains("_mm512_sad_epu8("));
+    assert!(generated.contains("_mm512_maskz_loadu_epi8("));
+    assert!(generated.contains("_mm256_sad_epu8("));
+    assert!(
+        !generated.contains("fastq_stats_from_newlines_par"),
+        "parallel FASTQ should stream generated masks into chunk sinks instead of validating from a newline-position vector"
+    );
+    assert!(
+        !generated.contains("let mut newlines = Vec::"),
+        "parallel FASTQ should not allocate a full newline-position vector"
+    );
+}
+
+#[test]
+fn generated_logfmt_target_exposes_fused_pair_api() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "logfmt")
+        .expect("logfmt target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("logfmt codegen should succeed");
+
+    assert!(generated.contains("pub struct LogfmtStats"));
+    assert!(generated.contains("pub fn parse_logfmt_pairs("));
+    assert!(generated.contains("pub fn parse_logfmt_pairs_par("));
+    assert!(generated.contains("pub fn logfmt_blocks("));
+    assert!(generated.contains("stats.key_bytes += key.len() as u64;"));
+    assert!(generated.contains("fn add_logfmt_value("));
+    assert!(generated.contains("value.first() != Some(&Q)"));
+    assert!(generated.contains("has_key: bool"));
+    assert!(generated.contains("#[inline(always)]\n    fn drive("));
+    assert!(generated.contains("#[inline(always)]\n    fn field("));
+    assert!(generated.contains("data.get_unchecked(self.key_start..self.key_end)"));
+    assert!(generated.contains("data.get_unchecked(self.field_start..end)"));
+    assert!(generated.contains("#[inline(always)]\nfn add_logfmt_pair("));
+    assert!(
+        !generated.contains("pending_key: Option"),
+        "fused logfmt pairs should keep key state as plain fields in the hot sink"
+    );
+    assert!(
+        !generated.contains("let key = clean(key);"),
+        "fused logfmt pairs should not scan bare keys for quote/escape cleaning"
+    );
+    assert!(
+        !generated.contains("clean(value)"),
+        "fused logfmt pairs should count/checksum cleaned values without materializing them"
+    );
+}
+
+#[test]
+fn generated_vcf_typed_target_exposes_fused_stats_api() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "vcf_typed")
+        .expect("vcf_typed target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("vcf_typed codegen should succeed");
+
+    assert!(generated.contains("pub struct VcfStats"));
+    assert!(generated.contains("pub fn parse_vcf_stats("));
+    assert!(generated.contains("pub fn parse_vcf_stats_par("));
+    assert!(generated.contains("pub(crate) fn index_vcf_stats("));
+    assert!(generated.contains("fn vcf_checksum_primary_bytes("));
+    assert!(generated.contains("fn parse_vcf_pos_cell("));
+    assert!(
+        generated.contains(
+            "self.stats.checksum = vcf_checksum_primary_bytes(self.stats.checksum, bytes);"
+        )
+    );
+    assert!(generated.contains("parse_vcf_pos_cell(&data[from as usize..to as usize])"));
+}
+
+#[test]
+fn generated_csv_geo_targets_expose_fused_stats_api() {
+    for (name, stats, serial, parallel, index) in [
+        (
+            "csv_geo",
+            "pub struct CsvGeoStats",
+            "pub fn parse_csv_geo_stats(",
+            "pub fn parse_csv_geo_stats_par(",
+            "pub(crate) fn index_csv_geo_stats(",
+        ),
+        (
+            "csv_geo_text",
+            "pub struct CsvGeoTextStats",
+            "pub fn parse_csv_geo_text_stats(",
+            "pub fn parse_csv_geo_text_stats_par(",
+            "pub(crate) fn index_csv_geo_text_stats(",
+        ),
+    ] {
+        let target = falx::kernels::targets()
+            .into_iter()
+            .find(|(target_name, _, _)| *target_name == name)
+            .unwrap_or_else(|| panic!("{name} target is registered"));
+        let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+            .unwrap_or_else(|_| panic!("{name} codegen should succeed"));
+
+        assert!(generated.contains(stats), "{name} missing stats struct");
+        assert!(
+            generated.contains(serial),
+            "{name} missing serial stats API"
+        );
+        assert!(
+            generated.contains(parallel),
+            "{name} missing parallel stats API"
+        );
+        assert!(
+            generated.contains(index),
+            "{name} missing generated stats indexer"
+        );
+        assert!(
+            !generated.contains("fn parse_f64_field_bits("),
+            "{name} should keep the proven f64 field parser path"
+        );
+        assert!(
+            generated.contains("wrapping_add(value.to_bits())"),
+            "{name} should keep the proven checksum path"
+        );
+    }
+}
+
+#[test]
+fn generated_float_columns_emit_fixed_six_decimal_fast_path() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "csv_geo")
+        .expect("csv_geo target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("csv_geo codegen should succeed");
+
+    assert!(generated.contains("#[inline(always)]\nfn parse_f64_cell("));
+    assert!(generated.contains("fn parse_fixed_6_decimal_signed("));
+    assert!(generated.contains("if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s)"));
+}
+
+#[test]
+fn generated_csv_tsv_targets_expose_fused_field_byte_api() {
+    for name in ["csv", "tsv"] {
+        let target = falx::kernels::targets()
+            .into_iter()
+            .find(|(target_name, _, _)| *target_name == name)
+            .unwrap_or_else(|| panic!("{name} target is registered"));
+        let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+            .unwrap_or_else(|_| panic!("{name} codegen should succeed"));
+
+        assert!(generated.contains("pub struct FieldByteStats"));
+        assert!(generated.contains("pub fn parse_field_bytes("));
+        assert!(generated.contains("pub fn parse_field_bytes_par("));
+        assert!(generated.contains("pub(crate) fn index_field_bytes("));
+    }
+}
+
+#[test]
+fn generated_csv_stats_paths_use_simd_quote_parity() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "csv")
+        .expect("csv target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("csv codegen should succeed");
+
+    assert!(generated.contains("fn quote_parity_dispatch("));
+    assert!(generated.contains("quote_parity_dispatch(&data[start..end], 0)"));
+    assert!(
+        !generated.contains("iter().filter(|&&b| b == 34u8).count()"),
+        "parallel stats paths should not run a scalar quote-count prepass"
+    );
+}
+
+#[test]
+fn generated_csv_geo_stats_paths_use_simd_quote_parity() {
+    for name in ["csv_geo", "csv_geo_text"] {
+        let target = falx::kernels::targets()
+            .into_iter()
+            .find(|(target_name, _, _)| *target_name == name)
+            .unwrap_or_else(|| panic!("{name} target is registered"));
+        let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+            .unwrap_or_else(|_| panic!("{name} codegen should succeed"));
+
+        assert!(
+            generated.contains("fn quote_parity_dispatch("),
+            "{name} missing generated quote-parity dispatch"
+        );
+        assert!(
+            generated.contains("quote_parity_dispatch(&data[start..end], 0)"),
+            "{name} should seed stats workers from generated SIMD quote parity"
+        );
+        assert!(
+            !generated.contains("iter().filter(|&&b| b == 34u8).count()"),
+            "{name} stats paths should not run a scalar quote-count prepass"
+        );
+    }
+}
+
+#[test]
+fn generated_csv_geo_text_stats_specializes_short_city_checksums() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "csv_geo_text")
+        .expect("csv_geo_text target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("csv_geo_text codegen should succeed");
+
+    assert!(generated.contains("fn csv_geo_checksum_first_8("));
+    assert!(generated.contains("match bytes.len()"));
+}
+
+#[test]
+fn generated_ndjson_target_exposes_fused_line_stats_api() {
+    let target = falx::kernels::targets()
+        .into_iter()
+        .find(|(name, _, _)| *name == "ndjson")
+        .expect("ndjson target is registered");
+    let generated = codegen::emit_parser_with_columns(&target.1, target.0, &target.2)
+        .expect("ndjson codegen should succeed");
+
+    assert!(generated.contains("pub struct NdjsonLineStats"));
+    assert!(generated.contains("pub fn parse_ndjson_lines("));
+    assert!(generated.contains("pub fn parse_ndjson_lines_par("));
+    assert!(generated.contains("pub fn index_ndjson_lines("));
+}
+
 /// Test 2: Generated kernels differential test.
 /// Runs 800 randomized inputs through generated kernels and compares against scalar reference.
 #[test]
@@ -300,7 +600,11 @@ fn comment_parallel_matches_serial() {
             // 16 is long enough to straddle chunk boundaries at high thread
             // counts. Comment lines carry tabs and `#` (inert) on purpose.
             let long = rng.next().is_multiple_of(16);
-            let cells = if long { 40 + rng.next() % 60 } else { 1 + rng.next() % 6 };
+            let cells = if long {
+                40 + rng.next() % 60
+            } else {
+                1 + rng.next() % 6
+            };
             if rng.next().is_multiple_of(5) {
                 data.push(b'#');
                 for _ in 0..cells {
@@ -332,7 +636,10 @@ fn comment_parallel_matches_serial() {
                 .records()
                 .map(|r| r.fields().map(|f| f.into_owned()).collect())
                 .collect();
-            assert_eq!(par_fields, serial_fields, "vcf parse_par mismatch at {threads} threads");
+            assert_eq!(
+                par_fields, serial_fields,
+                "vcf parse_par mismatch at {threads} threads"
+            );
         }
     }
 }

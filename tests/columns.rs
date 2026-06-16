@@ -259,15 +259,14 @@ fn assert_columns_match(
     // For every valid title, check string_at contents
     for row in 0..expected.rows {
         if falx::kernels::csv_typed::bitmap_get(&expected.title_valid, row) {
-            let exp_bytes = &expected.title_data[expected.title_offsets[row] as usize
-                ..expected.title_offsets[row + 1] as usize];
+            let exp_bytes = &expected.title_data
+                [expected.title_offsets[row] as usize..expected.title_offsets[row + 1] as usize];
             let act_bytes =
                 falx::kernels::csv_typed::string_at(&actual.title_offsets, &actual.title_data, row);
             assert_eq!(
                 act_bytes, exp_bytes,
                 "title string_at[{}] contents mismatch for input:\n{}",
-                row,
-                data_str
+                row, data_str
             );
         }
     }
@@ -389,7 +388,11 @@ fn randomized_differential() {
                 match cell_type {
                     0 => {
                         // Random i64-ish: optional sign, 1..22 digits
-                        let sign = if rng.next().is_multiple_of(2) { b'-' } else { b'+' };
+                        let sign = if rng.next().is_multiple_of(2) {
+                            b'-'
+                        } else {
+                            b'+'
+                        };
                         if rng.next().is_multiple_of(3) {
                             csv.push(sign);
                         }
@@ -675,7 +678,11 @@ fn parallel_matches_serial() {
                 "rows mismatch with {} threads",
                 threads
             );
-            assert_eq!(serial.id, parallel.id, "id mismatch with {} threads", threads);
+            assert_eq!(
+                serial.id, parallel.id,
+                "id mismatch with {} threads",
+                threads
+            );
             assert_eq!(
                 serial.id_valid, parallel.id_valid,
                 "id_valid mismatch with {} threads",
