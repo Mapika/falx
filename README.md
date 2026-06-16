@@ -45,39 +45,47 @@ let ok = parser::bitmap_get(&cols.latitude_valid, row);  // Arrow-style
 ## Performance
 
 Xeon w7-3455 (Sapphire Rapids, AVX-512F/BW/VL + PCLMULQDQ, 24 cores /
-48 threads, 8-channel DDR5), 64 MiB synthetic data per format, best of 7
-runs in one session; the AVX-512 path is selected at runtime.
+48 threads, 8-channel DDR5); **1 GiB** synthetic file per format, median/best
+of 3 runs via `cargo run --release --example bench_sustained`, AVX-512 path
+selected at runtime. These kernels are execution-port/bandwidth bound, so they
+**peak at 24 threads (physical cores)** — driving all 48 logical threads is
+*slower* (parallel parse roughly halves), so every parallel figure below uses
+24 threads. Each comparison row is gated by an equal-`Work` check: falx and the
+library it is timed against must emit identical record/byte/checksum counters
+before any timing is reported, so these are like-for-like — not a structural
+framer measured against a full semantic parser.
 
-**Structural indexing** — find every field and record boundary. This is less
-work than the baselines, which also materialize values, so these speedups
-show the headroom indexing creates rather than a like-for-like parse:
+**How much faster than the ecosystem** — same work on both sides (enforced by
+the `Work` gate), 1 GiB per format:
 
-| format | falx serial | falx parallel | ecosystem baseline |
-|---|---|---|---|
-| CSV | 5.8 GiB/s | **36 GiB/s** | csv crate full parse 0.26 |
-| TSV | 7.2 GiB/s | **42 GiB/s** | — |
-| logfmt | 5.1 GiB/s | — | — |
-| NDJSON framing | 5.1 GiB/s | — | serde_json 0.15 (34x), simd-json tape 0.19 (27x) |
+| format (equal work) | falx serial | falx @24 cores | fastest library | per-core | @24 cores |
+|---|---|---|---|---|---|
+| FASTQ records | 7.7 | **104** | seq_io / needletail 2.7 | 2.8x | 36x |
+| VCF typed projection | 2.0 | **31** | noodles-vcf 0.34 | 6.0x | 92x |
+| TSV field bytes | 2.9 | **36** | csv crate 0.31 | 9.4x | 119x |
+| logfmt pairs | 1.0 | **17** | logfmt-zerocopy 0.21 | 4.8x | 77x |
+| CSV field bytes | 1.2 | **18** | csv crate 0.30 | 4.1x | 58x |
+| CSV geo, text + lat/lon | 0.85 | **12** | arrow-csv 0.27 | 3.2x | 44x |
+| CSV geo, lat/lon f64 | 1.1 | **15** | arrow-csv 0.31 | 3.3x | 37x |
 
-**Like-for-like** — full record/field iteration with quote stripping and
-unescaping on both sides, byte-identical output to the csv crate:
+Throughput in GiB/s; `@24 cores` = 24 threads. The libraries are
+single-threaded, so **per-core** is the fairest kernel-efficiency comparison
+and **@24 cores** is the end-to-end throughput (kernel + parallelism). FASTQ is
+the toughest field — `seq_io`/`needletail` are real SIMD-class parsers at
+~2.7 GiB/s, so the ~2.8x per-core win there is a genuine kernel result, where
+the 119x over the `csv` crate partly reflects how slow that crate is.
 
-| | throughput | vs csv crate |
-|---|---|---|
-| falx `parse()` + field iteration | 0.83 GiB/s | 3.1x |
-| falx `parse_into()` + fields (recycled tape) | 1.16 GiB/s | 4.3x |
-| falx `parse_par()` + parallel fields (48 threads) | **9.6 GiB/s** | **36x** |
-| falx `stream()` incremental, 64 KiB feeds | 1.08 GiB/s | 4.0x |
-| falx `fields_raw()` (zero-copy spans, no cleaning) | **7.8 GiB/s** | — |
-| csv crate `byte_records()` | 0.27 GiB/s | 1.0x |
+**Reported separately, *not* a faster-than claim:** NDJSON. falx frames lines
+at 8.5 GiB/s serial / 101 GiB/s @24 cores, but that is line framing —
+`serde_json` (0.15) and `simd-json` (0.24) do full DOM/tape parsing, which is
+not equal work. Likewise, pure CSV structural indexing (every field + record
+boundary, no value work) runs 5.9 GiB/s serial / 38 GiB/s @24 cores — less work
+than a parse, so it is the headroom indexing creates, not a library speedup.
 
-The recycled-tape row is the steady-state number (a fresh ~40 MB tape per
-parse soft-page-faults at GiB/s, so batch callers hand the previous parse
-back via `parse_into`). `fields_raw()` is the zero-copy fast path for
-callers that don't need quote stripping (~6x the cleaning path). Parallel
-rows use all 48 threads; the csv crate and arrow-csv are single-threaded, so
-the single-core columns are the fairest "we're faster" figures and the
-parallel columns are the end-to-end throughput.
+The generated API also exposes `parse_into` (recycles the tape buffer — a fresh
+per-GiB tape soft-page-faults, so batch callers hand the previous parse back),
+a `fields_raw()` zero-copy span iterator that skips quote-stripping, and a
+`stream()` incremental mode for unbounded input; see `examples/`.
 
 Parallelism falls out of the tape design plus a **speculative** entry-state
 trick: each chunk is indexed as if it began outside any quoted region, and
@@ -90,8 +98,11 @@ chunk boundary.
 
 ### Typed columns: CSV → Arrow-layout buffers
 
-The projection benchmark — extract Latitude/Longitude as `f64` columns
-with validity bitmaps, skipping the other five fields, 64 MiB synthetic:
+The projection benchmark — extract Latitude/Longitude as `f64` columns with
+validity bitmaps, skipping the other five fields. This is a distinct
+column-*materialization* run (`bench_columns`, 64 MiB synthetic) measured at 48
+threads; the equal-work projection path in the 1 GiB scoreboard above hits
+~15 GiB/s @24 cores (37x arrow-csv), and 24 threads is the sweet spot:
 
 | | throughput | vs csv crate |
 |---|---|---|
@@ -128,10 +139,10 @@ The generator is the point — a new delimited or record format is a few
 lines of spec, not months of expert SIMD — so the same engine that does CSV
 does the formats genomics, ML, and scientific pipelines run on:
 
-| format | falx | baseline |
+| format | falx (serial / @24 cores) | baseline (equal work) |
 |---|---|---|
-| **VCF / BED / GFF / SAM** (tab + `#`, genomics) | 1.6 serial, **8.6 parallel** GiB/s | scalar readers ~1–2 GiB/s |
-| **FASTQ** (4-line reads, genomics) | **~21 GiB/s** framed (newline index 28–36) | scalar reader 2.5 GiB/s |
+| **VCF typed projection** (tab + `#`, genomics) | 2.0 / **31** GiB/s | noodles-vcf 0.34 (6.0x / 92x) |
+| **FASTQ records** (4-line reads, genomics) | 7.7 / **104** GiB/s | seq_io & needletail 2.7 (2.8x / 36x) |
 | Matrix Market (sparse sci-compute) | generated from a 4-line spec | — |
 
 VCF/BED/GFF/SAM are tab-delimited with `#` header lines — a
@@ -141,9 +152,11 @@ chunk boundary). FASTQ packs each read into 4 lines (`@header` / sequence /
 `+` / quality), and the quality line can contain `@` and `+`, so framing
 must count line boundaries rather than split on a sigil — falx finds them
 with the generated newline kernel at memory speed and groups them by 4
-(`examples/fastq.rs`), **~8–18x a scalar reader**, sequence-byte checksums
-identical. (Comment dialects still run their three-state region resolution
-scalar; vectorizing it is the next lever.)
+(`examples/fastq.rs`), **~2.8x per core / ~36x on 24 cores vs `seq_io` and
+`needletail`** (real SIMD-class FASTQ parsers, not toy baselines), with
+sequence- and quality-byte checksums identical on all three. (Comment dialects
+still run their three-state region resolution scalar; vectorizing it is the
+next lever.)
 
 ### Versus the real simdjson (C++)
 
@@ -199,9 +212,13 @@ never crosses a boundary. Both are byte-identical to serial, tested across
 thread counts with quoted/comment regions spanning every chunk boundary.
 
 Earlier versions ran a separate counting prepass (a full extra read of the
-data) and merged chunk tapes single-threaded; dropping both — speculative
-entry-state plus a parallel scatter — is what took CSV parallel indexing
-from ~13 to ~36 GiB/s on this box.
+data) and merged chunk tapes single-threaded. Dropping the prepass for the
+speculative scheme is a measured win in an interleaved same-box A/B against the
+prescan build — unchanged-kernel controls (serial index, the `csv` crate) held
+flat and structural output stayed byte-identical, so it is signal, not run
+noise: **1.27x at 48 threads and 2.34x at 24 threads** for parallel indexing
+(1.6x for parallel parse). The gain is largest at the 24-thread sweet spot,
+where indexing reaches ~38–40 GiB/s.
 
 Correctness: every kernel is differential-tested — generated SIMD dispatch,
 the IR interpreter, and an independent byte-at-a-time reference must agree
@@ -336,8 +353,9 @@ Kernel generation defaults to weighted auto-discovery plus cost-weighted graph o
   add a matched-bracket nested tape with O(1) container skips and a navigation
   API; JSON structural parsing differentially tested against serde_json
 - M8 (done): parallelism overhaul — parallel scatter merge, speculative
-  entry-state (no quote-parity prepass), `fields_raw()` zero-copy iterator;
-  CSV parallel indexing ~13 → ~36 GiB/s on the Sapphire Rapids box
+  entry-state (no quote-parity prepass), `fields_raw()` zero-copy iterator; a
+  measured 1.3–2.3x over the prescan build in same-box A/B (24-thread sweet
+  spot, ~38 GiB/s CSV indexing)
 - M9 (done): comment dialects parallelize by line ownership — genomics and
   scientific formats (VCF/BED/GFF/SAM, Matrix Market) get the parallel path;
   FASTQ framing (4-line reads) via the newline kernel (`examples/fastq.rs`)
