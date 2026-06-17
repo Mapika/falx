@@ -62,11 +62,12 @@ fn index_tape_seeded(slice: &[u8], mut carries: [u64; 2], base: u32, seps: &mut 
     carries[1]
 }
 
-/// Runtime-dispatched region-state scan with no tape output: threads the entry
-/// carries `[line_start, region_state]` through the kernel and returns (in
-/// `carries`) the exit state. The transfer-function phase below runs it once
-/// per possible entry state to learn each chunk's `state -> state` map.
-fn region_scan_dispatch(data: &[u8], carries: &mut [u64; 2]) {
+/// Runtime-dispatched no-tape region-state scan that advances all three
+/// candidate region states in one pass: `carries[0]` is the line-start carry,
+/// `states` is seeded `[0,1,2]` (the three entry states N/Q/C) and exits as the
+/// chunk's transfer function `[f(N), f(Q), f(C)]`. The region inputs (q,s,n) are
+/// computed once per block and shared across the three advances.
+fn region_scan3_dispatch(data: &[u8], carries: &mut [u64; 2], states: &mut [u64; 3]) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -74,7 +75,7 @@ fn region_scan_dispatch(data: &[u8], carries: &mut [u64; 2]) {
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx512::region_scan(data, carries) };
+        unsafe { avx512::region_scan3(data, carries, states) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -82,7 +83,7 @@ fn region_scan_dispatch(data: &[u8], carries: &mut [u64; 2]) {
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx2::region_scan(data, carries) };
+        unsafe { avx2::region_scan3(data, carries, states) };
         return;
     }
     unsupported_cpu();
@@ -148,13 +149,11 @@ fn parse_par_parts(data: &[u8], threads: usize) -> Option<Vec<TapePart>> {
                 let slice = &data[bounds[t]..bounds[t + 1]];
                 let ls = line_start(bounds[t]);
                 s.spawn(move || {
-                    let mut f = [0u64; 3];
-                    for entry in 0..3u64 {
-                        let mut c = [ls, entry];
-                        region_scan_dispatch(slice, &mut c);
-                        f[entry as usize] = c[1];
-                    }
-                    f
+                    // One pass advances all three entry states (N/Q/C) at once.
+                    let mut states = [0u64, 1, 2];
+                    let mut c = [ls, 0];
+                    region_scan3_dispatch(slice, &mut c, &mut states);
+                    states
                 })
             })
             .collect();
@@ -1204,19 +1203,35 @@ mod avx512 {
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
-    pub fn region_scan(data: &[u8], carries: &mut [u64; 2]) {
+    pub fn region_scan3(data: &[u8], carries: &mut [u64; 2], states: &mut [u64; 3]) {
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
-            let _ = unsafe { step(data.as_ptr().add(offset), carries) };
+            let (lo, hi) = unsafe { (_mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i), _mm256_loadu_si256(data.as_ptr().add(offset + 32) as *const __m256i)) };
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
+        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v3 = v1 & v2;
+        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let _ = resolve_regions(v4, v3, v0, &mut states[0]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[1]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[2]);
             offset += 64;
         }
         let rem = data.len() - offset;
         if rem > 0 {
-            let mut block = [0u8; 64];
-            block[..rem].copy_from_slice(&data[offset..]);
-            // SAFETY: block is a readable 64-byte buffer (zero padded).
-            let _ = unsafe { step(block.as_ptr(), carries) };
+            let mut blk = [0u8; 64];
+            blk[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: blk is a readable 64-byte buffer (zero padded).
+            let (lo, hi) = unsafe { (_mm256_loadu_si256(blk.as_ptr() as *const __m256i), _mm256_loadu_si256(blk.as_ptr().add(32) as *const __m256i)) };
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
+        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v3 = v1 & v2;
+        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let _ = resolve_regions(v4, v3, v0, &mut states[0]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[1]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[2]);
         }
     }
 
@@ -1507,19 +1522,35 @@ mod avx2 {
     }
 
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    pub fn region_scan(data: &[u8], carries: &mut [u64; 2]) {
+    pub fn region_scan3(data: &[u8], carries: &mut [u64; 2], states: &mut [u64; 3]) {
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
-            let _ = unsafe { step(data.as_ptr().add(offset), carries) };
+            let (lo, hi) = unsafe { (_mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i), _mm256_loadu_si256(data.as_ptr().add(offset + 32) as *const __m256i)) };
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
+        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v3 = v1 & v2;
+        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let _ = resolve_regions(v4, v3, v0, &mut states[0]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[1]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[2]);
             offset += 64;
         }
         let rem = data.len() - offset;
         if rem > 0 {
-            let mut block = [0u8; 64];
-            block[..rem].copy_from_slice(&data[offset..]);
-            // SAFETY: block is a readable 64-byte buffer (zero padded).
-            let _ = unsafe { step(block.as_ptr(), carries) };
+            let mut blk = [0u8; 64];
+            blk[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: blk is a readable 64-byte buffer (zero padded).
+            let (lo, hi) = unsafe { (_mm256_loadu_si256(blk.as_ptr() as *const __m256i), _mm256_loadu_si256(blk.as_ptr().add(32) as *const __m256i)) };
+        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
+        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v3 = v1 & v2;
+        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let _ = resolve_regions(v4, v3, v0, &mut states[0]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[1]);
+        let _ = resolve_regions(v4, v3, v0, &mut states[2]);
         }
     }
 
