@@ -141,6 +141,7 @@ fn alternative_dialects_differential() {
             escape: formats::Escape::None,
             comment: None,
             nesting: vec![],
+            lines_per_record: 1,
         });
 
         // Run 500 randomized tests.

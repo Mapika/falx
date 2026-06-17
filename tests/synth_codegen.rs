@@ -253,6 +253,7 @@ fn weighted_synth_rejects_quote_escape_conflicts() {
         escape: formats::Escape::Backslash(b'\\'),
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     };
 
     assert!(!synth_formats::supports_weighted(&dialect));
@@ -278,6 +279,7 @@ fn weighted_synth_handles_large_structural_sets_in_boundary_corpus() {
         escape: formats::Escape::None,
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     };
 
     let synthesized =
@@ -298,6 +300,7 @@ fn weighted_synth_rejects_invalid_nesting_dialects() {
         escape: formats::Escape::None,
         comment: None,
         nesting: vec![(b'{', b'}')],
+        lines_per_record: 1,
     };
 
     assert!(!synth_formats::supports_weighted(&dialect));

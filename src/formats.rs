@@ -45,6 +45,11 @@ pub struct Dialect {
     /// a navigable tree. Nesting bytes must be members of `structural` —
     /// the indexer only reports bytes it classifies.
     pub nesting: Vec<(u8, u8)>,
+    /// Lines per logical record. When > 1, the generated record API groups
+    /// every N newline-terminated lines into one record and exposes the N
+    /// constituent lines as its fields (FASTQ = 4). Only valid for a
+    /// newline-only line format; 1 means one record per line.
+    pub lines_per_record: u32,
 }
 
 /// RFC 4180 CSV: comma/newline structure, double-quote regions, `""` escapes.
@@ -55,6 +60,7 @@ pub fn csv_dialect() -> Dialect {
         escape: Escape::None,
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -66,6 +72,7 @@ pub fn tsv_dialect() -> Dialect {
         escape: Escape::None,
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -77,6 +84,7 @@ pub fn logfmt_dialect() -> Dialect {
         escape: Escape::Backslash(b'\\'),
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -90,6 +98,7 @@ pub fn multi_dialect() -> Dialect {
         escape: Escape::None,
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -102,6 +111,7 @@ pub fn csv_hash_dialect() -> Dialect {
         escape: Escape::None,
         comment: Some(b'#'),
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -115,6 +125,7 @@ pub fn vcf_dialect() -> Dialect {
         escape: Escape::None,
         comment: Some(b'#'),
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -129,6 +140,7 @@ pub fn lines_dialect() -> Dialect {
         escape: Escape::None,
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -141,6 +153,7 @@ pub fn ndjson_dialect() -> Dialect {
         escape: Escape::Backslash(b'\\'),
         comment: None,
         nesting: vec![],
+        lines_per_record: 1,
     }
 }
 
@@ -155,6 +168,18 @@ pub fn json_dialect() -> Dialect {
         escape: Escape::Backslash(b'\\'),
         comment: None,
         nesting: vec![(b'{', b'}'), (b'[', b']')],
+        lines_per_record: 1,
+    }
+}
+
+/// FASTQ-style fixed-line records: newline framing grouped four lines per
+/// record (`@header` / sequence / `+` / quality). The declarative
+/// generalization of FASTQ's by-4 line grouping — the generated record API
+/// yields one record per read with the four lines as its fields.
+pub fn fastq_dialect() -> Dialect {
+    Dialect {
+        lines_per_record: 4,
+        ..lines_dialect()
     }
 }
 

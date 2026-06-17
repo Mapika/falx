@@ -165,12 +165,44 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
         }
     }
 
+    // Extract `lines_per_record` (optional, positive integer). It groups N
+    // newline-terminated lines into one record (FASTQ = 4). Only meaningful for
+    // a pure newline-framed line format — anything with field separators,
+    // quoting, comments, escapes, or nesting is rejected.
+    let lines_per_record = match parsed.get("lines_per_record") {
+        Some(value) => {
+            let n = value
+                .as_integer()
+                .ok_or("'lines_per_record' must be an integer")?;
+            let n = u32::try_from(n)
+                .ok()
+                .filter(|&n| n >= 1)
+                .ok_or("'lines_per_record' must be a positive integer")?;
+            if n > 1
+                && (structural != [b'\n']
+                    || quote.is_some()
+                    || comment.is_some()
+                    || escape != crate::formats::Escape::None
+                    || !nesting.is_empty())
+            {
+                return Err(
+                    "'lines_per_record' > 1 is only valid for a newline-only line format \
+                     (structural = [\"\\n\"], no quote/comment/escape/nesting)"
+                        .to_string(),
+                );
+            }
+            n
+        }
+        None => 1,
+    };
+
     let dialect = Dialect {
         structural,
         quote,
         escape,
         comment,
         nesting,
+        lines_per_record,
     };
 
     // Extract `[[columns]]` (optional, array of tables).

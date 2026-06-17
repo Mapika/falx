@@ -873,7 +873,11 @@ fn emit_with(
 @LOAD2@        push_tape(mask & live, term & live, base, seps, ends);
     }
 "#;
-    let avx512_partial = if parser.is_some() {
+    // The streaming primitives (index_tape_partial/_block + their dispatchers)
+    // exist only to feed the per-line StreamParser. A grouped (lines_per_record
+    // > 1) dialect emits no StreamParser, so they would be dead — gate them off.
+    let stream_enabled = !matches!(dialect, Some(d) if d.lines_per_record > 1);
+    let avx512_partial = if parser.is_some() && stream_enabled {
         partial_tpl
             .replace("@ATTR@", "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n")
             .replace("@K@", &carry_count.to_string())
@@ -882,7 +886,7 @@ fn emit_with(
     } else {
         String::new()
     };
-    let avx2_partial = if parser.is_some() {
+    let avx2_partial = if parser.is_some() && stream_enabled {
         partial_tpl
             .replace("@ATTR@", "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
             .replace("@K@", &carry_count.to_string())
@@ -2478,6 +2482,15 @@ fn par_seed_parts(quote: Option<u8>, chunk: &str) -> (String, String, String) {
 /// Emit the records/fields span API: lazy walking of the structural index
 /// into record and field spans, with dialect-specific field cleaning.
 fn push_span_api(code: &mut String, dialect: &crate::formats::Dialect, carry_count: usize) {
+    // Fixed-line-count records (FASTQ-style): group N newline-terminated lines
+    // per record. A distinct, self-contained record API; the streaming parser
+    // (which delivers one record per line) is not emitted in this mode.
+    if dialect.lines_per_record > 1 {
+        push_grouped_span_api(code, dialect.lines_per_record);
+        code.push_str(&clean_fn(dialect));
+        code.push('\n');
+        return;
+    }
     // Comment dialects keep comment lines on the tape (their newline is a
     // record boundary) and skip them lazily during iteration.
     let next_body = match dialect.comment {
@@ -2855,6 +2868,273 @@ impl<'p> Iterator for FieldsRaw<'p> {
     code.push_str(&stream);
     code.push_str(&clean_fn(dialect));
     code.push('\n');
+}
+
+/// Record API for a fixed-line-count line format (`lines_per_record = N > 1`):
+/// `records()` yields one record per N newline-terminated lines, exposing the
+/// N constituent lines as its fields. Self-contained; `@N@` is the line count.
+fn push_grouped_span_api(code: &mut String, n: u32) {
+    let tpl = r#"/// Record-aware tape indexing used by [`parse`].
+fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_tape(data, seps, ends) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::index_tape(data, seps, ends) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+/// Index `data` into a lazy record view: one record per @N@ newline-terminated
+/// lines (a trailing partial group of fewer than @N@ lines is dropped).
+pub fn parse(data: &[u8]) -> Parsed<'_> {
+    let mut seps = Vec::with_capacity(data.len() / 16 + 8);
+    let mut ends = Vec::with_capacity(data.len() / 32 + 8);
+    index_tape(data, &mut seps, &mut ends);
+    Parsed { data, seps, ends }
+}
+
+/// Like [`parse`], recycling the tape allocations of a previous parse.
+pub fn parse_into<'a>(data: &'a [u8], recycle: Parsed<'_>) -> Parsed<'a> {
+    let mut seps = recycle.seps;
+    let mut ends = recycle.ends;
+    seps.clear();
+    ends.clear();
+    index_tape(data, &mut seps, &mut ends);
+    Parsed { data, seps, ends }
+}
+
+/// A structural tape over borrowed input. Records group @N@ newline-terminated
+/// lines; `seps` is retained for the parallel tape merge (`parse_par`).
+pub struct Parsed<'a> {
+    data: &'a [u8],
+    seps: Vec<u32>,
+    ends: Vec<u64>,
+}
+
+impl<'a> Parsed<'a> {
+    /// Iterate records, each grouping @N@ newline-terminated lines.
+    pub fn records(&self) -> Records<'_> {
+        self.records_range(0..self.terminated_record_count())
+    }
+
+    /// Number of complete @N@-line records (a trailing partial group is not
+    /// counted).
+    pub fn terminated_record_count(&self) -> usize {
+        self.ends.len() / @N@
+    }
+
+    /// Iterate a sub-range of records by record index. Disjoint ranges cover
+    /// disjoint input and can be walked from different threads.
+    pub fn records_range(&self, range: std::ops::Range<usize>) -> Records<'_> {
+        let groups = self.terminated_record_count();
+        let end = range.end.min(groups);
+        let start = range.start.min(end);
+        Records {
+            data: self.data,
+            ends: &self.ends[..end * @N@],
+            group: start,
+        }
+    }
+}
+
+pub struct Records<'p> {
+    data: &'p [u8],
+    ends: &'p [u64],
+    group: usize,
+}
+
+impl<'p> Records<'p> {
+    #[inline]
+    fn next_raw(&mut self) -> Option<Record<'p>> {
+        let base = self.group * @N@;
+        if base + @N@ > self.ends.len() {
+            return None;
+        }
+        // Record start: just past the previous group's last terminator.
+        let start = if base == 0 {
+            0
+        } else {
+            (self.ends[base - 1] & 0xFFFF_FFFF) as usize + 1
+        };
+        let lines = &self.ends[base..base + @N@];
+        self.group += 1;
+        Some(Record { data: self.data, start, lines })
+    }
+}
+
+impl<'p> Iterator for Records<'p> {
+    type Item = Record<'p>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Record<'p>> {
+        self.next_raw()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.ends.len() / @N@ - self.group;
+        (n, Some(n))
+    }
+}
+
+/// One record: @N@ consecutive lines. Field `i` is line `i`, its trailing
+/// newline excluded (a `\r` of `\r\n` trimmed). Trimming and byte access are
+/// lazy, so tape-only walks never touch the input buffer.
+#[derive(Clone, Copy)]
+pub struct Record<'p> {
+    data: &'p [u8],
+    start: usize,
+    lines: &'p [u64],
+}
+
+impl<'p> Record<'p> {
+    #[inline]
+    fn line_bounds(&self, i: usize) -> (usize, usize) {
+        let from = if i == 0 {
+            self.start
+        } else {
+            (self.lines[i - 1] & 0xFFFF_FFFF) as usize + 1
+        };
+        let mut to = (self.lines[i] & 0xFFFF_FFFF) as usize;
+        if to > from && self.data[to - 1] == b'\r' {
+            to -= 1;
+        }
+        (from, to)
+    }
+
+    /// The whole record span (all @N@ lines, final terminator excluded).
+    pub fn as_bytes(&self) -> &'p [u8] {
+        let to = (self.lines[self.lines.len() - 1] & 0xFFFF_FFFF) as usize;
+        let to = if to > self.start && self.data[to - 1] == b'\r' {
+            to - 1
+        } else {
+            to
+        };
+        &self.data[self.start..to]
+    }
+
+    /// Number of fields: always @N@ (the record's lines).
+    pub fn field_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Byte-offset span `(from, to)` of line `i`.
+    pub fn field_span(&self, i: usize) -> Option<(u32, u32)> {
+        if i >= self.lines.len() {
+            return None;
+        }
+        let (from, to) = self.line_bounds(i);
+        Some((from as u32, to as u32))
+    }
+
+    /// Raw bytes of line `i`.
+    pub fn field_raw(&self, i: usize) -> Option<&'p [u8]> {
+        if i >= self.lines.len() {
+            return None;
+        }
+        let (from, to) = self.line_bounds(i);
+        Some(&self.data[from..to])
+    }
+
+    /// Line `i`. A line format has no quoting, so this borrows the raw bytes.
+    pub fn field(&self, i: usize) -> Option<std::borrow::Cow<'p, [u8]>> {
+        self.field_raw(i).map(clean)
+    }
+
+    /// Iterate the record's @N@ lines.
+    pub fn fields(&self) -> Fields<'p> {
+        Fields { data: self.data, start: self.start, lines: self.lines, i: 0 }
+    }
+
+    /// Zero-copy line iterator: raw `&[u8]` spans.
+    pub fn fields_raw(&self) -> FieldsRaw<'p> {
+        FieldsRaw { data: self.data, start: self.start, lines: self.lines, i: 0 }
+    }
+}
+
+/// Cleaned-line iterator over a record's @N@ lines.
+pub struct Fields<'p> {
+    data: &'p [u8],
+    start: usize,
+    lines: &'p [u64],
+    i: usize,
+}
+
+impl<'p> Iterator for Fields<'p> {
+    type Item = std::borrow::Cow<'p, [u8]>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.lines.len() {
+            return None;
+        }
+        let from = if self.i == 0 {
+            self.start
+        } else {
+            (self.lines[self.i - 1] & 0xFFFF_FFFF) as usize + 1
+        };
+        let mut to = (self.lines[self.i] & 0xFFFF_FFFF) as usize;
+        if to > from && self.data[to - 1] == b'\r' {
+            to -= 1;
+        }
+        self.i += 1;
+        Some(clean(&self.data[from..to]))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.lines.len() - self.i;
+        (n, Some(n))
+    }
+}
+
+/// Zero-copy variant of [`Fields`]: raw `&[u8]` line spans.
+pub struct FieldsRaw<'p> {
+    data: &'p [u8],
+    start: usize,
+    lines: &'p [u64],
+    i: usize,
+}
+
+impl<'p> Iterator for FieldsRaw<'p> {
+    type Item = &'p [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.lines.len() {
+            return None;
+        }
+        let from = if self.i == 0 {
+            self.start
+        } else {
+            (self.lines[self.i - 1] & 0xFFFF_FFFF) as usize + 1
+        };
+        let mut to = (self.lines[self.i] & 0xFFFF_FFFF) as usize;
+        if to > from && self.data[to - 1] == b'\r' {
+            to -= 1;
+        }
+        self.i += 1;
+        Some(&self.data[from..to])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.lines.len() - self.i;
+        (n, Some(n))
+    }
+}
+"#;
+    code.push_str(&tpl.replace("@N@", &n.to_string()));
 }
 
 /// Emit the typed columnar projection API: a `Columns` struct with one

@@ -60,9 +60,9 @@ pub fn targets() -> Vec<(&'static str, Dialect, Vec<Column>)> {
         // Pure newline framing; the base for fixed-line record formats like
         // FASTQ (group line boundaries by 4). See examples/fastq.rs.
         ("lines", formats::lines_dialect(), vec![]),
-        // FASTQ uses the generated newline kernel plus a generated
-        // fixed-four-line validation/stat sink; no handwritten FASTQ kernel.
-        ("fastq", formats::lines_dialect(), vec![]),
+        // FASTQ: newline kernel + lines_per_record=4, so the generated record
+        // API yields one record per 4-line read; plus the bespoke stat sink.
+        ("fastq", formats::fastq_dialect(), vec![]),
         ("logfmt", formats::logfmt_dialect(), vec![]),
         ("ndjson", formats::ndjson_dialect(), vec![]),
         // Bracket nesting: the structural index feeds a nested tape with
