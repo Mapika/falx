@@ -331,16 +331,20 @@ emission. To force handwritten graphs for every target, run
 - M8–M9 (done): parallelism — speculative entry-state (no prepass) + parallel
   scatter merge; comment-without-quote dialects parallelize by line ownership
   (VCF/BED/GFF/SAM, Matrix Market); FASTQ framing via the newline kernel.
-- M10 (done): the region resolver fast-paths comment-free blocks through a
-  PCLMULQDQ prefix-XOR (csv_hash serial 1.96 → 3.84 GiB/s), and `csv_hash`
-  (comment+quote) gains a parallel parse via per-chunk region transfer functions
-  — the last serial-only kernel now scales (~5x at 24 threads).
-- Next: fold csv_hash's three transfer-function scans into one combined 3-state
-  pass and add `parse_par_into` (its remaining parallel levers); per-field
-  clean/Cow cost (~2.5 ns/field span-layer headroom); a declarative
-  `lines_per_record` so other fixed-line formats get FASTQ's generated record
-  API; ARM NEON backend; full equality-saturation graph extraction over the
-  local cost-weighted optimizer.
+- M10 (done): `csv_hash` (comment+quote — the last serial-only, scalar-resolver
+  kernel) reaches parity with the rest. The region resolver fast-paths
+  comment-free blocks through a PCLMULQDQ prefix-XOR (serial 1.96 → 3.84 GiB/s),
+  and a parallel parse falls out of a per-chunk region *transfer function*
+  (one combined single-pass 3-state scan) reconciled with no serial re-index —
+  scaling ~6x at 24 threads, with `parse_par_into` recycling the master tape.
+- Next: a declarative `lines_per_record` so other fixed-line formats get FASTQ's
+  generated record API; ARM NEON backend (CI already verifies ARM correctness,
+  so it is pure speed work); full equality-saturation graph extraction over the
+  local cost-weighted optimizer. (The per-field clean path is already at the
+  floor for real data — ~0.7 ns/field on the common borrow path; the only
+  residual headroom is the `Vec` allocation in the rare doubled-quote copy path,
+  which would want a non-allocating `fields_into` buffer-reuse API rather than a
+  `clean` change.)
 
 ## License
 
