@@ -1039,7 +1039,12 @@ mod avx512 {
     /// region open and close events. Quote bits are ignored inside comments
     /// and comment candidates inside quotes — the interleaving bit-parallel
     /// parity cannot express. `state` carries the region across blocks.
+    ///
+    /// `pclmulqdq` is required for the carry-less-multiply prefix-XOR on the
+    /// comment-free fast path; the SIMD modules that emit this helper already
+    /// enable it, and `step` (a feature superset) is the only caller.
     #[inline]
+    #[target_feature(enable = "pclmulqdq")]
     fn resolve_regions(q: u64, s: u64, n: u64, state: &mut u64) -> u64 {
         const NORMAL: u64 = 0;
         const QUOTE: u64 = 1;
@@ -1051,6 +1056,27 @@ mod avx512 {
         // headers, etc.), turning per-block region resolution into a no-op.
         if *state == NORMAL && (q | s) == 0 {
             return 0;
+        }
+        // Fast path: no comment can be active in this block — none starts here
+        // (`s == 0`) and we did not enter mid-comment — so the three-state
+        // machine collapses to plain quote toggling, which is exactly a
+        // prefix-XOR of the quote bits seeded by the entry state. Newlines and
+        // stray `#` are irrelevant outside a comment. This keeps the common
+        // quoted body (comments cluster in the header) on a branchless path
+        // instead of the per-event walk below; it is bit-identical to that walk
+        // for every block satisfying this guard (proven by the differential
+        // tests, which route interleaved blocks to the walk). The prefix-XOR is
+        // one PCLMULQDQ carry-less multiply (`prefix_xor`) rather than the
+        // scalar shift cascade — shorter latency on the block-to-block region
+        // state dependency chain.
+        if *state != COMMENT && s == 0 {
+            let mut inert = prefix_xor(q);
+            if *state == QUOTE {
+                inert = !inert;
+            }
+            // MSB set iff still inside a quoted region at the block boundary.
+            *state = inert >> 63;
+            return inert;
         }
         let mut inert = 0u64;
         // A region continuing from the previous block fills from bit 0.
@@ -1103,6 +1129,14 @@ mod avx512 {
         let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
         let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
         lo_bits | (hi_bits << 32)
+    }
+
+    #[target_feature(enable = "pclmulqdq")]
+    fn prefix_xor(mask: u64) -> u64 {
+        let ones = _mm_set1_epi8(-1);
+        let value = _mm_set_epi64x(0, mask as i64);
+        let product = _mm_clmulepi64_si128::<0>(value, ones);
+        _mm_cvtsi128_si64(product) as u64
     }
 
     /// Branchless bit decoding (simdjson flatten_bits): write indexes in
@@ -1291,7 +1325,12 @@ mod avx2 {
     /// region open and close events. Quote bits are ignored inside comments
     /// and comment candidates inside quotes — the interleaving bit-parallel
     /// parity cannot express. `state` carries the region across blocks.
+    ///
+    /// `pclmulqdq` is required for the carry-less-multiply prefix-XOR on the
+    /// comment-free fast path; the SIMD modules that emit this helper already
+    /// enable it, and `step` (a feature superset) is the only caller.
     #[inline]
+    #[target_feature(enable = "pclmulqdq")]
     fn resolve_regions(q: u64, s: u64, n: u64, state: &mut u64) -> u64 {
         const NORMAL: u64 = 0;
         const QUOTE: u64 = 1;
@@ -1303,6 +1342,27 @@ mod avx2 {
         // headers, etc.), turning per-block region resolution into a no-op.
         if *state == NORMAL && (q | s) == 0 {
             return 0;
+        }
+        // Fast path: no comment can be active in this block — none starts here
+        // (`s == 0`) and we did not enter mid-comment — so the three-state
+        // machine collapses to plain quote toggling, which is exactly a
+        // prefix-XOR of the quote bits seeded by the entry state. Newlines and
+        // stray `#` are irrelevant outside a comment. This keeps the common
+        // quoted body (comments cluster in the header) on a branchless path
+        // instead of the per-event walk below; it is bit-identical to that walk
+        // for every block satisfying this guard (proven by the differential
+        // tests, which route interleaved blocks to the walk). The prefix-XOR is
+        // one PCLMULQDQ carry-less multiply (`prefix_xor`) rather than the
+        // scalar shift cascade — shorter latency on the block-to-block region
+        // state dependency chain.
+        if *state != COMMENT && s == 0 {
+            let mut inert = prefix_xor(q);
+            if *state == QUOTE {
+                inert = !inert;
+            }
+            // MSB set iff still inside a quoted region at the block boundary.
+            *state = inert >> 63;
+            return inert;
         }
         let mut inert = 0u64;
         // A region continuing from the previous block fills from bit 0.
@@ -1355,6 +1415,14 @@ mod avx2 {
         let lo_bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, needle)) as u32 as u64;
         let hi_bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, needle)) as u32 as u64;
         lo_bits | (hi_bits << 32)
+    }
+
+    #[target_feature(enable = "pclmulqdq")]
+    fn prefix_xor(mask: u64) -> u64 {
+        let ones = _mm_set1_epi8(-1);
+        let value = _mm_set_epi64x(0, mask as i64);
+        let product = _mm_clmulepi64_si128::<0>(value, ones);
+        _mm_cvtsi128_si64(product) as u64
     }
 
     /// Branchless bit decoding (simdjson flatten_bits): write indexes in
