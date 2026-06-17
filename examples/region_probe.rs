@@ -51,7 +51,7 @@ fn with_comments(base: &[u8], every: usize) -> Vec<u8> {
     for chunk in base.split_inclusive(|&b| b == b'\n') {
         out.extend_from_slice(chunk);
         line += 1;
-        if line % every == 0 {
+        if line.is_multiple_of(every) {
             out.extend_from_slice(b"# comment line, with \"a\" quote and, commas\n");
         }
     }
