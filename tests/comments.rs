@@ -119,6 +119,41 @@ fn parallel_parse_matches_serial() {
     }
 }
 
+/// `parse_par_into` recycles the master tape buffers and must still produce
+/// records byte-identical to serial — including when the recycled buffer holds
+/// stale content from an unrelated parse (it must be cleared, not appended to).
+#[test]
+fn parallel_parse_into_matches_serial() {
+    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+    let alphabet = b"abc,,\n\n\"\"##  ,\nx\"";
+    for round in 0..150 {
+        let len = 64 + (rng.next() % 20000) as usize;
+        let mut input: Vec<u8> = (0..len)
+            .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+            .collect();
+        if rng.next() & 1 == 0 {
+            let at = (rng.next() as usize) % (input.len() + 1);
+            let mut blob = vec![b'"'];
+            for _ in 0..(rng.next() % 2000) {
+                blob.push(b"a,\n#\"".as_slice()[(rng.next() % 5) as usize]);
+            }
+            input.splice(at..at, blob);
+        }
+        let serial: Vec<Vec<u8>> =
+            k::parse(&input).records().map(|r| r.as_bytes().to_vec()).collect();
+        for threads in [1usize, 2, 8, 16, 24] {
+            // Recycle a buffer holding stale, unrelated tape content (a different
+            // length and record count) — it must be cleared, not appended to.
+            let stale = k::parse(b"stale,row,one\nstale,row,two\n# stale comment\nx,y,z\n");
+            let got: Vec<Vec<u8>> = k::parse_par_into(&input, threads, stale)
+                .records()
+                .map(|r| r.as_bytes().to_vec())
+                .collect();
+            assert_eq!(got, serial, "round {round} threads {threads} len {}", input.len());
+        }
+    }
+}
+
 #[test]
 fn streaming_skips_comments_like_batch() {
     let data = b"# c1\nfoo,1\n#c2,x\nbar,2\n# trailing";

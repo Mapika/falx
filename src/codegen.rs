@@ -2054,10 +2054,37 @@ fn region_scan_dispatch(data: &[u8], carries: &mut [u64; 2]) {
 /// boundaries land mid-quote/comment. The line-start carry is region
 /// independent (the newline status of the preceding byte), read directly.
 pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
+    match parse_par_parts(data, threads) {
+        Some(parts) => {
+            let (seps, ends) = scatter_tape(&parts);
+            Parsed { data, seps, ends }
+        }
+        None => parse(data),
+    }
+}
+
+/// Like [`parse_par`], reusing `recycle`'s tape allocations for the master tape
+/// (the big one). At GiB/s the soft page faults of a fresh master tape are a
+/// measurable share of a parse, so batch callers — one parse per request/file —
+/// hand the previous parse back to skip them; the per-chunk tapes are still
+/// fresh.
+pub fn parse_par_into<'a>(data: &'a [u8], threads: usize, recycle: Parsed<'_>) -> Parsed<'a> {
+    match parse_par_parts(data, threads) {
+        Some(parts) => {
+            let (seps, ends) = scatter_tape_into(&parts, recycle.seps, recycle.ends);
+            Parsed { data, seps, ends }
+        }
+        None => parse_into(data, recycle),
+    }
+}
+
+/// Build the per-chunk tape parts in parallel via the transfer-function scheme
+/// (phases below); `None` means fall back to the serial path.
+fn parse_par_parts(data: &[u8], threads: usize) -> Option<Vec<TapePart>> {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
     if threads == 1 || chunk == 0 {
-        return parse(data);
+        return None;
     }
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
@@ -2112,8 +2139,7 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
             .collect();
         handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
     });
-    let (seps, ends) = scatter_tape(&parts);
-    Parsed { data, seps, ends }
+    Some(parts)
 }
 
 /// Concatenate per-chunk tape parts into the master tape, copying each into its
@@ -2121,10 +2147,19 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
 /// already absolute; only each end entry's cumulative-separator high word is
 /// rebased by the separators in the preceding chunks.
 fn scatter_tape(parts: &[TapePart]) -> (Vec<u32>, Vec<u64>) {
+    scatter_tape_into(parts, Vec::new(), Vec::new())
+}
+
+/// [`scatter_tape`] reusing the provided buffers' allocations for the master
+/// tape (cleared first). `reserve` is a no-op when the recycled capacity already
+/// covers the totals, so the steady-state batch caller takes no page faults.
+fn scatter_tape_into(parts: &[TapePart], mut seps: Vec<u32>, mut ends: Vec<u64>) -> (Vec<u32>, Vec<u64>) {
     let sep_total: usize = parts.iter().map(|p| p.0.len()).sum();
     let end_total: usize = parts.iter().map(|p| p.1.len()).sum();
-    let mut seps: Vec<u32> = Vec::with_capacity(sep_total);
-    let mut ends: Vec<u64> = Vec::with_capacity(end_total);
+    seps.clear();
+    ends.clear();
+    seps.reserve(sep_total);
+    ends.reserve(end_total);
     let mut sep_prefix: Vec<u64> = Vec::with_capacity(parts.len());
     {
         let mut acc = 0u64;
