@@ -337,10 +337,13 @@ emission. To force handwritten graphs for every target, run
   and a parallel parse falls out of a per-chunk region *transfer function*
   (one combined single-pass 3-state scan) reconciled with no serial re-index —
   scaling ~6x at 24 threads, with `parse_par_into` recycling the master tape.
-- Next: a declarative `lines_per_record` so other fixed-line formats get FASTQ's
-  generated record API; ARM NEON backend (CI already verifies ARM correctness,
-  so it is pure speed work); full equality-saturation graph extraction over the
-  local cost-weighted optimizer. (The per-field clean path is already at the
+- M11 (done): declarative `lines_per_record` — a spec field that groups every N
+  newline-terminated lines into one generated record (FASTQ = 4), the lines
+  exposed as fields. The fixed-line-count record API, generated rather than
+  hand-written; differentially tested against the by-N reference grouping.
+- Next: ARM NEON backend (CI already verifies ARM correctness, so it is pure
+  speed work); full equality-saturation graph extraction over the local
+  cost-weighted optimizer. (The per-field clean path is already at the
   floor for real data — ~0.7 ns/field on the common borrow path; the only
   residual headroom is the `Vec` allocation in the rare doubled-quote copy path,
   which would want a non-allocating `fields_into` buffer-reuse API rather than a
