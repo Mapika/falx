@@ -891,6 +891,40 @@ fn emit_with(
     } else {
         String::new()
     };
+    // Comment+quote dialects also emit a no-tape region-state scan, used by the
+    // transfer-function parallel parse to learn each chunk's exit region state
+    // for all three entry states without writing the tape.
+    let (avx512_partial, avx2_partial) = if region_par {
+        let scan_tpl = r#"
+@ATTR@    pub fn region_scan(data: &[u8], carries: &mut [u64; 2]) {
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let _ = unsafe { step(data.as_ptr().add(offset), carries) };
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer (zero padded).
+            let _ = unsafe { step(block.as_ptr(), carries) };
+        }
+    }
+"#;
+        (
+            format!(
+                "{avx512_partial}{}",
+                scan_tpl.replace("@ATTR@", "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n")
+            ),
+            format!(
+                "{avx2_partial}{}",
+                scan_tpl.replace("@ATTR@", "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
+            ),
+        )
+    } else {
+        (avx512_partial, avx2_partial)
+    };
 
     let par_block = if par_mode {
         // One per-chunk tape part; aliased to keep the parallel driver's
@@ -1982,11 +2016,43 @@ fn index_tape_seeded(slice: &[u8], mut carries: [u64; 2], base: u32, seps: &mut 
     carries[1]
 }
 
-/// Parallel [`parse`]: byte-identical tape to serial [`parse`], built across
-/// `threads` chunks via speculative NORMAL-state indexing plus a serial
-/// region-state reconcile. When chunk boundaries fall between records (the
-/// common case) no chunk is re-indexed and the pass is fully parallel; only
-/// boundaries landing inside a quoted field or comment cost a serial re-index.
+/// Runtime-dispatched region-state scan with no tape output: threads the entry
+/// carries `[line_start, region_state]` through the kernel and returns (in
+/// `carries`) the exit state. The transfer-function phase below runs it once
+/// per possible entry state to learn each chunk's `state -> state` map.
+fn region_scan_dispatch(data: &[u8], carries: &mut [u64; 2]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::region_scan(data, carries) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx2::region_scan(data, carries) };
+        return;
+    }
+    unsupported_cpu();
+}
+
+/// Parallel [`parse`]: byte-identical tape to serial [`parse`]. The region
+/// machine (NORMAL/QUOTE/COMMENT) carries state across chunks and its
+/// transitions are not XOR-linear, so the entry state cannot be recovered with
+/// a parity prefix as in the quote-only dialects. Instead each chunk's region
+/// *transfer function* `f: state -> state` is computed in parallel (phase 1, a
+/// no-tape scan for each of the three possible entry states); every chunk's
+/// true entry state then follows from an O(threads) serial composition
+/// (phase 2); and every chunk is indexed exactly once, in parallel, with its
+/// known entry state (phase 3) — no serial re-indexing regardless of how many
+/// boundaries land mid-quote/comment. The line-start carry is region
+/// independent (the newline status of the preceding byte), read directly.
 pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
@@ -2001,39 +2067,51 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let line_start = |b: usize| -> u64 {
         if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }
     };
-    let mut results: Vec<(TapePart, u64)> = std::thread::scope(|s| {
+    // Phase 1 (parallel): each chunk's region transfer function — the exit
+    // region state for each of the three possible entry region states.
+    let transfer: Vec<[u64; 3]> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let ls = line_start(bounds[t]);
+                s.spawn(move || {
+                    let mut f = [0u64; 3];
+                    for entry in 0..3u64 {
+                        let mut c = [ls, entry];
+                        region_scan_dispatch(slice, &mut c);
+                        f[entry as usize] = c[1];
+                    }
+                    f
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("scan thread ok")).collect()
+    });
+    // Phase 2 (serial, O(threads)): compose transfer functions to get every
+    // chunk's true entry region state (file start = NORMAL = CARRY_INIT[1]).
+    let mut entry = vec![0u64; threads];
+    let mut region = 0u64;
+    for t in 0..threads {
+        entry[t] = region;
+        region = transfer[t][region as usize];
+    }
+    // Phase 3 (parallel): index every chunk exactly once with its true carries.
+    let parts: Vec<TapePart> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let slice = &data[bounds[t]..bounds[t + 1]];
                 let base = bounds[t] as u32;
-                let ls = line_start(bounds[t]);
+                let carries = [line_start(bounds[t]), entry[t]];
                 s.spawn(move || {
                     let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
                     let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
-                    let exit = index_tape_seeded(slice, [ls, 0], base, &mut seps, &mut ends);
-                    ((seps, ends), exit)
+                    let _ = index_tape_seeded(slice, carries, base, &mut seps, &mut ends);
+                    (seps, ends)
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
+        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
     });
-    // Reconcile: thread the true region state. A chunk entering in NORMAL kept
-    // the correct speculative tape; a chunk entering mid-quote/comment is
-    // re-indexed (serial, but only for non-NORMAL entries — rare in practice).
-    let mut region = 0u64;
-    for t in 0..threads {
-        if region == 0 {
-            region = results[t].1;
-        } else {
-            let slice = &data[bounds[t]..bounds[t + 1]];
-            let base = bounds[t] as u32;
-            let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
-            let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
-            region = index_tape_seeded(slice, [line_start(bounds[t]), region], base, &mut seps, &mut ends);
-            results[t].0 = (seps, ends);
-        }
-    }
-    let parts: Vec<TapePart> = results.into_iter().map(|r| r.0).collect();
     let (seps, ends) = scatter_tape(&parts);
     Parsed { data, seps, ends }
 }
