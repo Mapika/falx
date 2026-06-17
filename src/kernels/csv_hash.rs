@@ -42,6 +42,143 @@ fn unsupported_cpu() -> ! {
 }
 
 
+/// One chunk's tape: separator positions and end entries.
+type TapePart = (Vec<u32>, Vec<u64>);
+
+/// Index one chunk with the given entry carries `[line_start, region_state]`,
+/// returning the exit region state. Full 64-byte blocks go through
+/// `index_tape_partial_dispatch`; a trailing partial block (only ever the final
+/// chunk) is zero-padded exactly as the serial tail.
+fn index_tape_seeded(slice: &[u8], mut carries: [u64; 2], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) -> u64 {
+    let full = slice.len() & !63;
+    index_tape_partial_dispatch(&slice[..full], &mut carries, base, seps, ends);
+    let rem = slice.len() - full;
+    if rem > 0 {
+        let mut block = [0u8; 64];
+        block[..rem].copy_from_slice(&slice[full..]);
+        let live = (1u64 << rem) - 1;
+        index_tape_block_dispatch(&block, live, &mut carries, base + full as u32, seps, ends);
+    }
+    carries[1]
+}
+
+/// Parallel [`parse`]: byte-identical tape to serial [`parse`], built across
+/// `threads` chunks via speculative NORMAL-state indexing plus a serial
+/// region-state reconcile. When chunk boundaries fall between records (the
+/// common case) no chunk is re-indexed and the pass is fully parallel; only
+/// boundaries landing inside a quoted field or comment cost a serial re-index.
+pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return parse(data);
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // Line-start carry entering a chunk: region-independent, = whether the byte
+    // before it was a newline (CARRY_INIT at the file start).
+    let line_start = |b: usize| -> u64 {
+        if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }
+    };
+    let mut results: Vec<(TapePart, u64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                let ls = line_start(bounds[t]);
+                s.spawn(move || {
+                    let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+                    let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
+                    let exit = index_tape_seeded(slice, [ls, 0], base, &mut seps, &mut ends);
+                    ((seps, ends), exit)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("parse thread ok")).collect()
+    });
+    // Reconcile: thread the true region state. A chunk entering in NORMAL kept
+    // the correct speculative tape; a chunk entering mid-quote/comment is
+    // re-indexed (serial, but only for non-NORMAL entries — rare in practice).
+    let mut region = 0u64;
+    for t in 0..threads {
+        if region == 0 {
+            region = results[t].1;
+        } else {
+            let slice = &data[bounds[t]..bounds[t + 1]];
+            let base = bounds[t] as u32;
+            let mut seps = Vec::with_capacity(slice.len() / 16 + 8);
+            let mut ends = Vec::with_capacity(slice.len() / 32 + 8);
+            region = index_tape_seeded(slice, [line_start(bounds[t]), region], base, &mut seps, &mut ends);
+            results[t].0 = (seps, ends);
+        }
+    }
+    let parts: Vec<TapePart> = results.into_iter().map(|r| r.0).collect();
+    let (seps, ends) = scatter_tape(&parts);
+    Parsed { data, seps, ends }
+}
+
+/// Concatenate per-chunk tape parts into the master tape, copying each into its
+/// own disjoint slot concurrently. Separator positions and end byte offsets are
+/// already absolute; only each end entry's cumulative-separator high word is
+/// rebased by the separators in the preceding chunks.
+fn scatter_tape(parts: &[TapePart]) -> (Vec<u32>, Vec<u64>) {
+    let sep_total: usize = parts.iter().map(|p| p.0.len()).sum();
+    let end_total: usize = parts.iter().map(|p| p.1.len()).sum();
+    let mut seps: Vec<u32> = Vec::with_capacity(sep_total);
+    let mut ends: Vec<u64> = Vec::with_capacity(end_total);
+    let mut sep_prefix: Vec<u64> = Vec::with_capacity(parts.len());
+    {
+        let mut acc = 0u64;
+        for p in parts {
+            sep_prefix.push(acc);
+            acc += p.0.len() as u64;
+        }
+    }
+    {
+        let mut srest = &mut seps.spare_capacity_mut()[..sep_total];
+        let mut erest = &mut ends.spare_capacity_mut()[..end_total];
+        let mut sslots: Vec<&mut [std::mem::MaybeUninit<u32>]> = Vec::with_capacity(parts.len());
+        let mut eslots: Vec<&mut [std::mem::MaybeUninit<u64>]> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let (sh, st) = srest.split_at_mut(p.0.len());
+            sslots.push(sh);
+            srest = st;
+            let (eh, et) = erest.split_at_mut(p.1.len());
+            eslots.push(eh);
+            erest = et;
+        }
+        std::thread::scope(|s| {
+            for (((sslot, eslot), part), &prefix) in
+                sslots.into_iter().zip(eslots).zip(parts.iter()).zip(sep_prefix.iter())
+            {
+                s.spawn(move || {
+                    // SAFETY: each slot's length equals its part's; the writes
+                    // initialize exactly these disjoint slices.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.0.as_ptr(),
+                            sslot.as_mut_ptr().cast::<u32>(),
+                            part.0.len(),
+                        );
+                    }
+                    let rebase = prefix << 32;
+                    let dst = eslot.as_mut_ptr().cast::<u64>();
+                    for (i, &e) in part.1.iter().enumerate() {
+                        // SAFETY: i < part.1.len() == eslot.len().
+                        unsafe { *dst.add(i) = e + rebase; }
+                    }
+                });
+            }
+        });
+    }
+    // SAFETY: the scatter initialized every element of both spare regions.
+    unsafe {
+        seps.set_len(sep_total);
+        ends.set_len(end_total);
+    }
+    (seps, ends)
+}
 /// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]

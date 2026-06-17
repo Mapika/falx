@@ -59,6 +59,66 @@ fn hand_picked_comment_semantics() {
     assert_eq!(recs, vec![b"a,\"multi\nline\"".to_vec(), b"b,2".to_vec()]);
 }
 
+/// Parallel parse must produce byte-identical records to serial parse across
+/// thread counts, with quoted fields and comments freely spanning the
+/// speculative chunk boundaries (the case that exercises the serial 3-state
+/// region reconcile + re-indexing).
+#[test]
+fn parallel_parse_matches_serial() {
+    // Hand-picked: a multi-line quoted field containing a line that *starts*
+    // with '#' (not a comment — it is inside the quote), then real comment and
+    // data lines, all long enough to straddle 64-byte block / chunk bounds.
+    let mut tricky = Vec::new();
+    tricky.extend_from_slice(b"k,\"a very long quoted value with\n#not a comment, still quoted\nand more, lines\"\n");
+    for i in 0..50 {
+        tricky.extend_from_slice(b"# comment line, with \"quote\" and, commas\n");
+        tricky.extend_from_slice(format!("row{i},{i},\"x\ny\"\n").as_bytes());
+    }
+    let serial: Vec<Vec<u8>> = k::parse(&tricky).records().map(|r| r.as_bytes().to_vec()).collect();
+    for threads in [1usize, 2, 3, 4, 8, 16, 24, 48] {
+        let par: Vec<Vec<u8>> = k::parse_par(&tricky, threads)
+            .records()
+            .map(|r| r.as_bytes().to_vec())
+            .collect();
+        assert_eq!(par, serial, "hand-picked, threads {threads}");
+    }
+
+    // Randomized: structure-heavy alphabet so quotes/comments span boundaries;
+    // sizes large enough to split into many chunks at high thread counts.
+    let mut rng = Rng(0xA11C_E5EE_D012_3499);
+    let alphabet = b"abc,,\n\n\"\"##  ,\nx\"";
+    for round in 0..300 {
+        let len = 64 + (rng.next() % 30000) as usize;
+        let mut input: Vec<u8> = (0..len)
+            .map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize])
+            .collect();
+        // Occasionally splice in a long multi-line quoted blob with embedded
+        // '#'/','/'\n' to force a quoted region across chunk boundaries.
+        if rng.next() & 1 == 0 {
+            let at = (rng.next() as usize) % (input.len() + 1);
+            let mut blob = vec![b'"'];
+            for _ in 0..(rng.next() % 3000) {
+                blob.push(b"a,\n#\"".as_slice()[(rng.next() % 5) as usize]);
+            }
+            input.splice(at..at, blob);
+        }
+        let serial: Vec<Vec<u8>> = k::parse(&input).records().map(|r| r.as_bytes().to_vec()).collect();
+        for threads in [1usize, 2, 3, 5, 8, 16, 24, 48] {
+            let par: Vec<Vec<u8>> = k::parse_par(&input, threads)
+                .records()
+                .map(|r| r.as_bytes().to_vec())
+                .collect();
+            assert_eq!(
+                par.len(),
+                serial.len(),
+                "round {round} threads {threads} len {}: record count",
+                input.len()
+            );
+            assert_eq!(par, serial, "round {round} threads {threads} len {}", input.len());
+        }
+    }
+}
+
 #[test]
 fn streaming_skips_comments_like_batch() {
     let data = b"# c1\nfoo,1\n#c2,x\nbar,2\n# trailing";
