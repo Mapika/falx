@@ -190,7 +190,7 @@ fn codegen_default_uses_manual_for_unsupported_dialects() {
 }
 
 #[test]
-fn codegen_default_uses_cost_weighted_graph_optimizer() {
+fn codegen_default_uses_eqsat_graph_optimizer() {
     let dialect = formats::csv_dialect();
     let default = codegen::emit_parser_with_columns(&dialect, "csv_opt_default_test", &[])
         .expect("default codegen should succeed");
@@ -199,7 +199,7 @@ fn codegen_default_uses_cost_weighted_graph_optimizer() {
         "csv_opt_default_test",
         &[],
         CodegenOptions {
-            graph_optimizer: GraphOptimizer::CostWeightedAvx2,
+            graph_optimizer: GraphOptimizer::EqSat,
             ..CodegenOptions::default()
         },
     )

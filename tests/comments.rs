@@ -69,12 +69,17 @@ fn parallel_parse_matches_serial() {
     // with '#' (not a comment — it is inside the quote), then real comment and
     // data lines, all long enough to straddle 64-byte block / chunk bounds.
     let mut tricky = Vec::new();
-    tricky.extend_from_slice(b"k,\"a very long quoted value with\n#not a comment, still quoted\nand more, lines\"\n");
+    tricky.extend_from_slice(
+        b"k,\"a very long quoted value with\n#not a comment, still quoted\nand more, lines\"\n",
+    );
     for i in 0..50 {
         tricky.extend_from_slice(b"# comment line, with \"quote\" and, commas\n");
         tricky.extend_from_slice(format!("row{i},{i},\"x\ny\"\n").as_bytes());
     }
-    let serial: Vec<Vec<u8>> = k::parse(&tricky).records().map(|r| r.as_bytes().to_vec()).collect();
+    let serial: Vec<Vec<u8>> = k::parse(&tricky)
+        .records()
+        .map(|r| r.as_bytes().to_vec())
+        .collect();
     for threads in [1usize, 2, 3, 4, 8, 16, 24, 48] {
         let par: Vec<Vec<u8>> = k::parse_par(&tricky, threads)
             .records()
@@ -102,7 +107,10 @@ fn parallel_parse_matches_serial() {
             }
             input.splice(at..at, blob);
         }
-        let serial: Vec<Vec<u8>> = k::parse(&input).records().map(|r| r.as_bytes().to_vec()).collect();
+        let serial: Vec<Vec<u8>> = k::parse(&input)
+            .records()
+            .map(|r| r.as_bytes().to_vec())
+            .collect();
         for threads in [1usize, 2, 3, 5, 8, 16, 24, 48] {
             let par: Vec<Vec<u8>> = k::parse_par(&input, threads)
                 .records()
@@ -114,7 +122,12 @@ fn parallel_parse_matches_serial() {
                 "round {round} threads {threads} len {}: record count",
                 input.len()
             );
-            assert_eq!(par, serial, "round {round} threads {threads} len {}", input.len());
+            assert_eq!(
+                par,
+                serial,
+                "round {round} threads {threads} len {}",
+                input.len()
+            );
         }
     }
 }
@@ -139,8 +152,10 @@ fn parallel_parse_into_matches_serial() {
             }
             input.splice(at..at, blob);
         }
-        let serial: Vec<Vec<u8>> =
-            k::parse(&input).records().map(|r| r.as_bytes().to_vec()).collect();
+        let serial: Vec<Vec<u8>> = k::parse(&input)
+            .records()
+            .map(|r| r.as_bytes().to_vec())
+            .collect();
         for threads in [1usize, 2, 8, 16, 24] {
             // Recycle a buffer holding stale, unrelated tape content (a different
             // length and record count) — it must be cleared, not appended to.
@@ -149,7 +164,12 @@ fn parallel_parse_into_matches_serial() {
                 .records()
                 .map(|r| r.as_bytes().to_vec())
                 .collect();
-            assert_eq!(got, serial, "round {round} threads {threads} len {}", input.len());
+            assert_eq!(
+                got,
+                serial,
+                "round {round} threads {threads} len {}",
+                input.len()
+            );
         }
     }
 }

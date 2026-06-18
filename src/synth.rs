@@ -119,16 +119,22 @@ pub struct CostModel {
 }
 
 impl CostModel {
-    /// The dispatched kernel: classes are a couple of compares, constants
-    /// are free registers, PrefixXor is PCLMULQDQ plus GPR/XMM round trips.
+    /// The dispatched kernel. Weights are calibrated from measured marginal
+    /// per-op latency (`examples/gen_calib.rs`: dependency chains differenced
+    /// across two lengths on this class of CPU): bitwise ops are effectively
+    /// free under memory bandwidth (kept at 1 as a floor), `Add`'s carry
+    /// propagation costs ~1.75× a shift, and `PrefixXor` (PCLMULQDQ plus
+    /// GPR/XMM round trips) ~4× a shift. `class` and `regions` are not
+    /// chain-measurable and remain estimates (`Regions` is a sequential
+    /// whole-stream walk, deliberately costly).
     pub fn avx2() -> Self {
         Self {
             class: 2,
             constant: 0,
             bitwise: 1,
             shift: 2,
-            add: 2,
-            prefix_xor: 10,
+            add: 3,
+            prefix_xor: 8,
             regions: 50,
         }
     }
@@ -2299,9 +2305,12 @@ mod tests {
             &budget,
         ) {
             Outcome::Found(sol) => {
+                // The minimal odd-backslash care-form is
+                // `EVEN ^ !Add(EVEN, EVEN ^ B)`: one class (2), one Add
+                // (calibrated 3), three shared bitwise ops (3) = 8.
                 assert!(
-                    sol.cost <= 7,
-                    "expected cost <= 7, got {} ({})",
+                    sol.cost <= 8,
+                    "expected cost <= 8, got {} ({})",
                     sol.cost,
                     sol.expr
                 );

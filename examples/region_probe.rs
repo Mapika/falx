@@ -37,7 +37,12 @@ fn bench(label: &str, data: &[u8], runs: usize) {
     let h = median(hash_g);
     println!(
         "{:<28} csv {:>5.2}  csv_hash {:>5.2} GiB/s  tax {:.2}x  (csv structs {}, hash structs {})",
-        label, c, h, c / h, csv_n, hash_n
+        label,
+        c,
+        h,
+        c / h,
+        csv_n,
+        hash_n
     );
 }
 
@@ -72,7 +77,11 @@ fn main() {
     }
     let base = &data[..end];
     let runs = 9;
-    println!("base: {} ({:.0} MiB quoted CSV body)\n", path, base.len() as f64 / 1048576.0);
+    println!(
+        "base: {} ({:.0} MiB quoted CSV body)\n",
+        path,
+        base.len() as f64 / 1048576.0
+    );
 
     bench("none (fast path B)", base, runs);
     let header = with_comments(base, 0); // then prepend a header block

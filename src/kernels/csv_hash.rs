@@ -9,6 +9,11 @@
 // with dialect-aware quote stripping and escape resolution.
 
 #[rustfmt::skip]
+// The SIMD bodies are `#[cfg(target_arch = "x86_64")]`-gated, so on other
+// architectures the kernel functions are dispatch stubs whose parameters and
+// helpers go unused; allow the resulting (arch-conditional) lints there only —
+// on x86 every lint stays active and catches real issues.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, dead_code, clippy::ptr_arg))]
 mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
@@ -1278,7 +1283,7 @@ mod avx512 {
         let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
         let v6 = !v5;
         let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
-        let v8 = v6 & v7;
+        let v8 = v7 & v6;
         (v8, v8 & v0)
     }
 
@@ -1597,7 +1602,7 @@ mod avx2 {
         let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
         let v6 = !v5;
         let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
-        let v8 = v6 & v7;
+        let v8 = v7 & v6;
         (v8, v8 & v0)
     }
 

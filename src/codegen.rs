@@ -163,13 +163,18 @@ pub enum GraphOptimizer {
     /// Run the deterministic cost-weighted graph simplifier using the AVX2
     /// cost model.
     CostWeightedAvx2,
+    /// Run the equality-saturation optimizer ([`crate::egraph`]) using the
+    /// AVX2 cost model: a superset of the `CostWeightedAvx2` rewrites that
+    /// extracts the globally cheapest graph rather than the cheaper of two
+    /// whole-graph candidates.
+    EqSat,
 }
 
 impl Default for CodegenOptions {
     fn default() -> Self {
         Self {
             graph_source: GraphSource::AutoWeighted(crate::synth_formats::SynthProfile::Weighted),
-            graph_optimizer: GraphOptimizer::CostWeightedAvx2,
+            graph_optimizer: GraphOptimizer::EqSat,
         }
     }
 }
@@ -317,6 +322,9 @@ pub fn emit_parser_with_columns_options(
         GraphOptimizer::Disabled => parts,
         GraphOptimizer::CostWeightedAvx2 => {
             crate::graph_opt::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
+        }
+        GraphOptimizer::EqSat => {
+            crate::egraph::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
         }
     };
     emit_with(
@@ -951,11 +959,17 @@ fn emit_with(
         (
             format!(
                 "{avx512_partial}\n{}",
-                emit_scan3(Flavor::Avx512, "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n")
+                emit_scan3(
+                    Flavor::Avx512,
+                    "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n"
+                )
             ),
             format!(
                 "{avx2_partial}\n{}",
-                emit_scan3(Flavor::Avx2, "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
+                emit_scan3(
+                    Flavor::Avx2,
+                    "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n"
+                )
             ),
         )
     } else {
@@ -1653,6 +1667,11 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
 // depends only on std.
 {parser_doc}
 #[rustfmt::skip]
+// The SIMD bodies are `#[cfg(target_arch = "x86_64")]`-gated, so on other
+// architectures the kernel functions are dispatch stubs whose parameters and
+// helpers go unused; allow the resulting (arch-conditional) lints there only —
+// on x86 every lint stays active and catches real issues.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, dead_code, clippy::ptr_arg))]
 mod generated {{
 {carry_init_const}/// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
@@ -6512,6 +6531,21 @@ impl<'a> Nested<'a> {
             limit: self.data.len(),
         }
     }
+
+    /// Every scalar span in the document, flat and depth-independent, in input
+    /// order: keys and values at any nesting level, whitespace-trimmed, with
+    /// quotes and escapes intact (zero-copy). Aggregate queries — sum, count,
+    /// search — that do not need the object/array structure run as a single
+    /// O(tape) pass here, far cheaper than recursive [`Self::items`] descent:
+    /// every scalar is the gap between consecutive structural-byte positions,
+    /// which the tape already stores in ascending order.
+    pub fn scalars(&self) -> Scalars<'a, '_> {
+        Scalars {
+            nested: self,
+            next: 0,
+            cursor: 0,
+        }
+    }
 }
 
 /// One value: a bracketed container or a whitespace-trimmed scalar span.
@@ -6653,6 +6687,48 @@ impl<'a, 'p> Iterator for Items<'a, 'p> {
                         return Some(Node { nested: self.nested, repr: Repr::Scalar(s, e) });
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Flat iterator over every scalar span in the document; see
+/// [`Nested::scalars`]. One linear pass over the tape: the gap between each pair
+/// of consecutive structural-byte positions (and the trailing gap) is a scalar,
+/// trimmed of whitespace and skipped if empty. No recursion, no per-level state.
+pub struct Scalars<'a, 'p> {
+    nested: &'p Nested<'a>,
+    /// Next tape index to inspect.
+    next: usize,
+    /// Byte position where the pending scalar gap starts.
+    cursor: usize,
+}
+
+impl<'a, 'p> Iterator for Scalars<'a, 'p> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let data = self.nested.data;
+        let tape = &self.nested.tape;
+        loop {
+            if self.next >= tape.len() {
+                // The trailing gap after the last structural byte, yielded at
+                // most once (cursor is pushed past the input to stop).
+                if self.cursor <= data.len() {
+                    let (s, e) = trim_ws(data, self.cursor, data.len());
+                    self.cursor = data.len() + 1;
+                    if s < e {
+                        return Some(&data[s..e]);
+                    }
+                }
+                return None;
+            }
+            let pos = (tape[self.next] as u32) as usize;
+            self.next += 1;
+            let (s, e) = trim_ws(data, self.cursor, pos);
+            self.cursor = pos + 1;
+            if s < e {
+                return Some(&data[s..e]);
             }
         }
     }

@@ -341,9 +341,30 @@ emission. To force handwritten graphs for every target, run
   newline-terminated lines into one generated record (FASTQ = 4), the lines
   exposed as fields. The fixed-line-count record API, generated rather than
   hand-written; differentially tested against the by-N reference grouping.
+- M12 (done): equality-saturation graph extraction (`src/egraph.rs`,
+  `GraphOptimizer::EqSat`) — the e-graph the two-candidate `graph_opt` simplifier
+  anticipated. It keeps every equivalent form of every subterm in a congruence
+  closure, saturates a superset of the old rewrites (plus AC normalization, De
+  Morgan, distributive factoring of shared subterms) and extracts the globally
+  cheapest graph, so it can speculate per-subterm where the global
+  conservative/speculative pick cannot. Associativity is handled by
+  *AC-flattening* (combine a whole same-op chain in one pass) rather than
+  pairwise rewrites (which Catalan-explode), and saturation is *staged* — the
+  cheap two-candidate rules reach a fixpoint first (so the result is never worse
+  than that optimizer), then the expensive new rules run under budget.
+  Deterministic (byte-identical codegen) and provably never costlier than the
+  input. Extraction emits operands deeper-subtree-first (Sethi–Ullman), matching
+  the rebuild's register-pressure ordering — without it, equal-cost extractions
+  schedule measurably worse (a benchmarked ~7% regression on `json` before the
+  fix). On the built-in dialects (≤18 nodes) it ties the two-candidate optimizer;
+  the advantage grows with graph size — `cargo run --example egraph_scaling`
+  curves it at +8–23% cheaper across 18–256-node random circuits, every point
+  differentially verified. Now the codegen **default**: regenerating the kernels
+  under it changed only 4 escape/region dialects (`json`, `logfmt`, `ndjson`,
+  `csv_hash`), all confirmed within the benchmark noise floor vs the previous
+  optimizer.
 - Next: ARM NEON backend (CI already verifies ARM correctness, so it is pure
-  speed work); full equality-saturation graph extraction over the local
-  cost-weighted optimizer. (The per-field clean path is already at the
+  speed work). (The per-field clean path is already at the
   floor for real data — ~0.7 ns/field on the common borrow path; the only
   residual headroom is the `Vec` allocation in the rare doubled-quote copy path,
   which would want a non-allocating `fields_into` buffer-reuse API rather than a

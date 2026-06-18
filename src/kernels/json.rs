@@ -9,6 +9,11 @@
 // with dialect-aware quote stripping and escape resolution.
 
 #[rustfmt::skip]
+// The SIMD bodies are `#[cfg(target_arch = "x86_64")]`-gated, so on other
+// architectures the kernel functions are dispatch stubs whose parameters and
+// helpers go unused; allow the resulting (arch-conditional) lints there only —
+// on x86 every lint stays active and catches real issues.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, dead_code, clippy::ptr_arg))]
 mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
@@ -743,6 +748,21 @@ impl<'a> Nested<'a> {
             limit: self.data.len(),
         }
     }
+
+    /// Every scalar span in the document, flat and depth-independent, in input
+    /// order: keys and values at any nesting level, whitespace-trimmed, with
+    /// quotes and escapes intact (zero-copy). Aggregate queries — sum, count,
+    /// search — that do not need the object/array structure run as a single
+    /// O(tape) pass here, far cheaper than recursive [`Self::items`] descent:
+    /// every scalar is the gap between consecutive structural-byte positions,
+    /// which the tape already stores in ascending order.
+    pub fn scalars(&self) -> Scalars<'a, '_> {
+        Scalars {
+            nested: self,
+            next: 0,
+            cursor: 0,
+        }
+    }
 }
 
 /// One value: a bracketed container or a whitespace-trimmed scalar span.
@@ -884,6 +904,48 @@ impl<'a, 'p> Iterator for Items<'a, 'p> {
                         return Some(Node { nested: self.nested, repr: Repr::Scalar(s, e) });
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Flat iterator over every scalar span in the document; see
+/// [`Nested::scalars`]. One linear pass over the tape: the gap between each pair
+/// of consecutive structural-byte positions (and the trailing gap) is a scalar,
+/// trimmed of whitespace and skipped if empty. No recursion, no per-level state.
+pub struct Scalars<'a, 'p> {
+    nested: &'p Nested<'a>,
+    /// Next tape index to inspect.
+    next: usize,
+    /// Byte position where the pending scalar gap starts.
+    cursor: usize,
+}
+
+impl<'a, 'p> Iterator for Scalars<'a, 'p> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let data = self.nested.data;
+        let tape = &self.nested.tape;
+        loop {
+            if self.next >= tape.len() {
+                // The trailing gap after the last structural byte, yielded at
+                // most once (cursor is pushed past the input to stop).
+                if self.cursor <= data.len() {
+                    let (s, e) = trim_ws(data, self.cursor, data.len());
+                    self.cursor = data.len() + 1;
+                    if s < e {
+                        return Some(&data[s..e]);
+                    }
+                }
+                return None;
+            }
+            let pos = (tape[self.next] as u32) as usize;
+            self.next += 1;
+            let (s, e) = trim_ws(data, self.cursor, pos);
+            self.cursor = pos + 1;
+            if s < e {
+                return Some(&data[s..e]);
             }
         }
     }
@@ -1405,11 +1467,11 @@ mod avx512 {
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
         let v5 = eq_mask(lo, hi, 34u8); // class "\""
-        let v6 = v4 & v5;
+        let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
         let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v10 = v8 & v9;
+        let v10 = v9 & v8;
         let v11 = eq_mask(lo, hi, 10u8); // class "\n"
         (v10, v10 & v11)
     }
@@ -1430,11 +1492,11 @@ mod avx512 {
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
         let v5 = eq_mask(lo, hi, 34u8); // class "\""
-        let v6 = v4 & v5;
+        let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
         let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v10 = v8 & v9;
+        let v10 = v9 & v8;
         let v12 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
         let v13 = v8 & v12;
         let v14 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"
@@ -1729,11 +1791,11 @@ mod avx2 {
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
         let v5 = eq_mask(lo, hi, 34u8); // class "\""
-        let v6 = v4 & v5;
+        let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
         let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v10 = v8 & v9;
+        let v10 = v9 & v8;
         let v11 = eq_mask(lo, hi, 10u8); // class "\n"
         (v10, v10 & v11)
     }
@@ -1754,11 +1816,11 @@ mod avx2 {
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
         let v5 = eq_mask(lo, hi, 34u8); // class "\""
-        let v6 = v4 & v5;
+        let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
         let v9 = eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 123u8) | eq_mask(lo, hi, 125u8); // class ",:[]{}"
-        let v10 = v8 & v9;
+        let v10 = v9 & v8;
         let v12 = eq_mask(lo, hi, 91u8) | eq_mask(lo, hi, 123u8); // class "[{"
         let v13 = v8 & v12;
         let v14 = eq_mask(lo, hi, 93u8) | eq_mask(lo, hi, 125u8); // class "]}"

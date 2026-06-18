@@ -32,9 +32,15 @@ fn main() {
     // Correctness sanity: record counts agree (cheap, on real data).
     let serial_recs = falx::kernels::csv_hash::parse(&data).terminated_record_count();
     let par_recs = falx::kernels::csv_hash::parse_par(&data, 24).terminated_record_count();
-    assert_eq!(serial_recs, par_recs, "parse_par record count must match serial");
+    assert_eq!(
+        serial_recs, par_recs,
+        "parse_par record count must match serial"
+    );
 
-    println!("csv_hash parse_par: {:.2} GiB (quote-dense body + clustered # header)\n", gib);
+    println!(
+        "csv_hash parse_par: {:.2} GiB (quote-dense body + clustered # header)\n",
+        gib
+    );
 
     // Headline: interleave serial vs par@24 (fresh tape) vs par_into@24
     // (recycled tape) so they share run conditions. parse_par_into hands the
@@ -61,8 +67,16 @@ fn main() {
     let (s, p24, i24) = (median(serial), median(par24), median(into24));
     println!("INTERLEAVED A/B (median of 15):");
     println!("  serial parse           {:>6.2} GiB/s   1.00x", s);
-    println!("  parse_par x24          {:>6.2} GiB/s   {:.2}x", p24, p24 / s);
-    println!("  parse_par_into x24     {:>6.2} GiB/s   {:.2}x  (recycled tape)\n", i24, i24 / s);
+    println!(
+        "  parse_par x24          {:>6.2} GiB/s   {:.2}x",
+        p24,
+        p24 / s
+    );
+    println!(
+        "  parse_par_into x24     {:>6.2} GiB/s   {:.2}x  (recycled tape)\n",
+        i24,
+        i24 / s
+    );
 
     // Indicative scaling curve (single pass each, noisier; HT >24 hurts).
     println!("scaling sweep (indicative):");
@@ -75,6 +89,11 @@ fn main() {
             std::hint::black_box(p.terminated_record_count());
         }
         let m = median(g);
-        println!("  parse_par x{:<4} {:>6.2} GiB/s   {:.2}x", threads, m, m / s);
+        println!(
+            "  parse_par x{:<4} {:>6.2} GiB/s   {:.2}x",
+            threads,
+            m,
+            m / s
+        );
     }
 }
