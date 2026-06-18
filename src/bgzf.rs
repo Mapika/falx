@@ -24,12 +24,14 @@ const HEADER_LEN: usize = 12;
 /// gzip trailer: CRC32 (4) + ISIZE (4).
 const TRAILER_LEN: usize = 8;
 
-/// One decompressible block: the raw-DEFLATE payload range within the input,
-/// the uncompressed size, and the offset of its output in the result buffer.
-struct Block {
-    payload: Range<usize>,
-    isize: usize,
-    out_off: usize,
+/// One decompressible block: the raw-DEFLATE payload range within the input
+/// and its uncompressed size. Blocks are independent, so a consumer can inflate
+/// any contiguous run on its own (the fusion path decompresses one group per
+/// worker straight into the parser).
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub payload: Range<usize>,
+    pub isize: usize,
 }
 
 /// Read the `BC` subfield (`SI1=66`, `SI2=67`, `SLEN=2`) from a block's gzip
@@ -51,12 +53,11 @@ fn read_bsize(extra: &[u8]) -> io::Result<usize> {
     ))
 }
 
-/// Scan every block boundary, returning the block list and the total
-/// uncompressed length. One linear pass, no inflation.
-fn scan_blocks(data: &[u8]) -> io::Result<(Vec<Block>, usize)> {
+/// Scan every block boundary in one linear pass (no inflation), returning the
+/// independent blocks in stream order. Empty bgzf EOF blocks are dropped.
+pub fn scan(data: &[u8]) -> io::Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut pos = 0usize;
-    let mut out_total = 0usize;
     while pos < data.len() {
         if pos + HEADER_LEN > data.len() {
             return Err(Error::new(
@@ -98,20 +99,15 @@ fn scan_blocks(data: &[u8]) -> io::Result<(Vec<Block>, usize)> {
         ]) as usize;
         // The bgzf EOF marker is an empty block (ISIZE 0); skip empties.
         if isize > 0 {
-            blocks.push(Block {
-                payload,
-                isize,
-                out_off: out_total,
-            });
-            out_total += isize;
+            blocks.push(Block { payload, isize });
         }
         pos += block_len;
     }
-    Ok((blocks, out_total))
+    Ok(blocks)
 }
 
 /// Inflate one raw-DEFLATE block into its exact-size output slice.
-fn inflate_into(payload: &[u8], out: &mut [u8]) -> io::Result<()> {
+fn inflate_one(payload: &[u8], out: &mut [u8]) -> io::Result<()> {
     let mut d = Decompress::new(false); // raw DEFLATE: bgzf carries no zlib header
     d.decompress(payload, out, FlushDecompress::Finish)
         .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
@@ -124,17 +120,33 @@ fn inflate_into(payload: &[u8], out: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Total uncompressed size of `blocks`.
+fn span(blocks: &[Block]) -> usize {
+    blocks.iter().map(|b| b.isize).sum()
+}
+
+/// Inflate `blocks` (a contiguous run) sequentially into `out`, which must be
+/// exactly their combined uncompressed length.
+fn inflate_blocks_into(data: &[u8], blocks: &[Block], out: &mut [u8]) -> io::Result<()> {
+    let mut off = 0usize;
+    for b in blocks {
+        inflate_one(&data[b.payload.clone()], &mut out[off..off + b.isize])?;
+        off += b.isize;
+    }
+    Ok(())
+}
+
+/// Decompress a contiguous run of already-scanned blocks into a fresh buffer.
+/// The building block for the fusion path: a worker inflates exactly its group.
+pub fn inflate_range(data: &[u8], blocks: &[Block]) -> io::Result<Vec<u8>> {
+    let mut out = vec![0u8; span(blocks)];
+    inflate_blocks_into(data, blocks, &mut out)?;
+    Ok(out)
+}
+
 /// Decompress a whole bgzf stream on one thread.
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
-    let (blocks, total) = scan_blocks(data)?;
-    let mut out = vec![0u8; total];
-    for b in &blocks {
-        inflate_into(
-            &data[b.payload.clone()],
-            &mut out[b.out_off..b.out_off + b.isize],
-        )?;
-    }
-    Ok(out)
+    inflate_range(data, &scan(data)?)
 }
 
 /// Decompress a whole bgzf stream across `threads` workers. Blocks are
@@ -142,57 +154,37 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
 /// worker inflates straight into its own `split_at_mut` slice — no locking, no
 /// post-merge copy.
 pub fn decompress_par(data: &[u8], threads: usize) -> io::Result<Vec<u8>> {
-    let (blocks, total) = scan_blocks(data)?;
+    let blocks = scan(data)?;
     let threads = threads.max(1).min(blocks.len().max(1));
+    let mut out = vec![0u8; span(&blocks)];
     if threads == 1 || blocks.len() <= 1 {
-        let mut out = vec![0u8; total];
-        for b in &blocks {
-            inflate_into(
-                &data[b.payload.clone()],
-                &mut out[b.out_off..b.out_off + b.isize],
-            )?;
-        }
+        inflate_blocks_into(data, &blocks, &mut out)?;
         return Ok(out);
     }
 
-    let mut out = vec![0u8; total];
-    // Contiguous block runs of roughly equal block count.
+    // Contiguous block runs of roughly equal block count, each handed the exact
+    // output slice its blocks cover.
     let per = blocks.len().div_ceil(threads);
     let groups: Vec<&[Block]> = blocks.chunks(per).collect();
-
-    // Hand each group the exact contiguous output slice its blocks cover.
     let mut slots: Vec<&mut [u8]> = Vec::with_capacity(groups.len());
     let mut rest = out.as_mut_slice();
     for g in &groups {
-        let span: usize = g.iter().map(|b| b.isize).sum();
-        let (head, tail) = rest.split_at_mut(span);
+        let (head, tail) = rest.split_at_mut(span(g));
         slots.push(head);
         rest = tail;
     }
 
-    let result = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         let handles: Vec<_> = groups
             .into_iter()
             .zip(slots)
-            .map(|(group, slot)| {
-                // Offsets within this group's slice are absolute out_off minus
-                // the group's first block offset (chunks() never yields empty).
-                let group_base = group[0].out_off;
-                s.spawn(move || -> io::Result<()> {
-                    for b in group {
-                        let lo = b.out_off - group_base;
-                        inflate_into(&data[b.payload.clone()], &mut slot[lo..lo + b.isize])?;
-                    }
-                    Ok(())
-                })
-            })
+            .map(|(group, slot)| s.spawn(move || inflate_blocks_into(data, group, slot)))
             .collect();
         handles
             .into_iter()
             .map(|h| h.join().expect("bgzf worker panicked"))
             .collect::<io::Result<Vec<()>>>()
-    });
-    result?;
+    })?;
     Ok(out)
 }
 
