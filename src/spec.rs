@@ -249,7 +249,22 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
                 ),
                 None => None,
             };
-            columns.push(Column { index, name, ty });
+            // Optional: extract a key from within field `index` (e.g. VCF INFO)
+            // rather than projecting the whole field.
+            let info_key = match table.get("info_key") {
+                Some(v) => Some(
+                    v.as_str()
+                        .ok_or(format!("columns[{i}]: 'info_key' must be a string"))?
+                        .to_string(),
+                ),
+                None => None,
+            };
+            columns.push(Column {
+                index,
+                name,
+                ty,
+                info_key,
+            });
         }
     }
 

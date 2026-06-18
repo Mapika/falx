@@ -831,6 +831,14 @@ pub struct Columns<'a> {
     pub quality: Vec<f64>,
     /// Validity bitmap for `quality`.
     pub quality_valid: Vec<u64>,
+    /// Field 7 of each record as `i64`; zero where invalid.
+    pub dp: Vec<i64>,
+    /// Validity bitmap for `dp`.
+    pub dp_valid: Vec<u64>,
+    /// Field 7 of each record as `f64`; zero where invalid.
+    pub af: Vec<f64>,
+    /// Validity bitmap for `af`.
+    pub af_valid: Vec<u64>,
 }
 
 impl<'a> Columns<'a> {
@@ -846,6 +854,10 @@ impl<'a> Columns<'a> {
             alternate_valid: Vec::with_capacity(rows / 64 + 1),
             quality: Vec::with_capacity(rows),
             quality_valid: Vec::with_capacity(rows / 64 + 1),
+            dp: Vec::with_capacity(rows),
+            dp_valid: Vec::with_capacity(rows / 64 + 1),
+            af: Vec::with_capacity(rows),
+            af_valid: Vec::with_capacity(rows / 64 + 1),
         }
     }
 
@@ -865,7 +877,7 @@ pub(crate) struct ColumnSink<'a> {
     field_start: u32,
     record_start: u32,
     ordinal: u32,
-    pending: [(u32, u32); 4],
+    pending: [(u32, u32); 6],
     /// Bit k set = declared column k's span is pending this record.
     found: u32,
     end: u32,
@@ -882,7 +894,7 @@ impl<'a> ColumnSink<'a> {
             field_start: start,
             record_start: start,
             ordinal: 0,
-            pending: [(0, 0); 4],
+            pending: [(0, 0); 6],
             found: 0,
             end,
             emitting,
@@ -916,6 +928,7 @@ impl<'a> ColumnSink<'a> {
             3 => { self.pending[1] = (self.field_start, p); self.found |= 2; }
             4 => { self.pending[2] = (self.field_start, p); self.found |= 4; }
             5 => { self.pending[3] = (self.field_start, p); self.found |= 8; }
+            7 => { self.pending[4] = (self.field_start, p); self.found |= 16; self.pending[5] = (self.field_start, p); self.found |= 32; }
                 _ => {}
                 }
                 self.ordinal += 1;
@@ -943,6 +956,7 @@ impl<'a> ColumnSink<'a> {
             3 => { self.pending[1] = (self.field_start, to); self.found |= 2; }
             4 => { self.pending[2] = (self.field_start, to); self.found |= 4; }
             5 => { self.pending[3] = (self.field_start, to); self.found |= 8; }
+            7 => { self.pending[4] = (self.field_start, to); self.found |= 16; self.pending[5] = (self.field_start, to); self.found |= 32; }
         _ => {}
         }
         let row = self.cols.rows;
@@ -951,6 +965,8 @@ impl<'a> ColumnSink<'a> {
             self.cols.reference_valid.push(0);
             self.cols.alternate_valid.push(0);
             self.cols.quality_valid.push(0);
+            self.cols.dp_valid.push(0);
+            self.cols.af_valid.push(0);
         }
         let (cfrom, cto) = self.pending[0];
         let v = if self.found & 1 != 0 {
@@ -976,6 +992,45 @@ impl<'a> ColumnSink<'a> {
         };
         self.cols.quality.push(v.unwrap_or(0.0));
         self.cols.quality_valid[row >> 6] |= (v.is_some() as u64) << (row & 63);
+        let (ifrom, ito) = self.pending[4];
+        let info: &[u8] = if self.found & 16 != 0 {
+            &data[ifrom as usize..ito as usize]
+        } else {
+            &[]
+        };
+        let mut dp_v: Option<i64> = None;
+        let mut af_v: Option<f64> = None;
+        {
+            let mut i = 0usize;
+            while i < info.len() {
+                let ks = i;
+                while i < info.len() && info[i] != b'=' && info[i] != b';' {
+                    i += 1;
+                }
+                let key = &info[ks..i];
+                let mut val: &[u8] = &[];
+                if i < info.len() && info[i] == b'=' {
+                    i += 1;
+                    let vs = i;
+                    while i < info.len() && info[i] != b';' {
+                        i += 1;
+                    }
+                    val = &info[vs..i];
+                }
+                match key {
+                    b"DP" => dp_v = parse_i64_cell(val),
+                    b"AF" => af_v = parse_f64_cell(val),
+                    _ => {}
+                }
+                if i < info.len() && info[i] == b';' {
+                    i += 1;
+                }
+            }
+        }
+        self.cols.dp.push(dp_v.unwrap_or(0));
+        self.cols.dp_valid[row >> 6] |= (dp_v.is_some() as u64) << (row & 63);
+        self.cols.af.push(af_v.unwrap_or(0.0));
+        self.cols.af_valid[row >> 6] |= (af_v.is_some() as u64) << (row & 63);
         self.cols.rows = row + 1;
     }
 
@@ -1077,6 +1132,10 @@ pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
         append_bitmap(&mut cols.alternate_valid, cols.rows, &part.alternate_valid, part.rows);
         cols.quality.extend_from_slice(&part.quality);
         append_bitmap(&mut cols.quality_valid, cols.rows, &part.quality_valid, part.rows);
+        cols.dp.extend_from_slice(&part.dp);
+        append_bitmap(&mut cols.dp_valid, cols.rows, &part.dp_valid, part.rows);
+        cols.af.extend_from_slice(&part.af);
+        append_bitmap(&mut cols.af_valid, cols.rows, &part.af_valid, part.rows);
         cols.rows += part.rows;
     }
     cols

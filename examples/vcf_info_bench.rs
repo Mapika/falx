@@ -297,6 +297,74 @@ fn throughput(bytes: usize, rows: usize, dt: std::time::Duration) -> (f64, f64) 
     )
 }
 
+/// The GENERATED codegen path: `vcf_typed::parse_columns` projects POS/REF/ALT/
+/// QUAL (top-level) + DP/AF (INFO sub-columns) straight into Arrow-layout
+/// buffers (values + validity bitmaps). We lift DP/AF back out for the gate.
+fn falx_codegen_extract(data: &[u8]) -> Columns {
+    use falx::kernels::vcf_typed;
+    let c = vcf_typed::parse_columns(data);
+    let rows = c.rows;
+    let dp_valid = (0..rows)
+        .map(|r| vcf_typed::bitmap_get(&c.dp_valid, r))
+        .collect();
+    let af_valid = (0..rows)
+        .map(|r| vcf_typed::bitmap_get(&c.af_valid, r))
+        .collect();
+    Columns {
+        rows,
+        dp: c.dp,
+        dp_valid,
+        af: c.af,
+        af_valid,
+    }
+}
+
+/// Fair baseline for the generated path: noodles projecting the SAME six
+/// columns (POS/REF/ALT/QUAL consumed to match the work; DP/AF kept for the
+/// gate).
+fn noodles_extract_full(data: &[u8]) -> Columns {
+    let mut reader = noodles_vcf::io::Reader::new(std::io::Cursor::new(data));
+    let header = reader.read_header().expect("valid VCF header");
+    let mut cols = Columns::default();
+    let mut sink = 0u64;
+    for rec in reader.records() {
+        let rec = rec.expect("valid VCF record");
+        cols.rows += 1;
+        if let Some(p) = rec.variant_start() {
+            sink = sink.wrapping_add(p.expect("valid POS").get() as u64);
+        }
+        sink = sink.wrapping_add(rec.reference_bases().len() as u64);
+        let alt = rec.alternate_bases();
+        sink = sink.wrapping_add(alt.as_ref().len() as u64);
+        if let Some(q) = rec.quality_score() {
+            sink = sink.wrapping_add(q.expect("valid QUAL").to_bits() as u64);
+        }
+        let info = rec.info();
+        match info.get(&header, "DP") {
+            Some(Ok(Some(Value::Integer(n)))) => {
+                cols.dp.push(n as i64);
+                cols.dp_valid.push(true);
+            }
+            _ => {
+                cols.dp.push(0);
+                cols.dp_valid.push(false);
+            }
+        }
+        match info.get(&header, "AF") {
+            Some(Ok(Some(_))) => {
+                cols.af.push(0.0);
+                cols.af_valid.push(true);
+            }
+            _ => {
+                cols.af.push(0.0);
+                cols.af_valid.push(false);
+            }
+        }
+    }
+    std::hint::black_box(sink);
+    cols
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(800_000);
@@ -376,6 +444,35 @@ fn main() {
             ff / nn
         );
     }
+
+    // Generated codegen path: the real product — vcf_typed::parse_columns
+    // projects 6 typed columns (POS/REF/ALT/QUAL + INFO DP/AF) into Arrow
+    // buffers in one structural pass. Compare to noodles projecting the same 6.
+    let gx = falx_codegen_extract(&data);
+    let gn = noodles_extract_full(&data);
+    assert_eq!(gx.rows, gn.rows, "codegen record count mismatch");
+    assert_eq!(gx.dp, gn.dp, "codegen DP diverges from noodles");
+    assert_eq!(gx.dp_valid, gn.dp_valid, "codegen DP validity diverges");
+    assert_eq!(gx.af_valid, gn.af_valid, "codegen AF validity diverges");
+    let mut gfx = std::time::Duration::MAX;
+    let mut gnd = std::time::Duration::MAX;
+    for _ in 0..iters {
+        let t = Instant::now();
+        std::hint::black_box(falx_codegen_extract(&data));
+        gfx = gfx.min(t.elapsed());
+        let t = Instant::now();
+        std::hint::black_box(noodles_extract_full(&data));
+        gnd = gnd.min(t.elapsed());
+    }
+    let (gf_mb, _) = throughput(data.len(), rows, gfx);
+    let (gn_mb, _) = throughput(data.len(), rows, gnd);
+    println!(
+        "\ngenerated codegen path (6 typed columns → Arrow, DP byte-identical to noodles):\n\
+         \x20 falx-codegen : {:>7.1} MiB/s | noodles : {:>7.1} MiB/s | {:.2}x",
+        gf_mb,
+        gn_mb,
+        gf_mb / gn_mb
+    );
 
     // Prove the Arrow end-to-end output.
     let (dp_arr, af_arr) = to_arrow(&fx);
