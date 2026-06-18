@@ -1278,7 +1278,7 @@ mod avx512 {
         let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
         let v6 = !v5;
         let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
-        let v8 = v6 & v7;
+        let v8 = v7 & v6;
         (v8, v8 & v0)
     }
 
@@ -1597,7 +1597,7 @@ mod avx2 {
         let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
         let v6 = !v5;
         let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
-        let v8 = v6 & v7;
+        let v8 = v7 & v6;
         (v8, v8 & v0)
     }
 

@@ -959,11 +959,11 @@ mod avx512 {
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
         let v5 = eq_mask(lo, hi, 34u8); // class "\""
-        let v6 = v4 & v5;
+        let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
         let v9 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 32u8) | eq_mask(lo, hi, 61u8); // class "\n ="
-        let v10 = v8 & v9;
+        let v10 = v9 & v8;
         let v11 = eq_mask(lo, hi, 10u8); // class "\n"
         (v10, v10 & v11)
     }
@@ -1164,11 +1164,11 @@ mod avx2 {
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
         let v5 = eq_mask(lo, hi, 34u8); // class "\""
-        let v6 = v4 & v5;
+        let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
         let v9 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 32u8) | eq_mask(lo, hi, 61u8); // class "\n ="
-        let v10 = v8 & v9;
+        let v10 = v9 & v8;
         let v11 = eq_mask(lo, hi, 10u8); // class "\n"
         (v10, v10 & v11)
     }

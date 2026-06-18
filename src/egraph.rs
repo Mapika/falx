@@ -874,9 +874,36 @@ impl EGraph {
             }
         }
 
+        // Depth of each chosen subtree, for Sethi–Ullman emit ordering below.
+        let mut depth = vec![0u32; n];
+        loop {
+            let mut changed = false;
+            for c in 0..n {
+                let cid = EClassId(c as u32);
+                if self.find_imm(cid) != cid {
+                    continue;
+                }
+                if let Some(node) = &best[c] {
+                    let d = children(node)
+                        .iter()
+                        .map(|ch| depth[self.find_imm(*ch).0 as usize])
+                        .max()
+                        .map_or(0, |m| m + 1);
+                    if d != depth[c] {
+                        depth[c] = d;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
         let mut builder = Builder {
             eg: self,
             best: &best,
+            depth: &depth,
             graph: Graph::new(),
             memo: vec![None; n],
             building: vec![false; n],
@@ -944,12 +971,35 @@ impl AndOrXor {
 struct Builder<'a> {
     eg: &'a EGraph,
     best: &'a [Option<ENode>],
+    depth: &'a [u32],
     graph: Graph,
     memo: Vec<Option<NodeId>>,
     building: Vec<bool>,
 }
 
 impl Builder<'_> {
+    fn depth_of(&self, class: EClassId) -> u32 {
+        self.depth[self.eg.find_imm(class).0 as usize]
+    }
+
+    /// Emit two operands deeper-subtree-first (Sethi–Ullman): the shallow
+    /// operand lands adjacent to its consumer instead of being hoisted to the
+    /// top of the block, where it would stay live across the whole computation
+    /// and raise register pressure in the emitted kernel loop. Matches the
+    /// ordering `graph_opt`'s rebuild uses; without it, equal-cost extractions
+    /// schedule measurably worse. Returns operands in (a, b) order.
+    fn emit_pair(&mut self, a: EClassId, b: EClassId) -> (NodeId, NodeId) {
+        if self.depth_of(a) >= self.depth_of(b) {
+            let ea = self.emit(a);
+            let eb = self.emit(b);
+            (ea, eb)
+        } else {
+            let eb = self.emit(b);
+            let ea = self.emit(a);
+            (ea, eb)
+        }
+    }
+
     fn emit(&mut self, class: EClassId) -> NodeId {
         let c = self.eg.find_imm(class).0 as usize;
         if let Some(id) = self.memo[c] {
@@ -966,18 +1016,15 @@ impl Builder<'_> {
                 self.graph.not(a)
             }
             ENode::And(a, b) => {
-                let a = self.emit(a);
-                let b = self.emit(b);
+                let (a, b) = self.emit_pair(a, b);
                 self.graph.and(a, b)
             }
             ENode::Or(a, b) => {
-                let a = self.emit(a);
-                let b = self.emit(b);
+                let (a, b) = self.emit_pair(a, b);
                 self.graph.or(a, b)
             }
             ENode::Xor(a, b) => {
-                let a = self.emit(a);
-                let b = self.emit(b);
+                let (a, b) = self.emit_pair(a, b);
                 self.graph.xor(a, b)
             }
             ENode::ShiftLeft1(a) => {
@@ -993,11 +1040,17 @@ impl Builder<'_> {
                 self.graph.prefix_xor(a)
             }
             ENode::Add(a, b) => {
-                let a = self.emit(a);
-                let b = self.emit(b);
+                let (a, b) = self.emit_pair(a, b);
                 self.graph.add(a, b)
             }
             ENode::Regions(q, s, t) => {
+                // Visit deepest-first for register pressure, then emit in role
+                // order (memoized, so position is fixed by the first visit).
+                let mut order = [q, s, t];
+                order.sort_by_key(|c| std::cmp::Reverse(self.depth_of(*c)));
+                for c in order {
+                    self.emit(c);
+                }
                 let q = self.emit(q);
                 let s = self.emit(s);
                 let t = self.emit(t);

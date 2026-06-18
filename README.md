@@ -353,11 +353,16 @@ emission. To force handwritten graphs for every target, run
   cheap two-candidate rules reach a fixpoint first (so the result is never worse
   than that optimizer), then the expensive new rules run under budget.
   Deterministic (byte-identical codegen) and provably never costlier than the
-  input. On the built-in dialects (≤18 nodes) it ties the two-candidate
-  optimizer; the advantage grows with graph size — `cargo run --example
-  egraph_scaling` curves it at +8–23% cheaper across 18–256-node random circuits,
-  every point differentially verified. Shipped opt-in; the codegen default stays
-  `CostWeightedAvx2` until a benchmarked flip.
+  input. Extraction emits operands deeper-subtree-first (Sethi–Ullman), matching
+  the rebuild's register-pressure ordering — without it, equal-cost extractions
+  schedule measurably worse (a benchmarked ~7% regression on `json` before the
+  fix). On the built-in dialects (≤18 nodes) it ties the two-candidate optimizer;
+  the advantage grows with graph size — `cargo run --example egraph_scaling`
+  curves it at +8–23% cheaper across 18–256-node random circuits, every point
+  differentially verified. Now the codegen **default**: regenerating the kernels
+  under it changed only 4 escape/region dialects (`json`, `logfmt`, `ndjson`,
+  `csv_hash`), all confirmed within the benchmark noise floor vs the previous
+  optimizer.
 - Next: ARM NEON backend (CI already verifies ARM correctness, so it is pure
   speed work). (The per-field clean path is already at the
   floor for real data — ~0.7 ns/field on the common borrow path; the only

@@ -174,7 +174,7 @@ impl Default for CodegenOptions {
     fn default() -> Self {
         Self {
             graph_source: GraphSource::AutoWeighted(crate::synth_formats::SynthProfile::Weighted),
-            graph_optimizer: GraphOptimizer::CostWeightedAvx2,
+            graph_optimizer: GraphOptimizer::EqSat,
         }
     }
 }
