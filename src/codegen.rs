@@ -959,11 +959,17 @@ fn emit_with(
         (
             format!(
                 "{avx512_partial}\n{}",
-                emit_scan3(Flavor::Avx512, "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n")
+                emit_scan3(
+                    Flavor::Avx512,
+                    "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n"
+                )
             ),
             format!(
                 "{avx2_partial}\n{}",
-                emit_scan3(Flavor::Avx2, "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n")
+                emit_scan3(
+                    Flavor::Avx2,
+                    "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n"
+                )
             ),
         )
     } else {

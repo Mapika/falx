@@ -1007,7 +1007,9 @@ impl Builder<'_> {
         }
         debug_assert!(!self.building[c], "cycle in extracted graph");
         self.building[c] = true;
-        let node = self.best[c].clone().expect("reachable class has a best node");
+        let node = self.best[c]
+            .clone()
+            .expect("reachable class has a best node");
         let id = match node {
             ENode::Class(w) => self.graph.class(CharClass::from_words(w)),
             ENode::Const(v) => self.graph.constant(v),

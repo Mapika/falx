@@ -125,10 +125,17 @@ fn sweep(sizes: &[usize], k: u64) -> Vec<Row> {
                 mismatches += 1;
             }
 
-            let (cwc, esc) = (cw.stats.optimized_cost as f64, es.stats.optimized_cost as f64);
+            let (cwc, esc) = (
+                cw.stats.optimized_cost as f64,
+                es.stats.optimized_cost as f64,
+            );
             cw_sum += cwc;
             es_sum += esc;
-            adv_sum += if cwc > 0.0 { (cwc - esc) / cwc * 100.0 } else { 0.0 };
+            adv_sum += if cwc > 0.0 {
+                (cwc - esc) / cwc * 100.0
+            } else {
+                0.0
+            };
         }
         let kf = k as f64;
         rows.push(Row {

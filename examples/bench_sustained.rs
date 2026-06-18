@@ -452,7 +452,9 @@ fn bench_csv_hash(data: &[u8], options: &Options) {
     let _ = threads;
     let falx_serial = Row {
         label: "falx field bytes".into(),
-        measurement: measure(options, || field_bytes(&falx::kernels::csv_hash::parse(data))),
+        measurement: measure(options, || {
+            field_bytes(&falx::kernels::csv_hash::parse(data))
+        }),
     };
     let mut parse_rows = vec![falx_serial];
     if !options.falx_only {

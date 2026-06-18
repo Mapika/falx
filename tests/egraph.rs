@@ -44,7 +44,11 @@ fn corpus_for(dialect: &Dialect) -> Vec<Vec<u8>> {
 /// Every output node of `optimized` must compute the same stream as the
 /// corresponding node of `original` on every corpus input, and the optimizer
 /// must never grow the graph.
-fn assert_parts_equivalent(original: &DelimitedParts, optimized: &DelimitedParts, dialect: &Dialect) {
+fn assert_parts_equivalent(
+    original: &DelimitedParts,
+    optimized: &DelimitedParts,
+    dialect: &Dialect,
+) {
     assert!(
         optimized.graph.nodes().len() <= original.graph.nodes().len(),
         "optimizer should not grow the graph: original={}, optimized={}",
