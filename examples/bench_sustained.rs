@@ -10,6 +10,7 @@ const DEFAULT_WARMUP: usize = 1;
 enum Format {
     Csv,
     CsvGeo,
+    CsvHash,
     Tsv,
     Logfmt,
     Ndjson,
@@ -22,6 +23,7 @@ impl Format {
         match self {
             Format::Csv => "csv",
             Format::CsvGeo => "csv-geo",
+            Format::CsvHash => "csv-hash",
             Format::Tsv => "tsv",
             Format::Logfmt => "logfmt",
             Format::Ndjson => "ndjson",
@@ -32,7 +34,7 @@ impl Format {
 
     fn path(self, data_dir: &std::path::Path) -> PathBuf {
         let ext = match self {
-            Format::Csv | Format::CsvGeo => "csv",
+            Format::Csv | Format::CsvGeo | Format::CsvHash => "csv",
             Format::Tsv => "tsv",
             Format::Logfmt => "logfmt",
             Format::Ndjson => "ndjson",
@@ -46,6 +48,7 @@ impl Format {
 const ALL_FORMATS: &[Format] = &[
     Format::Csv,
     Format::CsvGeo,
+    Format::CsvHash,
     Format::Tsv,
     Format::Logfmt,
     Format::Ndjson,
@@ -147,6 +150,7 @@ fn main() {
         match format {
             Format::Csv => bench_csv(&data, &options),
             Format::CsvGeo => bench_csv_geo(&data, &options),
+            Format::CsvHash => bench_csv_hash(&data, &options),
             Format::Tsv => bench_tsv(&data, &options),
             Format::Logfmt => bench_logfmt(&data, &options),
             Format::Ndjson => bench_ndjson(&data, &options),
@@ -160,7 +164,7 @@ fn print_usage() {
     eprintln!(
         "Usage: cargo run --release --example bench_sustained -- \
          [--data-dir /mnt/data/falx-bench] \
-         [--formats all|csv,csv-geo,tsv,logfmt,ndjson,vcf,fastq] \
+         [--formats all|csv,csv-geo,csv-hash,tsv,logfmt,ndjson,vcf,fastq] \
          [--runs 3] [--warmup 1] [--threads N] [--falx-only] [--only-row SUBSTRING]"
     );
 }
@@ -244,6 +248,7 @@ fn parse_formats(value: &str) -> Result<Vec<Format>, String> {
         let format = match raw.trim() {
             "csv" => Format::Csv,
             "csv-geo" | "geo" => Format::CsvGeo,
+            "csv-hash" | "csvhash" | "hash" => Format::CsvHash,
             "tsv" => Format::Tsv,
             "logfmt" => Format::Logfmt,
             "ndjson" => Format::Ndjson,
@@ -411,6 +416,69 @@ fn bench_csv(data: &[u8], options: &Options) {
     report("CSV like-for-like field bytes", data.len(), &parse_rows);
 
     index_rows.clear();
+}
+
+fn bench_csv_hash(data: &[u8], options: &Options) {
+    let threads = benchmark_threads(options);
+
+    // Structural indexing — the row where the `Regions` resolver runs. Falx-only
+    // (no comparable library produces a structural index of quoted CSV).
+    let index_rows = vec![Row {
+        label: "falx index_structurals".into(),
+        measurement: bench_indexer(data, options, falx::kernels::csv_hash::index_structurals),
+    }];
+    report(
+        "csv_hash structural indexing (# comments + quotes)",
+        data.len(),
+        &index_rows,
+    );
+
+    // Like-for-like cleaned field bytes vs the csv crate's comment-aware reader:
+    // both skip `#` comment lines and unquote/unescape fields, so the byte
+    // counts (and thus Work) must agree.
+    let field_bytes = |parsed: &falx::kernels::csv_hash::Parsed<'_>| -> u64 {
+        let mut total = 0u64;
+        for record in parsed.records() {
+            for field in record.fields() {
+                total += field.len() as u64;
+            }
+        }
+        total
+    };
+    // Serial only: csv_hash has no fused parallel field-byte API (its parallel
+    // path, the Regions transfer-function `parse_par`, is benchmarked in
+    // examples/bench_csv_hash_par.rs). Parallelizing only the index while
+    // materializing fields serially would under-represent it, so it is omitted.
+    let _ = threads;
+    let falx_serial = Row {
+        label: "falx field bytes".into(),
+        measurement: measure(options, || field_bytes(&falx::kernels::csv_hash::parse(data))),
+    };
+    let mut parse_rows = vec![falx_serial];
+    if !options.falx_only {
+        parse_rows.push(Row {
+            label: "csv crate byte_records (comment=#)".into(),
+            measurement: measure(options, || {
+                let mut reader = csv::ReaderBuilder::new()
+                    .has_headers(false)
+                    .comment(Some(b'#'))
+                    .from_reader(data);
+                let mut total = 0u64;
+                for record in reader.byte_records() {
+                    for field in record.expect("valid csv_hash").iter() {
+                        total += field.len() as u64;
+                    }
+                }
+                total
+            }),
+        });
+    }
+    assert_same_work("csv_hash", "field bytes", &parse_rows);
+    report(
+        "csv_hash like-for-like field bytes (vs csv crate comment=#)",
+        data.len(),
+        &parse_rows,
+    );
 }
 
 fn bench_csv_geo(data: &[u8], options: &Options) {

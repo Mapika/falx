@@ -14,6 +14,7 @@ This creates one approximately 1 GiB file per generated format:
 
 - `/mnt/data/falx-bench/csv-1g.csv`
 - `/mnt/data/falx-bench/csv-geo-1g.csv`
+- `/mnt/data/falx-bench/csv-hash-1g.csv` (CSV + `#` comments + quotes — exercises the `Regions` resolver; the scoreboard compares it vs the `csv` crate's `comment(Some(b'#'))` reader)
 - `/mnt/data/falx-bench/tsv-1g.tsv`
 - `/mnt/data/falx-bench/logfmt-1g.logfmt`
 - `/mnt/data/falx-bench/ndjson-1g.ndjson`

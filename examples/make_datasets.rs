@@ -9,6 +9,7 @@ const DEFAULT_SIZE: usize = 1024 * 1024 * 1024;
 enum Dataset {
     Csv,
     CsvGeo,
+    CsvHash,
     Tsv,
     Logfmt,
     Ndjson,
@@ -21,6 +22,7 @@ impl Dataset {
         match self {
             Dataset::Csv => "csv",
             Dataset::CsvGeo => "csv-geo",
+            Dataset::CsvHash => "csv-hash",
             Dataset::Tsv => "tsv",
             Dataset::Logfmt => "logfmt",
             Dataset::Ndjson => "ndjson",
@@ -31,7 +33,7 @@ impl Dataset {
 
     fn extension(self) -> &'static str {
         match self {
-            Dataset::Csv | Dataset::CsvGeo => "csv",
+            Dataset::Csv | Dataset::CsvGeo | Dataset::CsvHash => "csv",
             Dataset::Tsv => "tsv",
             Dataset::Logfmt => "logfmt",
             Dataset::Ndjson => "ndjson",
@@ -44,6 +46,7 @@ impl Dataset {
 const ALL_DATASETS: &[Dataset] = &[
     Dataset::Csv,
     Dataset::CsvGeo,
+    Dataset::CsvHash,
     Dataset::Tsv,
     Dataset::Logfmt,
     Dataset::Ndjson,
@@ -95,7 +98,7 @@ fn print_usage() {
     eprintln!(
         "Usage: cargo run --release --example make_datasets -- \
          [--out /mnt/data/falx-bench] [--size 1g] \
-         [--formats all|csv,csv-geo,tsv,logfmt,ndjson,vcf,fastq]"
+         [--formats all|csv,csv-geo,csv-hash,tsv,logfmt,ndjson,vcf,fastq]"
     );
 }
 
@@ -166,6 +169,7 @@ fn parse_formats(value: &str) -> Result<Vec<Dataset>, String> {
         let dataset = match raw.trim() {
             "csv" => Dataset::Csv,
             "csv-geo" | "geo" => Dataset::CsvGeo,
+            "csv-hash" | "csvhash" | "hash" => Dataset::CsvHash,
             "tsv" => Dataset::Tsv,
             "logfmt" => Dataset::Logfmt,
             "ndjson" => Dataset::Ndjson,
@@ -196,6 +200,7 @@ fn write_dataset(dataset: Dataset, path: &Path, target: usize) -> io::Result<u64
         match dataset {
             Dataset::Csv => csv_record(&mut rng, &mut record),
             Dataset::CsvGeo => csv_geo_record(&mut rng, row, &mut record),
+            Dataset::CsvHash => csv_hash_record(&mut rng, row, &mut record),
             Dataset::Tsv => tsv_record(&mut rng, &mut record),
             Dataset::Logfmt => logfmt_record(&mut rng, &mut record),
             Dataset::Ndjson => ndjson_record(&mut rng, &mut record),
@@ -217,6 +222,7 @@ impl Rng {
         let seed = match dataset {
             Dataset::Csv => 0x9E37_79B9_7F4A_7C15,
             Dataset::CsvGeo => 0xDEAD_BEEF_CAFE_BABE,
+            Dataset::CsvHash => 0xC0FF_EE15_600D_F00D,
             Dataset::Tsv => 0xA076_1D64_78BD_642F,
             Dataset::Logfmt => 0xE703_7ED1_A0B4_28DB,
             Dataset::Ndjson => 0x853C_49E6_748F_EA9B,
@@ -286,6 +292,44 @@ fn csv_record(rng: &mut Rng, out: &mut Vec<u8>) {
                 }
                 if rng.below(2) == 0 {
                     out.extend_from_slice(b"x\ny");
+                }
+                if rng.below(2) == 0 {
+                    out.extend_from_slice(b"q\"\"q");
+                }
+                rng.alnum(1, 6, out);
+                out.push(b'"');
+            }
+            1 | 2 => push_u64(out, rng.below(1_000_000_000)),
+            _ => rng.alnum(3, 13, out),
+        }
+    }
+    out.push(b'\n');
+}
+
+/// CSV with `#` comments and quotes — the dialect that exercises the `Regions`
+/// resolver. A clustered header plus ~2% interspersed comment lines (carrying
+/// commas, quotes, and `#` that the resolver must treat as inert), and a quoted
+/// body with embedded commas and doubled quotes. No embedded newlines, so a `#`
+/// at column 0 is an unambiguous comment — letting the `csv` crate's
+/// `comment(Some(b'#'))` reader produce byte-identical fields for a fair row.
+fn csv_hash_record(rng: &mut Rng, row: u64, out: &mut Vec<u8>) {
+    if row < 8 || row.is_multiple_of(50) {
+        out.extend_from_slice(b"# ");
+        rng.word(3, 10, out);
+        out.extend_from_slice(b", \"quoted, noise\" #section ");
+        rng.alnum(2, 8, out);
+        out.push(b'\n');
+        return;
+    }
+    for field in 0..8 {
+        if field > 0 {
+            out.push(b',');
+        }
+        match rng.below(10) {
+            0 => {
+                out.push(b'"');
+                if rng.below(2) == 0 {
+                    out.extend_from_slice(b"a,b");
                 }
                 if rng.below(2) == 0 {
                     out.extend_from_slice(b"q\"\"q");
