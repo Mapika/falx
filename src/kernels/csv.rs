@@ -9,6 +9,11 @@
 // with dialect-aware quote stripping and escape resolution.
 
 #[rustfmt::skip]
+// The SIMD bodies are `#[cfg(target_arch = "x86_64")]`-gated, so on other
+// architectures the kernel functions are dispatch stubs whose parameters and
+// helpers go unused; allow the resulting (arch-conditional) lints there only —
+// on x86 every lint stays active and catches real issues.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, dead_code, clippy::ptr_arg))]
 mod generated {
 /// Stream-start carry values; kernels and the stream parser all
 /// begin from this state.
