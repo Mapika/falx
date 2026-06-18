@@ -23,6 +23,8 @@
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
+#[cfg(feature = "bgzf")]
+pub mod bgzf;
 pub mod codegen;
 pub mod egraph;
 pub mod formats;
