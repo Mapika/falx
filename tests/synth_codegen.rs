@@ -166,11 +166,13 @@ fn codegen_default_uses_manual_for_unsupported_dialects() {
             index: 0,
             name: Some("key".into()),
             ty: codegen::ColumnType::Str,
+            info_key: None,
         },
         codegen::Column {
             index: 1,
             name: Some("amount".into()),
             ty: codegen::ColumnType::I64,
+            info_key: None,
         },
     ];
     let default = codegen::emit_parser_with_columns(&dialect, "csv_hash_default_test", &columns)

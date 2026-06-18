@@ -91,21 +91,30 @@ pub enum ColumnType {
     Str,
 }
 
-/// One requested typed column: project field `index` of every record.
+/// One requested typed column. By default it projects field `index` of every
+/// record; if `info_key` is set, `index` names the parent field (e.g. VCF
+/// INFO) and the column extracts that key's value from within it (a `;`/`=`
+/// sub-grammar), with a validity bit for the records where the key is absent.
 #[derive(Clone, Debug)]
 pub struct Column {
-    /// Zero-based field index within a record.
+    /// Zero-based field index within a record (the parent field for an
+    /// `info_key` sub-column).
     pub index: usize,
-    /// Generated struct field name; defaults to `c{index}`.
+    /// Generated struct field name; defaults to the `info_key`, else `c{index}`.
     pub name: Option<String>,
     pub ty: ColumnType,
+    /// When set, extract this key from within field `index` instead of
+    /// projecting the whole field. Several `info_key` columns sharing an
+    /// `index` are filled by one single-pass scan of that field.
+    pub info_key: Option<String>,
 }
 
 impl Column {
     fn field_name(&self) -> String {
-        match &self.name {
-            Some(name) => name.clone(),
-            None => format!("c{}", self.index),
+        match (&self.name, &self.info_key) {
+            (Some(name), _) => name.clone(),
+            (None, Some(key)) => key.clone(),
+            (None, None) => format!("c{}", self.index),
         }
     }
 
@@ -220,6 +229,20 @@ fn validate_columns(columns: &[Column]) -> Result<(), CodegenError> {
             return Err(CodegenError(format!(
                 "column name '{name}' collides with another column"
             )));
+        }
+        if let Some(key) = &column.info_key {
+            // The single-pass INFO scan currently parses numeric values only.
+            if !matches!(column.ty, ColumnType::I64 | ColumnType::F64) {
+                return Err(CodegenError(format!(
+                    "info_key column '{name}' must be i64 or f64 (got {:?})",
+                    column.ty
+                )));
+            }
+            if key.is_empty() || key.bytes().any(|b| b == b'=' || b == b';') {
+                return Err(CodegenError(format!(
+                    "info_key '{key}' must be non-empty and contain no '=' or ';'"
+                )));
+            }
         }
     }
     Ok(())
@@ -4664,6 +4687,11 @@ fn push_columns_api(
     }
     code.push_str("        }\n");
     for (k, column) in columns.iter().enumerate() {
+        // INFO sub-columns are filled together by the single-pass scan emitted
+        // after this loop, not by an independent parse of a whole field span.
+        if column.info_key.is_some() {
+            continue;
+        }
         let name = column.field_name();
         let found_bit = 1u32 << k;
         let body = match column.ty {
@@ -4712,6 +4740,89 @@ fn push_columns_api(
             ),
         };
         code.push_str(&body);
+    }
+    // INFO sub-columns: one allocation-free pass over each parent field span
+    // fills every requested key at once (vs a rescan per key), then each
+    // column pushes its value + validity bit.
+    let mut info_by_parent: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (k, column) in columns.iter().enumerate() {
+        if column.info_key.is_some() {
+            info_by_parent.entry(column.index).or_default().push(k);
+        }
+    }
+    for ks in info_by_parent.values() {
+        let k0 = ks[0];
+        let bit0 = 1u32 << k0;
+        let _ = write!(
+            code,
+            "        let (ifrom, ito) = self.pending[{k0}];\n\
+             \x20       let info: &[u8] = if self.found & {bit0} != 0 {{\n\
+             \x20           &data[ifrom as usize..ito as usize]\n\
+             \x20       }} else {{\n\
+             \x20           &[]\n\
+             \x20       }};\n"
+        );
+        for &k in ks {
+            let column = &columns[k];
+            let name = column.field_name();
+            let elem = column.rust_type();
+            let _ = writeln!(code, "        let mut {name}_v: Option<{elem}> = None;");
+        }
+        code.push_str(
+            "        {\n\
+             \x20           let mut i = 0usize;\n\
+             \x20           while i < info.len() {\n\
+             \x20               let ks = i;\n\
+             \x20               while i < info.len() && info[i] != b'=' && info[i] != b';' {\n\
+             \x20                   i += 1;\n\
+             \x20               }\n\
+             \x20               let key = &info[ks..i];\n\
+             \x20               let mut val: &[u8] = &[];\n\
+             \x20               if i < info.len() && info[i] == b'=' {\n\
+             \x20                   i += 1;\n\
+             \x20                   let vs = i;\n\
+             \x20                   while i < info.len() && info[i] != b';' {\n\
+             \x20                       i += 1;\n\
+             \x20                   }\n\
+             \x20                   val = &info[vs..i];\n\
+             \x20               }\n\
+             \x20               match key {\n",
+        );
+        for &k in ks {
+            let column = &columns[k];
+            let name = column.field_name();
+            let key = column.info_key.as_deref().expect("info column");
+            let parser = match (column.ty, dialect.quote.is_some()) {
+                (ColumnType::I64, true) => "parse_i64_field",
+                (ColumnType::I64, false) => "parse_i64_cell",
+                (ColumnType::F64, true) => "parse_f64_field",
+                _ => "parse_f64_cell",
+            };
+            let _ = writeln!(
+                code,
+                "                    b\"{key}\" => {name}_v = {parser}(val),"
+            );
+        }
+        code.push_str(
+            "                    _ => {}\n\
+             \x20               }\n\
+             \x20               if i < info.len() && info[i] == b';' {\n\
+             \x20                   i += 1;\n\
+             \x20               }\n\
+             \x20           }\n\
+             \x20       }\n",
+        );
+        for &k in ks {
+            let column = &columns[k];
+            let name = column.field_name();
+            let zero = column.zero();
+            let _ = write!(
+                code,
+                "        self.cols.{name}.push({name}_v.unwrap_or({zero}));\n\
+                 \x20       self.cols.{name}_valid[row >> 6] |= ({name}_v.is_some() as u64) << (row & 63);\n"
+            );
+        }
     }
     code.push_str(
         "        self.cols.rows = row + 1;\n\
