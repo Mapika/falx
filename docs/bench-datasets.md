@@ -27,7 +27,15 @@ Current file-backed benchmark entry points:
 cargo run --release --example bench_sustained -- --formats all --runs 3 --warmup 1
 cargo run --release --example bench_real -- /mnt/data/falx-bench/csv-1g.csv
 cargo run --release --example bench_columns -- /mnt/data/falx-bench/csv-geo-1g.csv
+cargo run --release --example json_parity -- /mnt/data/falx-bench/ndjson-1g.ndjson
 ```
+
+`json_parity` is a same-work JSON comparison vs simd-json: both sum every
+integer in each NDJSON document and must agree on the total (so it is a real
+like-for-like query, not framing-vs-parsing). It contrasts falx's recursive
+`Node`/`Items` navigation against a flat O(tape) scan — for an aggregate that
+needs no hierarchy, the flat scan over `Nested::tape()` is ~2.3x faster and puts
+falx ~3.5x ahead of simd-json on the identical query.
 
 `bench_sustained` is the comparable-library scoreboard. Fair rows must produce
 the same `Work` counters before timings are reported: record/pair count,
