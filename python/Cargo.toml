@@ -1,0 +1,15 @@
+[package]
+name = "falx-genomics"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings: .vcf.gz → Apache Arrow typed columns via falx's fused SIMD pipeline"
+license = "MIT"
+
+[lib]
+name = "falx_genomics"
+crate-type = ["cdylib"]
+
+[dependencies]
+falx = { path = "..", features = ["bgzf"] }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+arrow = { version = "59", features = ["pyarrow"] }
