@@ -743,6 +743,21 @@ impl<'a> Nested<'a> {
             limit: self.data.len(),
         }
     }
+
+    /// Every scalar span in the document, flat and depth-independent, in input
+    /// order: keys and values at any nesting level, whitespace-trimmed, with
+    /// quotes and escapes intact (zero-copy). Aggregate queries — sum, count,
+    /// search — that do not need the object/array structure run as a single
+    /// O(tape) pass here, far cheaper than recursive [`Self::items`] descent:
+    /// every scalar is the gap between consecutive structural-byte positions,
+    /// which the tape already stores in ascending order.
+    pub fn scalars(&self) -> Scalars<'a, '_> {
+        Scalars {
+            nested: self,
+            next: 0,
+            cursor: 0,
+        }
+    }
 }
 
 /// One value: a bracketed container or a whitespace-trimmed scalar span.
@@ -884,6 +899,48 @@ impl<'a, 'p> Iterator for Items<'a, 'p> {
                         return Some(Node { nested: self.nested, repr: Repr::Scalar(s, e) });
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Flat iterator over every scalar span in the document; see
+/// [`Nested::scalars`]. One linear pass over the tape: the gap between each pair
+/// of consecutive structural-byte positions (and the trailing gap) is a scalar,
+/// trimmed of whitespace and skipped if empty. No recursion, no per-level state.
+pub struct Scalars<'a, 'p> {
+    nested: &'p Nested<'a>,
+    /// Next tape index to inspect.
+    next: usize,
+    /// Byte position where the pending scalar gap starts.
+    cursor: usize,
+}
+
+impl<'a, 'p> Iterator for Scalars<'a, 'p> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let data = self.nested.data;
+        let tape = &self.nested.tape;
+        loop {
+            if self.next >= tape.len() {
+                // The trailing gap after the last structural byte, yielded at
+                // most once (cursor is pushed past the input to stop).
+                if self.cursor <= data.len() {
+                    let (s, e) = trim_ws(data, self.cursor, data.len());
+                    self.cursor = data.len() + 1;
+                    if s < e {
+                        return Some(&data[s..e]);
+                    }
+                }
+                return None;
+            }
+            let pos = (tape[self.next] as u32) as usize;
+            self.next += 1;
+            let (s, e) = trim_ws(data, self.cursor, pos);
+            self.cursor = pos + 1;
+            if s < e {
+                return Some(&data[s..e]);
             }
         }
     }

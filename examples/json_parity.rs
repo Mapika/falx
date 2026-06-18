@@ -59,38 +59,17 @@ fn falx_sum_recursive(data: &[u8]) -> i64 {
     sum
 }
 
-#[inline]
-fn trim(data: &[u8], mut s: usize, mut e: usize) -> (usize, usize) {
-    while s < e && matches!(data[s], b' ' | b'\t' | b'\r' | b'\n') {
-        s += 1;
-    }
-    while e > s && matches!(data[e - 1], b' ' | b'\t' | b'\r' | b'\n') {
-        e -= 1;
-    }
-    (s, e)
-}
-
-/// Optimized: a flat O(tape) scan. Summing integers needs no hierarchy — every
-/// scalar token lives in a gap between consecutive structural-byte positions, so
-/// one linear pass over the tape (positions are stored in ascending order)
-/// visits every scalar with no recursion, no per-level iterator, no `Node`.
+/// Optimized: the library's flat `scalars()` iterator — one O(tape) pass over
+/// every scalar, no hierarchy walked (an aggregate needs none).
 fn falx_sum_flat(data: &[u8]) -> i64 {
     let mut nested = parse_nested(b"");
     let mut sum = 0i64;
     for line in data.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         nested = parse_nested_into(line, nested);
-        let mut prev = 0usize;
-        for &entry in nested.tape() {
-            let pos = (entry as u32) as usize;
-            let (s, e) = trim(line, prev, pos);
-            if s < e && let Some(n) = parse_int(&line[s..e]) {
+        for scalar in nested.scalars() {
+            if let Some(n) = parse_int(scalar) {
                 sum = sum.wrapping_add(n);
             }
-            prev = pos + 1;
-        }
-        let (s, e) = trim(line, prev, line.len());
-        if s < e && let Some(n) = parse_int(&line[s..e]) {
-            sum = sum.wrapping_add(n);
         }
     }
     sum

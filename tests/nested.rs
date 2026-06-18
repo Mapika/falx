@@ -391,3 +391,49 @@ fn parallel_malformed_matches_serial() {
         }
     }
 }
+
+/// Every scalar a recursive `items()` descent reaches (containers excluded via
+/// `open()`), in input order.
+fn collect_scalars_recursive(node: &json::Node<'_, '_>, out: &mut Vec<Vec<u8>>) {
+    if node.open().is_some() {
+        for child in node.items() {
+            collect_scalars_recursive(&child, out);
+        }
+    } else {
+        out.push(node.bytes().to_vec());
+    }
+}
+
+#[test]
+fn scalars_flat_iter_matches_recursive_walk() {
+    // The flat O(tape) `scalars()` iterator must yield exactly the scalars a
+    // recursive descent reaches, in the same order — including the empty-input,
+    // top-level-scalar, and empty-container edge cases.
+    let mut rng = Rng(0x5CA1_AB1E_5EED_0001);
+    let mut cases: Vec<String> = vec![
+        String::new(),
+        " ".into(),
+        "42".into(),
+        "  7  ".into(),
+        "{}".into(),
+        "[]".into(),
+        "[1,[2,[3,[4]]],5]".into(),
+        r#"{"a":1,"b":[2,3],"c":{"d":4}}"#.into(),
+        r#"{"x":{},"y":[],"z":"s"}"#.into(),
+    ];
+    for _ in 0..600 {
+        cases.push(serde_json::to_string(&gen_value(&mut rng, 4)).unwrap());
+    }
+    for text in cases {
+        let doc = json::parse_nested(text.as_bytes());
+        if doc.error.is_some() {
+            continue;
+        }
+        let mut recursive = Vec::new();
+        for item in doc.items() {
+            collect_scalars_recursive(&item, &mut recursive);
+        }
+        let flat: Vec<Vec<u8>> = doc.scalars().map(<[u8]>::to_vec).collect();
+        assert_eq!(flat, recursive, "scalars() disagreed for {text:?}");
+    }
+}
