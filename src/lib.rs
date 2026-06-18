@@ -24,6 +24,7 @@
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
 pub mod codegen;
+pub mod egraph;
 pub mod formats;
 pub mod graph_opt;
 pub mod interp;

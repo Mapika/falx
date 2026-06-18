@@ -1,35 +1,39 @@
-//! Report what the cost-weighted graph optimizer does to every built-in
-//! format, for both graph sources codegen can draw from: the manual
-//! `formats::delimited_parts()` builder and the weighted synthesizer.
+//! A/B the two graph optimizers — the cost-weighted two-candidate simplifier
+//! (`graph_opt`) and equality saturation (`egraph`) — over the manual
+//! `formats::delimited_parts()` builder for every built-in format.
+//!
+//! Equality saturation explores a superset of the two-candidate rewrites, so
+//! `eqsat` cost should never exceed `cw` cost. This table is the record to
+//! check before considering a codegen default flip.
 //!
 //! ```text
 //! cargo run --release --example opt_probe
 //! ```
 
 use falx::formats::{self, Dialect};
-use falx::graph_opt::optimize_parts;
 use falx::synth::CostModel;
-use falx::synth_formats::{self, SynthProfile};
+use falx::{egraph, graph_opt};
 
 fn probe(name: &str, dialect: &Dialect) {
-    let manual = formats::delimited_parts(dialect);
-    let m = optimize_parts(manual, CostModel::avx2()).stats;
-    print!(
-        "{name:10} manual: nodes {:3} -> {:3} cost {:4} -> {:4} applied={}",
-        m.original_nodes, m.optimized_nodes, m.original_cost, m.optimized_cost, m.applied
-    );
-    if synth_formats::supports_weighted(dialect) {
-        let synth =
-            synth_formats::synthesize_delimited_parts_with_profile(dialect, SynthProfile::Weighted)
-                .expect("supported dialect must synthesize");
-        let s = optimize_parts(synth, CostModel::avx2()).stats;
-        println!(
-            " | synth: nodes {:3} -> {:3} cost {:4} -> {:4} applied={}",
-            s.original_nodes, s.optimized_nodes, s.original_cost, s.optimized_cost, s.applied
-        );
+    let cw = graph_opt::optimize_parts(formats::delimited_parts(dialect), CostModel::avx2()).stats;
+    let es = egraph::optimize_parts(formats::delimited_parts(dialect), CostModel::avx2()).stats;
+    let flag = if es.optimized_cost <= cw.optimized_cost {
+        "ok"
     } else {
-        println!(" | synth: unsupported");
-    }
+        "REGRESSED"
+    };
+    println!(
+        "{name:10} orig nodes {:3} cost {:4} | cw nodes {:3} cost {:4} applied={:5} \
+         | eqsat nodes {:3} cost {:4} applied={:5} [{flag}]",
+        cw.original_nodes,
+        cw.original_cost,
+        cw.optimized_nodes,
+        cw.optimized_cost,
+        cw.applied,
+        es.optimized_nodes,
+        es.optimized_cost,
+        es.applied,
+    );
 }
 
 fn main() {

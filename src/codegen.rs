@@ -163,6 +163,11 @@ pub enum GraphOptimizer {
     /// Run the deterministic cost-weighted graph simplifier using the AVX2
     /// cost model.
     CostWeightedAvx2,
+    /// Run the equality-saturation optimizer ([`crate::egraph`]) using the
+    /// AVX2 cost model: a superset of the `CostWeightedAvx2` rewrites that
+    /// extracts the globally cheapest graph rather than the cheaper of two
+    /// whole-graph candidates.
+    EqSat,
 }
 
 impl Default for CodegenOptions {
@@ -317,6 +322,9 @@ pub fn emit_parser_with_columns_options(
         GraphOptimizer::Disabled => parts,
         GraphOptimizer::CostWeightedAvx2 => {
             crate::graph_opt::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
+        }
+        GraphOptimizer::EqSat => {
+            crate::egraph::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
         }
     };
     emit_with(
