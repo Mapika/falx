@@ -9,11 +9,12 @@
 // with dialect-aware quote stripping and escape resolution.
 
 #[rustfmt::skip]
-// The SIMD bodies are `#[cfg(target_arch = "x86_64")]`-gated, so on other
-// architectures the kernel functions are dispatch stubs whose parameters and
-// helpers go unused; allow the resulting (arch-conditional) lints there only —
-// on x86 every lint stays active and catches real issues.
-#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, dead_code, clippy::ptr_arg))]
+// The SIMD bodies are gated to `x86_64` (AVX-512/AVX2) and `aarch64` (NEON),
+// so on any other architecture the kernel functions are dispatch stubs whose
+// parameters and helpers go unused; allow the resulting (arch-conditional)
+// lints there only — on the SIMD targets every lint stays active and catches
+// real issues.
+#[cfg_attr(not(any(target_arch = "x86_64", target_arch = "aarch64")), allow(unused_variables, dead_code, clippy::ptr_arg))]
 mod generated {
 /// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
@@ -35,11 +36,19 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
         unsafe { avx2::index_structurals(data, out) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { neon::index_structurals(data, out) };
+        return;
+    }
     unsupported_cpu();
 }
 
 fn unsupported_cpu() -> ! {
-    panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
+    panic!("falx generated kernels require x86_64 (AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ) or aarch64 (NEON+AES)");
 }
 
 
@@ -142,6 +151,13 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
     {
         // SAFETY: the required target features were just detected.
         return unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { neon::index_structurals_seeded(data, seed, base, out) };
     }
     unsupported_cpu()
 }
@@ -254,6 +270,13 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
         // SAFETY: the required target features were just detected.
         return unsafe { avx2::index_tape_seeded(data, seed, base, seps, ends) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { neon::index_tape_seeded(data, seed, base, seps, ends) };
+    }
     unsupported_cpu()
 }
 /// Record-aware tape indexing used by [`parse`].
@@ -274,6 +297,14 @@ fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     {
         // SAFETY: the required target features were just detected.
         unsafe { avx2::index_tape(data, seps, ends) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { neon::index_tape(data, seps, ends) };
         return;
     }
     unsupported_cpu();
@@ -725,6 +756,14 @@ fn index_tape_partial_dispatch(data: &[u8], carries: &mut [u64; 0], base: u32, s
         unsafe { avx2::index_tape_partial(data, carries, base, seps, ends) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { neon::index_tape_partial(data, carries, base, seps, ends) };
+        return;
+    }
     unsupported_cpu();
 }
 
@@ -745,6 +784,14 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; 0]
     {
         // SAFETY: the required target features were just detected.
         unsafe { avx2::index_tape_block(block, live, carries, base, seps, ends) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { neon::index_tape_block(block, live, carries, base, seps, ends) };
         return;
     }
     unsupported_cpu();
@@ -1125,6 +1172,219 @@ mod avx2 {
         let lo_bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, needle)) as u32 as u64;
         let hi_bits = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, needle)) as u32 as u64;
         lo_bits | (hi_bits << 32)
+    }
+
+    /// Branchless bit decoding (simdjson flatten_bits): write indexes in
+    /// unconditional chunks of 8, then expose only the popcount-many real
+    /// entries.
+    #[inline]
+    fn push_indexes(mut mask: u64, base: u32, out: &mut Vec<u32>) {
+        let count = mask.count_ones() as usize;
+        if count == 0 {
+            return;
+        }
+        let len = out.len();
+        out.reserve(count + 8);
+        // SAFETY: capacity covers len + count + 8; chunked writes overshoot
+        // by at most 7 entries and set_len exposes only the real ones.
+        unsafe {
+            let mut ptr = out.as_mut_ptr().add(len);
+            let mut remaining = count as isize;
+            while remaining > 0 {
+                let mut j = 0;
+                while j < 8 {
+                    *ptr.add(j) = base + mask.trailing_zeros();
+                    mask &= mask.wrapping_sub(1);
+                    j += 1;
+                }
+                ptr = ptr.add(8);
+                remaining -= 8;
+            }
+            out.set_len(len + count);
+        }
+    }
+}
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {
+        let mut offset = 0usize;
+        // Two blocks per iteration: amortizes loop control and lets the
+        // second block's classification overlap the first block's extract.
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let m0 = unsafe { step(data.as_ptr().add(offset)) }.0;
+            push_indexes(m0, offset as u32, out);
+            let m1 = unsafe { step(data.as_ptr().add(offset + 64)) }.0;
+            push_indexes(m1, (offset + 64) as u32, out);
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let mask = unsafe { step(data.as_ptr().add(offset)) }.0;
+            push_indexes(mask, offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, offset as u32, out);
+        }
+    }
+
+
+    /// Record-aware indexing; structural and terminator masks encode the tape.
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let mut offset = 0usize;
+        // Two blocks per iteration (see index_structurals).
+        while offset + 128 <= data.len() {
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let (m0, t0) = unsafe { step(data.as_ptr().add(offset)) };
+            push_tape(m0, t0, offset as u32, seps, ends);
+            let (m1, t1) = unsafe { step(data.as_ptr().add(offset + 64)) };
+            push_tape(m1, t1, (offset + 64) as u32, seps, ends);
+            offset += 128;
+        }
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
+            push_tape(mask, term, offset as u32, seps, ends);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr()) };
+            push_tape(mask & live, term & live, offset as u32, seps, ends);
+        }
+    }
+
+    fn push_tape(structural: u64, term: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let sep_mask = structural & !term;
+        let base_count = seps.len() as u64;
+        push_indexes(sep_mask, base, seps);
+        let mut t = term;
+        while t != 0 {
+            let idx = t.trailing_zeros();
+            let below = (sep_mask & ((1u64 << idx) - 1)).count_ones() as u64;
+            ends.push(((base_count + below) << 32) | (base + idx) as u64);
+            t &= t - 1;
+        }
+    }
+
+    /// Like `index_structurals` but seeded with the entry quote-parity carry
+    /// and an absolute base offset; returns the *final* carry so the parallel
+    /// driver can recover each chunk's quote parity without a counting prepass.
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
+        let _ = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset)) }.0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr()) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
+        }
+        0
+    }
+
+    /// Seeded-carry, based variant of `index_tape` for parallel parsing.
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_tape_seeded(data: &[u8], seed: u64, base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) -> u64 {
+        let _ = seed;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
+            push_tape(mask, term, base + offset as u32, seps, ends);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr()) };
+            push_tape(mask & live, term & live, base + offset as u32, seps, ends);
+        }
+        0
+    }
+
+    /// Index the full 64-byte blocks of `data` (carries persist across
+    /// calls); returns the number of bytes consumed. Streaming primitive.
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_tape_partial(data: &[u8], carries: &mut [u64; 0], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let _ = &carries;
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset)) };
+            push_tape(mask, term, base + offset as u32, seps, ends);
+            offset += 64;
+        }
+    }
+
+    /// Index one final zero-padded block (end-of-stream only); `live`
+    /// masks off the padding bits.
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_tape_block(block: &[u8; 64], live: u64, carries: &mut [u64; 0], base: u32, seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
+        let _ = &carries;
+        // SAFETY: block is a readable 64-byte buffer.
+        let (mask, term) = unsafe { step(block.as_ptr()) };
+        push_tape(mask & live, term & live, base, seps, ends);
+    }
+
+    #[target_feature(enable = "neon", enable = "aes")]
+    unsafe fn step(ptr: *const u8) -> (u64, u64) {
+        // SAFETY: caller guarantees 64 readable bytes at `ptr`.
+        let (b0, b1, b2, b3) = unsafe {
+            (
+                vld1q_u8(ptr),
+                vld1q_u8(ptr.add(16)),
+                vld1q_u8(ptr.add(32)),
+                vld1q_u8(ptr.add(48)),
+            )
+        };
+        let v0 = eq_mask(b0, b1, b2, b3, 9u8) | eq_mask(b0, b1, b2, b3, 10u8); // class "\t\n"
+        let v1 = eq_mask(b0, b1, b2, b3, 10u8); // class "\n"
+        (v0, v0 & v1)
+    }
+
+    /// NEON has no movemask: AND each lane with its bit value, then fold the
+    /// four 16-byte compare results to one dense `u64` (bit j ⇔ byte j) with
+    /// three pairwise adds — bit-identical to x86 `movemask`/`cmpeq_epi8_mask`.
+    #[target_feature(enable = "neon")]
+    fn movemask(c0: uint8x16_t, c1: uint8x16_t, c2: uint8x16_t, c3: uint8x16_t) -> u64 {
+        let bits = vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201));
+        let s0 = vpaddq_u8(vandq_u8(c0, bits), vandq_u8(c1, bits));
+        let s1 = vpaddq_u8(vandq_u8(c2, bits), vandq_u8(c3, bits));
+        let s2 = vpaddq_u8(s0, s1);
+        let s3 = vpaddq_u8(s2, s2);
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(s3))
+    }
+
+    #[target_feature(enable = "neon")]
+    fn eq_mask(b0: uint8x16_t, b1: uint8x16_t, b2: uint8x16_t, b3: uint8x16_t, byte: u8) -> u64 {
+        let needle = vdupq_n_u8(byte);
+        movemask(vceqq_u8(b0, needle), vceqq_u8(b1, needle), vceqq_u8(b2, needle), vceqq_u8(b3, needle))
     }
 
     /// Branchless bit decoding (simdjson flatten_bits): write indexes in

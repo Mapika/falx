@@ -266,6 +266,70 @@ fn validate_nesting(dialect: &crate::formats::Dialect) -> Result<(), CodegenErro
 enum Flavor {
     Avx512,
     Avx2,
+    /// ARM NEON (aarch64). A 64-byte block is four 128-bit `uint8x16_t`
+    /// vectors `b0..b3`; classification reduces them to the same `u64` mask
+    /// as the x86 flavors, so all mask-level logic downstream is shared.
+    Neon,
+}
+
+/// The `#[target_feature]` body attribute every NEON kernel fn carries. NEON
+/// (Advanced SIMD) is baseline on aarch64; `aes` gates `vmull_p64`, the PMULL
+/// carryless multiply that stands in for x86 PCLMULQDQ in `prefix_xor`. As on
+/// x86 (where every fn carries `pclmulqdq`), we require it uniformly so all
+/// intra-module calls are target-feature supersets.
+const NEON_ATTR: &str = "    #[target_feature(enable = \"neon\", enable = \"aes\")]\n";
+
+/// The AVX2 driver attribute and its NEON counterpart. Driver bodies (the
+/// tape/seeded/cells/… kernels) only ever touch `u64` masks via `step`, so
+/// they are byte-identical across flavors apart from this attribute — a NEON
+/// driver is its AVX2 sibling with the attribute swapped (see [`neon_driver`]).
+const AVX2_ATTR_INNER: &str = "enable = \"avx2\", enable = \"pclmulqdq\"";
+const NEON_ATTR_INNER: &str = "enable = \"neon\", enable = \"aes\"";
+
+/// Build a NEON driver kernel from its already-emitted AVX2 twin by swapping
+/// the target-feature attribute. Returns an empty string unchanged (drivers
+/// that a dialect does not emit), so it composes with the `if … {} else {
+/// String::new() }` driver bindings.
+fn neon_driver(avx2: &str) -> String {
+    avx2.replace(AVX2_ATTR_INNER, NEON_ATTR_INNER)
+}
+
+/// Inject an aarch64/NEON sibling after every x86 AVX2 runtime-dispatch block
+/// in the generated `code`. Each dispatch fn tries AVX-512, then AVX2, then
+/// `unsupported_cpu()`; the AVX2 block is uniform across all of them, so we
+/// clone it, retarget it to aarch64 (`neon`+`aes` detection, `neon::` calls),
+/// and splice it in just before the panic. The block always closes at the
+/// first 4-space-indented `}` after its header — the call line and any inner
+/// `unsafe {…}` are indented deeper — which makes the boundary unambiguous.
+fn add_neon_dispatch(code: &str) -> String {
+    const MARKER: &str = "    #[cfg(target_arch = \"x86_64\")]\n    if std::arch::is_x86_feature_detected!(\"avx2\")\n        && std::arch::is_x86_feature_detected!(\"pclmulqdq\")\n    {\n";
+    const CLOSE: &str = "\n    }";
+    let mut out = String::with_capacity(code.len() + code.len() / 16);
+    let mut rest = code;
+    while let Some(start) = rest.find(MARKER) {
+        let after = start + MARKER.len();
+        let close = rest[after..]
+            .find(CLOSE)
+            .expect("AVX2 dispatch block must close at a 4-space `}`");
+        let end = after + close + CLOSE.len();
+        let neon_block = rest[start..end]
+            .replace("target_arch = \"x86_64\"", "target_arch = \"aarch64\"")
+            .replace(
+                "is_x86_feature_detected!(\"avx2\")",
+                "is_aarch64_feature_detected!(\"neon\")",
+            )
+            .replace(
+                "is_x86_feature_detected!(\"pclmulqdq\")",
+                "is_aarch64_feature_detected!(\"aes\")",
+            )
+            .replace("avx2::", "neon::");
+        out.push_str(&rest[..end]);
+        out.push('\n');
+        out.push_str(&neon_block);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Emit a generated source file exposing only the structural indexer.
@@ -906,7 +970,7 @@ fn emit_with(
     // Comment+quote dialects also emit a no-tape region-state scan, used by the
     // transfer-function parallel parse to learn each chunk's exit region state
     // for all three entry states without writing the tape.
-    let (avx512_partial, avx2_partial) = if region_par {
+    let (avx512_partial, avx2_partial, neon_partial) = if region_par {
         // `region_scan3`: a single no-tape pass that computes the region inputs
         // (q, s, n) once per block and advances all three candidate region
         // states (the transfer function's three entry states), instead of three
@@ -935,13 +999,26 @@ fn emit_with(
                 s = rs.0,
                 n = rn.0,
             );
+            // Block loads bind the per-flavor step inputs (`lo, hi` on x86;
+            // `b0..b3` on NEON); the classification body in `block` consumes
+            // whichever names this flavor produced.
+            let (full_load, tail_load) = match flavor {
+                Flavor::Avx512 | Flavor::Avx2 => (
+                    "            let (lo, hi) = unsafe { (_mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i), _mm256_loadu_si256(data.as_ptr().add(offset + 32) as *const __m256i)) };\n",
+                    "            let (lo, hi) = unsafe { (_mm256_loadu_si256(blk.as_ptr() as *const __m256i), _mm256_loadu_si256(blk.as_ptr().add(32) as *const __m256i)) };\n",
+                ),
+                Flavor::Neon => (
+                    "            let (b0, b1, b2, b3) = unsafe { (vld1q_u8(data.as_ptr().add(offset)), vld1q_u8(data.as_ptr().add(offset + 16)), vld1q_u8(data.as_ptr().add(offset + 32)), vld1q_u8(data.as_ptr().add(offset + 48))) };\n",
+                    "            let (b0, b1, b2, b3) = unsafe { (vld1q_u8(blk.as_ptr()), vld1q_u8(blk.as_ptr().add(16)), vld1q_u8(blk.as_ptr().add(32)), vld1q_u8(blk.as_ptr().add(48))) };\n",
+                ),
+            };
             let mut f = String::new();
             f.push_str(attr);
             f.push_str("    pub fn region_scan3(data: &[u8], carries: &mut [u64; 2], states: &mut [u64; 3]) {\n");
             f.push_str("        let mut offset = 0usize;\n");
             f.push_str("        while offset + 64 <= data.len() {\n");
             f.push_str("            // SAFETY: offset + 64 <= data.len().\n");
-            f.push_str("            let (lo, hi) = unsafe { (_mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i), _mm256_loadu_si256(data.as_ptr().add(offset + 32) as *const __m256i)) };\n");
+            f.push_str(full_load);
             f.push_str(&block);
             f.push_str("            offset += 64;\n");
             f.push_str("        }\n");
@@ -950,7 +1027,7 @@ fn emit_with(
             f.push_str("            let mut blk = [0u8; 64];\n");
             f.push_str("            blk[..rem].copy_from_slice(&data[offset..]);\n");
             f.push_str("            // SAFETY: blk is a readable 64-byte buffer (zero padded).\n");
-            f.push_str("            let (lo, hi) = unsafe { (_mm256_loadu_si256(blk.as_ptr() as *const __m256i), _mm256_loadu_si256(blk.as_ptr().add(32) as *const __m256i)) };\n");
+            f.push_str(tail_load);
             f.push_str(&block);
             f.push_str("        }\n");
             f.push_str("    }\n");
@@ -971,9 +1048,18 @@ fn emit_with(
                     "    #[target_feature(enable = \"avx2\", enable = \"pclmulqdq\")]\n"
                 )
             ),
+            // NEON: the streaming partial body is attribute-swapped from AVX2,
+            // but region_scan3 inlines its own per-flavor block loads, so it is
+            // emitted fresh rather than attribute-swapped.
+            format!(
+                "{}\n{}",
+                neon_driver(&avx2_partial),
+                emit_scan3(Flavor::Neon, NEON_ATTR)
+            ),
         )
     } else {
-        (avx512_partial, avx2_partial)
+        let neon_partial = neon_driver(&avx2_partial);
+        (avx512_partial, avx2_partial, neon_partial)
     };
 
     let par_block = if par_mode {
@@ -1324,6 +1410,19 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
     } else {
         String::new()
     };
+    // NEON's checksum accumulator is a 128-bit `uint64x2_t` (two lanes), so it
+    // mirrors the AVX2 path but with a `[u64; 2]` view of `checksum_lanes`.
+    let neon_fastq = if fastq_mode {
+        fastq_fill(
+            NEON_ATTR,
+            "        // SAFETY: uint64x2_t and [u64; 2] are both 16-byte vector storage here.\n        let mut checksum_acc: uint64x2_t = unsafe {\n            std::mem::transmute::<[u64; 2], uint64x2_t>([\n                sink.checksum_lanes[0],\n                sink.checksum_lanes[1],\n            ])\n        };\n",
+            "        // SAFETY: uint64x2_t and [u64; 2] are both 16-byte vector storage here.\n        let checksum_lanes: [u64; 2] = unsafe {\n            std::mem::transmute::<uint64x2_t, [u64; 2]>(checksum_acc)\n        };\n        sink.checksum_lanes[..2].copy_from_slice(&checksum_lanes);\n",
+            "drive_pair_neon",
+            "drive_neon",
+        )
+    } else {
+        String::new()
+    };
 
     let ndjson_lines_mode = format_name == "ndjson";
     let ndjson_lines_tpl = r#"
@@ -1667,11 +1766,12 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
 // depends only on std.
 {parser_doc}
 #[rustfmt::skip]
-// The SIMD bodies are `#[cfg(target_arch = "x86_64")]`-gated, so on other
-// architectures the kernel functions are dispatch stubs whose parameters and
-// helpers go unused; allow the resulting (arch-conditional) lints there only —
-// on x86 every lint stays active and catches real issues.
-#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, dead_code, clippy::ptr_arg))]
+// The SIMD bodies are gated to `x86_64` (AVX-512/AVX2) and `aarch64` (NEON),
+// so on any other architecture the kernel functions are dispatch stubs whose
+// parameters and helpers go unused; allow the resulting (arch-conditional)
+// lints there only — on the SIMD targets every lint stays active and catches
+// real issues.
+#[cfg_attr(not(any(target_arch = "x86_64", target_arch = "aarch64")), allow(unused_variables, dead_code, clippy::ptr_arg))]
 mod generated {{
 {carry_init_const}/// Index the structural positions of `data` into `out`.
 pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
@@ -1697,7 +1797,7 @@ pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
 }}
 
 fn unsupported_cpu() -> ! {{
-    panic!("falx generated kernels require x86_64 AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ");
+    panic!("falx generated kernels require x86_64 (AVX2+PCLMULQDQ or AVX-512F/BW/VL+PCLMULQDQ) or aarch64 (NEON+AES)");
 }}
 
 {quote_parity_dispatch}
@@ -1736,6 +1836,23 @@ fn unsupported_cpu() -> ! {{
             push_fastq_api(&mut code);
         }
     }
+
+    // NEON driver kernels. Every driver body operates only on `u64` masks via
+    // `step`, so it is byte-identical to its AVX2 twin apart from the target-
+    // feature attribute (see `neon_driver`). The exceptions — `neon_partial`
+    // (folds in region_scan3's inlined loads) and `neon_fastq` (NEON checksum
+    // accumulator) — are built explicitly above.
+    let neon_seeded = neon_driver(&avx2_seeded);
+    let neon_tape_seeded = neon_driver(&avx2_tape_seeded);
+    let neon_quote_parity = neon_driver(&avx2_quote_parity);
+    let neon_cells = neon_driver(&avx2_cells);
+    let neon_vcf_stats = neon_driver(&avx2_vcf_stats);
+    let neon_csv_geo_stats = neon_driver(&avx2_csv_geo_stats);
+    let neon_field_byte_stats = neon_driver(&avx2_field_byte_stats);
+    let neon_tape = neon_driver(&avx2_tape);
+    let neon_ndjson_lines = neon_driver(&avx2_ndjson_lines);
+    let neon_logfmt = neon_driver(&avx2_logfmt);
+    let neon_nested = neon_driver(&avx2_nested);
 
     let _ = write!(
         code,
@@ -2025,7 +2142,190 @@ mod avx2 {{
 "#,
     );
 
+    // ── ARM NEON (aarch64) ──────────────────────────────────────────────
+    // A 64-byte block is four 128-bit vectors `b0..b3`; classification folds
+    // them to the same `u64` mask as the x86 flavors (see `movemask`), so the
+    // driver kernels and all mask-level logic are shared verbatim.
+    let _ = write!(
+        code,
+        r#"#[cfg(target_arch = "aarch64")]
+mod neon {{
+    use std::arch::aarch64::*;
+
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_structurals(data: &[u8], out: &mut Vec<u32>) {{
+{carry_decl}        let mut offset = 0usize;
+        // Two blocks per iteration: amortizes loop control and lets the
+        // second block's classification overlap the first block's extract.
+        while offset + 128 <= data.len() {{
+            // SAFETY: offset + 128 <= data.len(), so both blocks are readable.
+            let m0 = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};
+            push_indexes(m0, offset as u32, out);
+            let m1 = unsafe {{ step(data.as_ptr().add(offset + 64){carry_arg}) }}{sel};
+            push_indexes(m1, (offset + 64) as u32, out);
+            offset += 128;
+        }}
+        while offset + 64 <= data.len() {{
+            // SAFETY: offset + 64 <= data.len(), so 64 bytes are readable.
+            let mask = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};
+            push_indexes(mask, offset as u32, out);
+            offset += 64;
+        }}
+        let rem = data.len() - offset;
+        if rem > 0 {{
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe {{ step(block.as_ptr(){carry_arg}) }}{sel} & ((1u64 << rem) - 1);
+            push_indexes(mask, offset as u32, out);
+        }}
+    }}
+
+{neon_tape}{neon_nested}{neon_seeded}{neon_tape_seeded}{neon_quote_parity}{neon_partial}{neon_cells}{neon_vcf_stats}{neon_csv_geo_stats}{neon_field_byte_stats}{neon_fastq}{neon_ndjson_lines}{neon_logfmt}
+    #[target_feature(enable = "neon", enable = "aes")]
+    unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
+        // SAFETY: caller guarantees 64 readable bytes at `ptr`.
+        let (b0, b1, b2, b3) = unsafe {{
+            (
+                vld1q_u8(ptr),
+                vld1q_u8(ptr.add(16)),
+                vld1q_u8(ptr.add(32)),
+                vld1q_u8(ptr.add(48)),
+            )
+        }};
+"#
+    );
+    emit_step_body(&mut code, graph, &carry_slot, Flavor::Neon, &step_roots);
+    let _ = write!(code, "        {step_ret}\n    }}\n");
+    if let Some((opens, closes)) = nest {
+        let _ = write!(
+            code,
+            "\n    /// `step` twin for the fused nested driver.\n    \
+             #[target_feature(enable = \"neon\", enable = \"aes\")]\n    \
+             unsafe fn step_nested(ptr: *const u8{carry_param}) -> (u64, u64, u64) {{\n        \
+             // SAFETY: caller guarantees 64 readable bytes at `ptr`.\n        \
+             let (b0, b1, b2, b3) = unsafe {{\n            (\n                \
+             vld1q_u8(ptr),\n                \
+             vld1q_u8(ptr.add(16)),\n                \
+             vld1q_u8(ptr.add(32)),\n                \
+             vld1q_u8(ptr.add(48)),\n            )\n        }};\n"
+        );
+        emit_step_body(&mut code, graph, &carry_slot, Flavor::Neon, &nested_roots);
+        let _ = write!(
+            code,
+            "        (v{}, v{}, v{})\n    }}\n",
+            output.0, opens.0, closes.0
+        );
+    }
+
+    if uses_regions {
+        // `resolve_regions` calls `prefix_xor`, so it must carry the NEON
+        // target features (PMULL = `aes`) in place of x86 `pclmulqdq`.
+        code.push_str(&REGIONS_HELPER.replace("enable = \"pclmulqdq\"", NEON_ATTR_INNER));
+    }
+    if uses_eq_class || uses_table_class {
+        code.push_str(
+            r#"
+    /// NEON has no movemask: AND each lane with its bit value, then fold the
+    /// four 16-byte compare results to one dense `u64` (bit j ⇔ byte j) with
+    /// three pairwise adds — bit-identical to x86 `movemask`/`cmpeq_epi8_mask`.
+    #[target_feature(enable = "neon")]
+    fn movemask(c0: uint8x16_t, c1: uint8x16_t, c2: uint8x16_t, c3: uint8x16_t) -> u64 {
+        let bits = vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201));
+        let s0 = vpaddq_u8(vandq_u8(c0, bits), vandq_u8(c1, bits));
+        let s1 = vpaddq_u8(vandq_u8(c2, bits), vandq_u8(c3, bits));
+        let s2 = vpaddq_u8(s0, s1);
+        let s3 = vpaddq_u8(s2, s2);
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(s3))
+    }
+"#,
+        );
+    }
+    if uses_eq_class {
+        code.push_str(
+            r#"
+    #[target_feature(enable = "neon")]
+    fn eq_mask(b0: uint8x16_t, b1: uint8x16_t, b2: uint8x16_t, b3: uint8x16_t, byte: u8) -> u64 {
+        let needle = vdupq_n_u8(byte);
+        movemask(vceqq_u8(b0, needle), vceqq_u8(b1, needle), vceqq_u8(b2, needle), vceqq_u8(b3, needle))
+    }
+"#,
+        );
+    }
+    if uses_table_class {
+        code.push_str(
+            r#"
+    /// Shuffle-based classification (simdjson): byte b is a member iff
+    /// lo_tbl[b & 15] & hi_tbl[b >> 4] != 0. One TBL per nibble per 16-byte
+    /// vector, regardless of class size.
+    #[target_feature(enable = "neon")]
+    fn table_lane(v: uint8x16_t, lo_tbl: uint8x16_t, hi_tbl: uint8x16_t) -> uint8x16_t {
+        let lo = vqtbl1q_u8(lo_tbl, vandq_u8(v, vdupq_n_u8(0x0F)));
+        let hi = vqtbl1q_u8(hi_tbl, vshrq_n_u8::<4>(v));
+        vtstq_u8(lo, hi)
+    }
+
+    #[target_feature(enable = "neon")]
+    fn table_mask(b0: uint8x16_t, b1: uint8x16_t, b2: uint8x16_t, b3: uint8x16_t, lo_tbl: uint8x16_t, hi_tbl: uint8x16_t) -> u64 {
+        movemask(table_lane(b0, lo_tbl, hi_tbl), table_lane(b1, lo_tbl, hi_tbl), table_lane(b2, lo_tbl, hi_tbl), table_lane(b3, lo_tbl, hi_tbl))
+    }
+"#,
+        );
+    }
+    if uses_prefix_xor || uses_regions {
+        code.push_str(
+            r#"
+    /// Carryless multiply by all-ones = inclusive prefix XOR. PMULL
+    /// (`vmull_p64`) stands in for x86 PCLMULQDQ; the low 64 bits are the
+    /// result.
+    #[target_feature(enable = "neon", enable = "aes")]
+    fn prefix_xor(mask: u64) -> u64 {
+        vmull_p64(mask, !0u64) as u64
+    }
+"#,
+        );
+    }
+    code.push_str(
+        r#"
+    /// Branchless bit decoding (simdjson flatten_bits): write indexes in
+    /// unconditional chunks of 8, then expose only the popcount-many real
+    /// entries.
+    #[inline]
+    fn push_indexes(mut mask: u64, base: u32, out: &mut Vec<u32>) {
+        let count = mask.count_ones() as usize;
+        if count == 0 {
+            return;
+        }
+        let len = out.len();
+        out.reserve(count + 8);
+        // SAFETY: capacity covers len + count + 8; chunked writes overshoot
+        // by at most 7 entries and set_len exposes only the real ones.
+        unsafe {
+            let mut ptr = out.as_mut_ptr().add(len);
+            let mut remaining = count as isize;
+            while remaining > 0 {
+                let mut j = 0;
+                while j < 8 {
+                    *ptr.add(j) = base + mask.trailing_zeros();
+                    mask &= mask.wrapping_sub(1);
+                    j += 1;
+                }
+                ptr = ptr.add(8);
+                remaining -= 8;
+            }
+            out.set_len(len + count);
+        }
+    }
+}
+"#,
+    );
+
     code.push_str("\n}\n\npub use self::generated::*;\n");
+
+    // Give every x86 runtime-dispatch block an aarch64/NEON sibling so the
+    // generated kernels select a real implementation on ARM instead of
+    // panicking in `unsupported_cpu`.
+    let code = add_neon_dispatch(&code);
 
     Ok(code)
 }
@@ -3741,6 +4041,143 @@ fn checksum_lanes_tail(
     lanes[0] = checksum_bytes_scalar(lanes[0], quality);
     // SAFETY: __m256i and [u64; 4] are both 32-byte vector storage here.
     *acc = unsafe { std::mem::transmute::<[u64; 4], __m256i>(lanes) };
+}
+
+#[cfg(target_arch = "aarch64")]
+impl FastqSink {
+    #[target_feature(enable = "neon")]
+    unsafe fn drive_neon(
+        &mut self,
+        data: &[u8],
+        mut mask: u64,
+        base: usize,
+        checksum_acc: &mut std::arch::aarch64::uint64x2_t,
+    ) -> u8 {
+        while mask != 0 {
+            let end = base + mask.trailing_zeros() as usize;
+            let error = unsafe { self.line_neon(data, end, checksum_acc) };
+            if error != 0 {
+                return error;
+            }
+            self.line_start = end + 1;
+            mask &= mask - 1;
+        }
+        0
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn drive_pair_neon(
+        &mut self,
+        data: &[u8],
+        m0: u64,
+        m1: u64,
+        base: usize,
+        checksum_acc: &mut std::arch::aarch64::uint64x2_t,
+    ) -> u8 {
+        let error = unsafe { self.drive_neon(data, m0, base, checksum_acc) };
+        if error != 0 {
+            return error;
+        }
+        unsafe { self.drive_neon(data, m1, base + 64, checksum_acc) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn line_neon(
+        &mut self,
+        data: &[u8],
+        end: usize,
+        checksum_acc: &mut std::arch::aarch64::uint64x2_t,
+    ) -> u8 {
+        match self.line_in_record {
+            0 => {
+                if unsafe { *data.get_unchecked(self.line_start) } != b'@' {
+                    return 1;
+                }
+                self.line_in_record = 1;
+            }
+            1 => {
+                self.sequence_start = self.line_start;
+                self.sequence_len = end - self.line_start;
+                self.line_in_record = 2;
+            }
+            2 => {
+                if unsafe { *data.get_unchecked(self.line_start) } != b'+' {
+                    return 2;
+                }
+                self.line_in_record = 3;
+            }
+            _ => {
+                return unsafe { self.record_neon(data, end, checksum_acc) };
+            }
+        }
+        0
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn record_neon(
+        &mut self,
+        data: &[u8],
+        end: usize,
+        checksum_acc: &mut std::arch::aarch64::uint64x2_t,
+    ) -> u8 {
+        let quality_len = end - self.line_start;
+        if quality_len != self.sequence_len {
+            self.error_quality_len = quality_len;
+            return 3;
+        }
+        let sequence = unsafe {
+            data.get_unchecked(self.sequence_start..self.sequence_start + self.sequence_len)
+        };
+        let quality = unsafe { data.get_unchecked(self.line_start..end) };
+        self.stats.records += 1;
+        self.stats.sequence_bytes += sequence.len() as u64;
+        self.stats.quality_bytes += quality.len() as u64;
+        unsafe { checksum_fastq_record_neon_acc(checksum_acc, sequence, quality) };
+        self.line_in_record = 0;
+        0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn checksum_fastq_record_neon_acc(
+    acc: &mut std::arch::aarch64::uint64x2_t,
+    sequence: &[u8],
+    quality: &[u8],
+) {
+    use std::arch::aarch64::{vaddq_u64, vld1q_u8, vpaddlq_u16, vpaddlq_u32, vpaddlq_u8};
+
+    debug_assert_eq!(sequence.len(), quality.len());
+    let mut local = *acc;
+    let mut offset = 0usize;
+    while offset + 16 <= sequence.len() {
+        // SAFETY: offset + 16 <= both input lengths, so both unaligned loads are readable.
+        let seq = unsafe { vld1q_u8(sequence.as_ptr().add(offset)) };
+        let qual = unsafe { vld1q_u8(quality.as_ptr().add(offset)) };
+        // Widen-sum each 16-byte vector to two u64 lanes (bytes 0..8, 8..16)
+        // and accumulate; the final fold over all lanes is the byte sum.
+        local = vaddq_u64(local, vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(seq))));
+        local = vaddq_u64(local, vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(qual))));
+        offset += 16;
+    }
+    *acc = local;
+    checksum_lanes_tail_neon(acc, &sequence[offset..], &quality[offset..]);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn checksum_lanes_tail_neon(
+    acc: &mut std::arch::aarch64::uint64x2_t,
+    sequence: &[u8],
+    quality: &[u8],
+) {
+    use std::arch::aarch64::uint64x2_t;
+
+    // SAFETY: uint64x2_t and [u64; 2] are both 16-byte vector storage here.
+    let mut lanes: [u64; 2] = unsafe { std::mem::transmute::<uint64x2_t, [u64; 2]>(*acc) };
+    lanes[0] = checksum_bytes_scalar(lanes[0], sequence);
+    lanes[0] = checksum_bytes_scalar(lanes[0], quality);
+    // SAFETY: uint64x2_t and [u64; 2] are both 16-byte vector storage here.
+    *acc = unsafe { std::mem::transmute::<[u64; 2], uint64x2_t>(lanes) };
 }
 
 "#,
@@ -6232,6 +6669,7 @@ fn emit_step_body(
     let class_args = match flavor {
         Flavor::Avx512 => "lo, hi",
         Flavor::Avx2 => "lo, hi",
+        Flavor::Neon => "b0, b1, b2, b3",
     };
     for (i, op) in graph.nodes().iter().enumerate() {
         if !live[i] {
@@ -6270,6 +6708,31 @@ fn emit_step_body(
                                 "let v{i} = {{ let lo_tbl = _mm256_setr_epi8({}); let hi_tbl = _mm256_setr_epi8({}); table_mask(lo, hi, lo_tbl, hi_tbl) }}; // class \"{label}\"",
                                 setr(lo_tbl),
                                 setr(hi_tbl)
+                            )
+                        }
+                        Flavor::Neon => {
+                            let (lo_tbl, hi_tbl) =
+                                nibble_tables(&class).expect("validated before emission");
+                            // NEON has no `setr`; pack each 16-byte table into
+                            // two little-endian u64 halves and rebuild it
+                            // branchlessly via vcreate/vcombine (no memory load).
+                            let dup = |t: [u8; 16]| -> String {
+                                let half = |bytes: &[u8]| -> u64 {
+                                    bytes
+                                        .iter()
+                                        .enumerate()
+                                        .fold(0u64, |acc, (k, &v)| acc | ((v as u64) << (8 * k)))
+                                };
+                                format!(
+                                    "vreinterpretq_u8_u64(vcombine_u64(vcreate_u64({:#018x}u64), vcreate_u64({:#018x}u64)))",
+                                    half(&t[..8]),
+                                    half(&t[8..])
+                                )
+                            };
+                            format!(
+                                "let v{i} = {{ let lo_tbl = {}; let hi_tbl = {}; table_mask(b0, b1, b2, b3, lo_tbl, hi_tbl) }}; // class \"{label}\"",
+                                dup(lo_tbl),
+                                dup(hi_tbl)
                             )
                         }
                         Flavor::Avx512 => unreachable!("AVX-512 emits class compares directly"),
