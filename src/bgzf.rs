@@ -188,6 +188,75 @@ pub fn decompress_par(data: &[u8], threads: usize) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Fused parallel parse of a bgzf stream: never materializes the full
+/// decompressed buffer. Each worker inflates its own contiguous block group,
+/// completes the record straddling its tail (inflating into following blocks
+/// until `terminator`), drops its leading partial record (the previous worker
+/// owns it via line ownership), and runs `parse` on the record-aligned local
+/// buffer while it is hot in cache. Returns one `parse` result per worker, in
+/// stream order — the caller concatenates them.
+///
+/// `parse` must treat its input as a self-contained run of whole `terminator`-
+/// delimited records (exactly what a generated `parse_columns` expects: leading
+/// comment/header lines are skipped, the final record is `terminator`-ended).
+/// This is the building block behind `.vcf.gz`/`.fastq.gz` → columnar parsing.
+pub fn parse_gz_par<C, F>(
+    comp: &[u8],
+    threads: usize,
+    terminator: u8,
+    parse: F,
+) -> io::Result<Vec<C>>
+where
+    F: Fn(&[u8]) -> C + Sync,
+    C: Send,
+{
+    let blocks = scan(comp)?;
+    let n = blocks.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let threads = threads.max(1).min(n);
+    let per = n.div_ceil(threads);
+    let bounds: Vec<usize> = (0..=threads).map(|w| (w * per).min(n)).collect();
+    let parse = &parse;
+    let blocks = &blocks;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .filter(|&w| bounds[w] < bounds[w + 1])
+            .map(|w| {
+                let bounds = &bounds;
+                s.spawn(move || -> io::Result<C> {
+                    let mut own = inflate_range(comp, &blocks[bounds[w]..bounds[w + 1]])?;
+                    // Finish the record straddling this group's tail.
+                    let mut k = bounds[w + 1];
+                    while k < n {
+                        let chunk = inflate_range(comp, &blocks[k..k + 1])?;
+                        if let Some(nl) = chunk.iter().position(|&b| b == terminator) {
+                            own.extend_from_slice(&chunk[..=nl]);
+                            break;
+                        }
+                        own.extend_from_slice(&chunk);
+                        k += 1;
+                    }
+                    // Drop the leading partial record (worker 0 keeps everything).
+                    let lead = if w == 0 {
+                        0
+                    } else {
+                        own.iter()
+                            .position(|&b| b == terminator)
+                            .map_or(own.len(), |i| i + 1)
+                    };
+                    Ok(parse(&own[lead..]))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("bgzf fusion worker panicked"))
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +338,32 @@ mod tests {
     #[test]
     fn rejects_non_bgzf() {
         assert!(decompress(b"not a gzip stream at all").is_err());
+    }
+
+    fn lines(s: &[u8]) -> Vec<Vec<u8>> {
+        s.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    #[test]
+    fn parse_gz_par_is_record_aligned_with_no_loss() {
+        // Records of varied width so block boundaries land mid-record.
+        let mut raw = Vec::new();
+        for i in 0..300_000u32 {
+            raw.extend_from_slice(
+                format!("rec{i}\t{}\tend\n", "x".repeat((i % 37) as usize)).as_bytes(),
+            );
+        }
+        let comp = bgzip(&raw);
+        let expect = lines(&raw);
+        // Each worker parses whole records; concatenation must reconstruct the
+        // exact sequence regardless of where block/worker boundaries fall.
+        for t in [1usize, 2, 3, 8, 16] {
+            let parts = parse_gz_par(&comp, t, b'\n', lines).unwrap();
+            let merged: Vec<Vec<u8>> = parts.into_iter().flatten().collect();
+            assert_eq!(merged, expect, "record loss/dup at boundaries, t={t}");
+        }
     }
 }

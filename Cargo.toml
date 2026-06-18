@@ -48,6 +48,10 @@ required-features = ["bgzf"]
 name = "vcf_gz_bench"
 required-features = ["bgzf"]
 
+[[example]]
+name = "validate_vcf_gz"
+required-features = ["bgzf"]
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

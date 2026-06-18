@@ -17,7 +17,7 @@ use std::io::Write as _;
 use std::num::NonZero;
 use std::time::{Duration, Instant};
 
-use falx::bgzf::{self, Block};
+use falx::bgzf;
 use falx::kernels::vcf_typed;
 use noodles_bgzf as nbgzf;
 use noodles_vcf::variant::record::info::field::Value;
@@ -93,63 +93,13 @@ fn staged(comp: &[u8], threads: usize) -> (Vec<i64>, Vec<bool>) {
     dp_of(&vcf_typed::parse_columns_par(&buf, threads))
 }
 
-/// Inflate blocks from `start` onward until a newline is reached, appending the
-/// completed straddling record (through that newline) to `own`.
-fn finish_straddler(comp: &[u8], blocks: &[Block], start: usize, own: &mut Vec<u8>) {
-    let mut k = start;
-    while k < blocks.len() {
-        let chunk = bgzf::inflate_range(comp, &blocks[k..k + 1]).expect("bgzf");
-        if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
-            own.extend_from_slice(&chunk[..=nl]);
-            return;
-        }
-        own.extend_from_slice(&chunk);
-        k += 1;
-    }
-}
-
-/// Fused: parallel over block groups; decompress + parse locally, merge.
+/// Fused via the library driver: each worker decompresses its block group and
+/// parses it locally; we concatenate the per-worker DP columns.
 fn fused(comp: &[u8], threads: usize) -> (Vec<i64>, Vec<bool>) {
-    let blocks = bgzf::scan(comp).expect("bgzf scan");
-    let threads = threads.max(1).min(blocks.len().max(1));
-    if threads == 1 {
-        return staged(comp, 1);
-    }
-    let per = blocks.len().div_ceil(threads);
-    let bounds: Vec<usize> = (0..=threads).map(|w| (w * per).min(blocks.len())).collect();
-
-    let parts: Vec<(Vec<i64>, Vec<bool>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .filter(|&w| bounds[w] < bounds[w + 1])
-            .map(|w| {
-                let blocks = &blocks;
-                let bounds = &bounds;
-                s.spawn(move || {
-                    let mut own =
-                        bgzf::inflate_range(comp, &blocks[bounds[w]..bounds[w + 1]]).expect("bgzf");
-                    if bounds[w + 1] < blocks.len() {
-                        finish_straddler(comp, blocks, bounds[w + 1], &mut own);
-                    }
-                    // Drop the partial leading record (owned by the previous
-                    // worker); worker 0 keeps everything (the VCF header lines
-                    // are comments and skipped by the parser).
-                    let lead = if w == 0 {
-                        0
-                    } else {
-                        own.iter()
-                            .position(|&b| b == b'\n')
-                            .map_or(own.len(), |i| i + 1)
-                    };
-                    dp_of(&vcf_typed::parse_columns(&own[lead..]))
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("worker"))
-            .collect()
-    });
-
+    let parts = bgzf::parse_gz_par(comp, threads, b'\n', |s| {
+        dp_of(&vcf_typed::parse_columns(s))
+    })
+    .expect("fusion");
     let mut dp = Vec::new();
     let mut valid = Vec::new();
     for (d, v) in parts {
