@@ -17,6 +17,9 @@ pub mod emit;
 pub mod formats;
 pub mod graph_opt;
 pub mod interp;
+/// Memory-mapped file input for the parallel kernels (`mmap` feature).
+#[cfg(feature = "mmap")]
+pub mod io;
 pub mod ir;
 pub mod kernels;
 pub mod scalar;
