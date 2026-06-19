@@ -11,17 +11,8 @@ use falx::synth::{
 
 const EVEN: u64 = 0x5555_5555_5555_5555;
 
-/// xorshift64* RNG; same generator the crate's tests use.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-}
+mod common;
+use common::Rng;
 
 fn uniform(alphabet: &[u8], blocks: usize, rng: &mut Rng) -> Vec<u8> {
     (0..blocks * 64)

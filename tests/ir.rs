@@ -3,16 +3,8 @@ use falx::interp;
 use falx::ir::{CharClass, Graph};
 use falx::scalar;
 
-/// xorshift64* RNG; avoids a dev-dependency for test data generation.
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-}
+mod common;
+use common::Rng;
 
 /// Compute parity of quotes to verify prefix_xor semantics.
 fn scalar_parity(data: &[u8], quote: u8) -> Vec<u32> {

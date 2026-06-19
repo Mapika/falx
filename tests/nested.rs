@@ -6,16 +6,8 @@
 use falx::kernels::json;
 use serde_json::Value;
 
-/// xorshift64* RNG; avoids a dev-dependency for test data generation.
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-}
+mod common;
+use common::Rng;
 
 /// Strings that stress the quote/escape machinery: structural bytes inside
 /// strings, backslash runs (odd and even), escaped quotes, trailing escapes.
