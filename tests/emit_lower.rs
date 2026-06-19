@@ -45,7 +45,13 @@ fn csv_indexer_has_expected_shape() {
     assert!(src.contains("fn prefix_xor"));
     assert!(src.contains("class_mask(block, &["));
     assert!(src.contains("while offset + 64 <= data.len()"));
-    assert!(src.contains("out.push(offset as u32 + mask.trailing_zeros());"));
+    // The output drain is the unrolled `push_indexes` scatter, not per-bit push.
+    assert!(src.contains("fn push_indexes"));
+    assert!(
+        src.contains("offset as u32, out)"),
+        "push_indexes drain call"
+    );
+    assert!(!src.contains("out.push(offset as u32 + mask.trailing_zeros());"));
     // M2: the class_mask seam is SIMD (AVX2) with a scalar fallback.
     assert!(src.contains("_mm256_cmpeq_epi8"), "AVX2 classify emitted");
     assert!(
