@@ -1,12 +1,10 @@
 //! The full GPU-resident genomics pipeline: `.vcf.gz` → answer, never leaving
-//! the device. Upload the *compressed* bytes once, then on the GPU:
-//!   1. inflate every bgzf block in parallel (one thread per independent block —
-//!      a CUDA-C port of Mark Adler's `puff.c`),
-//!   2. structural (newline) index,
-//!   3. per-row navigate → parse → filter → aggregate query,
-//! and download 16 bytes. The decompressed text, record boundaries, and parsed
-//! values never cross PCIe — so the upload is just the compressed size, and the
-//! CPU's decompression wall (~0.3–1 GiB/s) is gone.
+//! the device. Upload the *compressed* bytes once, then on the GPU — (1) inflate
+//! every bgzf block in parallel (one thread per independent block, a CUDA-C port
+//! of Mark Adler's `puff.c`), (2) structural (newline) index, (3) per-row
+//! navigate → parse → filter → aggregate query — and download 16 bytes. The
+//! decompressed text, record boundaries, and parsed values never cross PCIe, so
+//! the upload is just the compressed size and the CPU's decompression wall is gone.
 //!
 //! Run: `cargo run --release --features "gpu bgzf" --example gpu_pipeline`
 
@@ -15,6 +13,9 @@ use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
+
+/// (count, sum), per-block inflate status, GPU-compute seconds, end-to-end seconds.
+type RunOut = ((u64, u64), Vec<i32>, f64, f64);
 
 const SRC: &str = r#"
 // ───────────────────────── DEFLATE inflate (puff.c port) ─────────────────────
@@ -336,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_warps = (total as u64).div_ceil(wb);
     let total_u = total as u64;
 
-    let run = || -> Result<((u64, u64), Vec<i32>, f64, f64), cudarc::driver::DriverError> {
+    let run = || -> Result<RunOut, cudarc::driver::DriverError> {
         let t_all = Instant::now();
         let d_comp = stream.clone_htod(&comp)?; // upload: just the compressed bytes
         let d_poff = stream.clone_htod(&poff)?;
