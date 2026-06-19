@@ -68,3 +68,7 @@ lto = "thin"
 [[example]]
 name = "gpu_query"
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_pipeline"
+required-features = ["gpu", "bgzf"]
