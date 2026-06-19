@@ -80,7 +80,7 @@ fn build_program() -> String {
     let refs: Vec<&Graph> = graphs.iter().collect();
     let mut items = lower::needed_helpers(&refs);
     for ((name, _), g) in ds.iter().zip(&graphs) {
-        items.push(lower::index_function(g, &format!("index_{name}")));
+        items.extend(lower::rust_index_items(g, &format!("index_{name}")));
     }
     let kernels = emit_rust(&items).unwrap();
     let arms: String = ds
@@ -216,6 +216,125 @@ fn lowered_indexers_match_interp_and_simd() {
             "csv: typed-AST kernel != generated kernels::csv on {:?}",
             String::from_utf8_lossy(input)
         );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn run_variant(bin: &Path, name: &str, variant: &str, input: &[u8]) -> Vec<u32> {
+    let mut child = Command::new(bin)
+        .arg(name)
+        .arg(variant)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8(out.stdout).unwrap();
+    let s = s.trim();
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(',').map(|x| x.parse().unwrap()).collect()
+    }
+}
+
+/// Each baked x86 whole-loop variant, called *directly*, must match the
+/// interpreter. The runtime dispatch only exercises the best path, so this pins
+/// the others (e.g. AVX2 on an AVX-512 box, which the dispatcher would skip).
+/// Variants are gated on feature detection so we never execute an unsupported one.
+#[test]
+fn lowered_baked_x86_variants_match_interp() {
+    #[cfg(not(target_arch = "x86_64"))]
+    eprintln!("skipping: baked x86 variants are x86_64-only");
+    #[cfg(target_arch = "x86_64")]
+    baked_x86_variants_check();
+}
+
+/// The x86 body of [`lowered_baked_x86_variants_match_interp`], isolated so the
+/// `is_x86_feature_detected!` calls are only *compiled* on x86_64 (the macro
+/// does not exist on other targets).
+#[cfg(target_arch = "x86_64")]
+fn baked_x86_variants_check() {
+    if Command::new("rustc").arg("--version").output().is_err() {
+        eprintln!("skipping: no `rustc` on PATH");
+        return;
+    }
+    // Non-Regions dialects, with and without quote machinery.
+    let ds: Vec<(&str, formats::Dialect)> = vec![
+        ("csv", formats::csv_dialect()),
+        ("lines", formats::lines_dialect()),
+        ("ndjson", formats::ndjson_dialect()),
+        ("json", formats::json_dialect()),
+    ];
+    let graphs: Vec<Graph> = ds.iter().map(|(_, d)| formats::delimited(d)).collect();
+    let refs: Vec<&Graph> = graphs.iter().collect();
+    let mut items = lower::needed_helpers(&refs);
+    for ((name, _), g) in ds.iter().zip(&graphs) {
+        items.extend(lower::rust_index_items(g, &format!("index_{name}")));
+    }
+    let kernels = emit_rust(&items).unwrap();
+    let arms: String = ds
+        .iter()
+        .flat_map(|(name, _)| {
+            [
+                format!(
+                    "(\"{name}\", \"avx512\") => unsafe {{ index_{name}_avx512(&data, &mut out) }},\n"
+                ),
+                format!(
+                    "(\"{name}\", \"avx2\") => unsafe {{ index_{name}_avx2(&data, &mut out) }},\n"
+                ),
+                format!("(\"{name}\", \"portable\") => index_{name}_portable(&data, &mut out),\n"),
+            ]
+        })
+        .collect();
+    let program = format!(
+        "{kernels}\n\
+         fn main() {{\n\
+         use std::io::Read;\n\
+         let name = std::env::args().nth(1).unwrap();\n\
+         let variant = std::env::args().nth(2).unwrap();\n\
+         let mut data = Vec::new();\n\
+         std::io::stdin().read_to_end(&mut data).unwrap();\n\
+         let mut out: Vec<u32> = Vec::new();\n\
+         match (name.as_str(), variant.as_str()) {{\n\
+         {arms}_ => panic!(\"unknown\"),\n\
+         }}\n\
+         let s: Vec<String> = out.iter().map(|x| x.to_string()).collect();\n\
+         println!(\"{{}}\", s.join(\",\"));\n\
+         }}\n"
+    );
+    let bin = compile(&program, "baked_variants");
+    let inputs = test_inputs();
+
+    // Only run variants this CPU actually supports.
+    let mut variants: Vec<&str> = vec!["portable"];
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("pclmulqdq") {
+        variants.push("avx2");
+    }
+    if std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("pclmulqdq")
+    {
+        variants.push("avx512");
+    }
+
+    for (name, d) in &ds {
+        let graph = formats::delimited(d);
+        for input in &inputs {
+            let mut want = Vec::new();
+            interp::run(&graph, input, &mut want);
+            for variant in &variants {
+                let got = run_variant(&bin, name, variant, input);
+                assert_eq!(
+                    got,
+                    want,
+                    "{name}/{variant}: baked kernel != interp on {:?}",
+                    String::from_utf8_lossy(input)
+                );
+            }
+        }
     }
 }
 
