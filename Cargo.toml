@@ -17,6 +17,8 @@ flate2 = { version = "1", optional = true }
 # CUDA driver + NVRTC (runtime CUDA-C compilation) for the experimental GPU
 # parser backend. dynamic-loading dlopens the CUDA libs — no link-time CUDA.
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12090"] }
+# dlopen libnvcomp at runtime for the GPU-resident decompression backend.
+libloading = { version = "0.9", optional = true }
 
 [dev-dependencies]
 arrow-array = "59.0.0"
@@ -38,7 +40,7 @@ cli = ["spec"]
 # Block-parallel bgzf decompression (genomics .vcf.gz / .fastq.gz).
 bgzf = ["dep:flate2"]
 # Experimental GPU (CUDA) structural-parsing backend via NVRTC.
-gpu = ["dep:cudarc"]
+gpu = ["dep:cudarc", "dep:libloading"]
 
 [[bin]]
 name = "falx"
@@ -71,4 +73,8 @@ required-features = ["gpu"]
 
 [[example]]
 name = "gpu_pipeline"
+required-features = ["gpu", "bgzf"]
+
+[[example]]
+name = "gpu_nvcomp"
 required-features = ["gpu", "bgzf"]

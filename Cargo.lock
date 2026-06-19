@@ -355,6 +355,7 @@ dependencies = [
  "csv",
  "cudarc",
  "flate2",
+ "libloading",
  "logfmt-zerocopy",
  "needletail",
  "noodles-bgzf 0.45.0",
