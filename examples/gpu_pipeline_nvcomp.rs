@@ -239,53 +239,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_warps = (total as u64).div_ceil(wb);
     let total_u = total as u64;
 
-    let run = || -> Result<((u64, u64), f64, f64), Box<dyn std::error::Error>> {
+    // Reusable device buffers — a real streaming pipeline allocates once and
+    // reuses; per-call cudaMalloc of the 360 MiB output etc. is benchmark noise.
+    let num_rows = raw.iter().filter(|&&b| b == b'\n').count();
+    // Pinned (page-locked) host buffer → full-PCIe-bandwidth uploads (pageable
+    // memory caps H2D at roughly half).
+    let mut comp_pinned = unsafe { ctx.alloc_pinned::<u8>(comp_buf.len()) }?;
+    comp_pinned.as_mut_slice()?.copy_from_slice(&comp_buf);
+    let mut d_comp = unsafe { stream.alloc::<u8>(comp_buf.len()) }?;
+    let d_out = unsafe { stream.alloc::<u8>(total) }?;
+    let d_temp = unsafe { stream.alloc::<u8>(temp_bytes.max(1)) }?;
+    let d_clen = stream.clone_htod(&clen)?;
+    let d_olen = stream.clone_htod(&olen)?;
+    let d_actual = stream.alloc_zeros::<usize>(nchunks)?;
+    let d_status = stream.alloc_zeros::<i32>(nchunks)?;
+    let d_counts = stream.alloc_zeros::<u32>(num_warps as usize)?;
+    let d_nl = unsafe { stream.alloc::<u32>(num_rows) }?;
+    let (cptrs, optrs) = {
+        let (cb, _g1) = d_comp.device_ptr(&stream);
+        let (ob, _g2) = d_out.device_ptr(&stream);
+        (
+            coff.iter().map(|&o| cb + o as u64).collect::<Vec<u64>>(),
+            ooff.iter().map(|&o| ob + o as u64).collect::<Vec<u64>>(),
+        )
+    };
+    let d_cptrs = stream.clone_htod(&cptrs)?;
+    let d_optrs = stream.clone_htod(&optrs)?;
+    // Device addresses are stable across reuse — capture them once.
+    let p_cp = d_cptrs.device_ptr(&stream).0;
+    let p_op = d_optrs.device_ptr(&stream).0;
+    let p_cl = d_clen.device_ptr(&stream).0;
+    let p_ol = d_olen.device_ptr(&stream).0;
+    let p_ac = d_actual.device_ptr(&stream).0;
+    let p_tp = d_temp.device_ptr(&stream).0;
+    let p_sp = d_status.device_ptr(&stream).0;
+
+    let mut run = || -> Result<((u64, u64), f64, f64, f64), Box<dyn std::error::Error>> {
         let t_all = Instant::now();
-        let d_comp = stream.clone_htod(&comp_buf)?;
-        let d_out = stream.alloc_zeros::<u8>(total)?;
-        let d_temp = stream.alloc_zeros::<u8>(temp_bytes.max(1))?;
-        let d_clen = stream.clone_htod(&clen)?;
-        let d_olen = stream.clone_htod(&olen)?;
-        let d_actual = stream.alloc_zeros::<usize>(nchunks)?;
-        let d_status = stream.alloc_zeros::<i32>(nchunks)?;
-        let (comp_base, _a) = d_comp.device_ptr(&stream);
-        let (out_base, _b) = d_out.device_ptr(&stream);
-        let cptrs: Vec<u64> = coff.iter().map(|&o| comp_base + o as u64).collect();
-        let optrs: Vec<u64> = ooff.iter().map(|&o| out_base + o as u64).collect();
-        let d_cptrs = stream.clone_htod(&cptrs)?;
-        let d_optrs = stream.clone_htod(&optrs)?;
+        stream.memcpy_htod(&comp_pinned, &mut d_comp)?; // re-upload the compressed input
+        let d_c = stream.alloc_zeros::<u64>(1)?;
+        let d_s = stream.alloc_zeros::<u64>(1)?;
         stream.synchronize()?;
         let t_gpu = Instant::now();
 
         // 1. nvCOMP inflate → d_out (contiguous)
-        let (cp, _c) = d_cptrs.device_ptr(&stream);
-        let (op, _d) = d_optrs.device_ptr(&stream);
-        let (cl, _e) = d_clen.device_ptr(&stream);
-        let (ol, _f) = d_olen.device_ptr(&stream);
-        let (ac, _g) = d_actual.device_ptr(&stream);
-        let (tp, _h) = d_temp.device_ptr(&stream);
-        let (sp, _i) = d_status.device_ptr(&stream);
         let st = unsafe {
             (f_decomp)(
-                cp as *const *const c_void,
-                cl as *const usize,
-                ol as *const usize,
-                ac as *mut usize,
+                p_cp as *const *const c_void,
+                p_cl as *const usize,
+                p_ol as *const usize,
+                p_ac as *mut usize,
                 nchunks,
-                tp as *mut c_void,
+                p_tp as *mut c_void,
                 temp_bytes,
-                op as *const *mut c_void,
+                p_op as *const *mut c_void,
                 opts,
-                sp as *mut i32,
+                p_sp as *mut i32,
                 stream.cu_stream() as CuStream,
             )
         };
         if st != 0 {
             return Err(format!("nvcomp status {st}").into());
         }
+        stream.synchronize()?;
+        let t_inflate = t_gpu.elapsed().as_secs_f64();
 
         // 2. newline index (on device)
-        let d_counts = stream.alloc_zeros::<u32>(num_warps as usize)?;
         let cfg_w = LaunchConfig::for_num_elems((num_warps * 32) as u32);
         let mut b = stream.launch_builder(&nl_count);
         b.arg(&d_out);
@@ -294,9 +313,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b.arg(&d_counts);
         unsafe { b.launch(cfg_w) }?;
         let counts = stream.clone_dtoh(&d_counts)?;
-        let (base, num_rows) = prefix_sum(&counts);
+        let (base, _) = prefix_sum(&counts);
         let d_base = stream.clone_htod(&base)?;
-        let d_nl = stream.alloc_zeros::<u32>(num_rows)?;
         let mut b = stream.launch_builder(&nl_scatter);
         b.arg(&d_out);
         b.arg(&total_u);
@@ -306,8 +324,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { b.launch(cfg_w) }?;
 
         // 3. query → 16 bytes
-        let d_c = stream.alloc_zeros::<u64>(1)?;
-        let d_s = stream.alloc_zeros::<u64>(1)?;
         let (nr, col_u, t2) = (num_rows as u32, col as u32, thr);
         let mut b = stream.launch_builder(&query);
         b.arg(&d_out);
@@ -321,16 +337,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream.synchronize()?;
         let gpu = t_gpu.elapsed().as_secs_f64();
         let res = (stream.clone_dtoh(&d_c)?[0], stream.clone_dtoh(&d_s)?[0]);
-        Ok((res, gpu, t_all.elapsed().as_secs_f64()))
+        let e2e = t_all.elapsed().as_secs_f64();
+        Ok((res, gpu, e2e, t_inflate))
     };
 
-    let (res, _, _) = run()?;
+    let (res, gpu0, e2e0, infl0) = run()?;
+    println!(
+        "stage breakdown (1 run): inflate {:.1} ms, index+query {:.1} ms, non-GPU (alloc+upload) {:.1} ms",
+        infl0 * 1e3,
+        (gpu0 - infl0) * 1e3,
+        (e2e0 - gpu0) * 1e3
+    );
+    let (res, _, _, _) = (res, gpu0, e2e0, infl0);
     assert_eq!(res, cpu_ref, "GPU pipeline != CPU");
     println!("\ncorrectness: GPU (.vcf.gz→nvcomp→index→query) == CPU ✓");
 
     let (mut bc, mut be) = (f64::MAX, f64::MAX);
     for _ in 0..5 {
-        let (_, c, e) = run()?;
+        let (_, c, e, _) = run()?;
         bc = bc.min(c);
         be = be.min(e);
     }

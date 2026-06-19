@@ -23,11 +23,16 @@ struct Opts {
 }
 impl Opts {
     fn default_backend() -> Self {
+        // 0=DEFAULT, 1=HARDWARE (Blackwell decompression engine), 2=CUDA
+        let backend = std::env::var("NVCOMP_BACKEND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Opts {
-            backend: 0,
-            sort_before_hw: 0,
+            backend,
+            sort_before_hw: 1,
             reserved: [0; 56],
-        } // BACKEND_DEFAULT
+        }
     }
 }
 
