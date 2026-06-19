@@ -10,9 +10,12 @@
 //!
 //! Run: cargo run --release --example avx512_probe -- <file.csv> [iters]
 
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_arch = "x86_64")]
 fn best(iters: usize, mut f: impl FnMut() -> Duration) -> Duration {
     let mut b = Duration::MAX;
     for _ in 0..iters {
