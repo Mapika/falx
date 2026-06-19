@@ -45,12 +45,12 @@ pub fn lower_parser(dialect: &Dialect) -> Vec<Item> {
     items
 }
 
-/// The helper items required by `graphs` (their union): `class_mask` always,
-/// `prefix_xor` if any graph uses [`Op::PrefixXor`], the region resolver if any
-/// uses [`Op::Regions`].
+/// The helper items required by `graphs` (their union): `class_mask` and
+/// `push_indexes` (the output scatter) always, `prefix_xor` if any graph uses
+/// [`Op::PrefixXor`], the region resolver if any uses [`Op::Regions`].
 pub fn needed_helpers(graphs: &[&Graph]) -> Vec<Item> {
     let uses = |pred: fn(&Op) -> bool| graphs.iter().any(|g| g.nodes().iter().any(pred));
-    let mut items = vec![class_mask_helper()];
+    let mut items = vec![class_mask_helper(), push_indexes_helper()];
     if uses(|o| matches!(o, Op::PrefixXor(_))) {
         items.push(prefix_xor_helper());
     }
@@ -58,6 +58,45 @@ pub fn needed_helpers(graphs: &[&Graph]) -> Vec<Item> {
         items.push(region_helpers());
     }
     items
+}
+
+/// `push_indexes(mask, base, out)` — the output scatter: reserve capacity once,
+/// then write set-bit positions in unconditional chunks of 8 via a raw pointer
+/// (overshoot ≤7 masked by a single `set_len`), avoiding a per-bit `Vec::push`
+/// capacity check. Matches the production kernel's hot extraction path.
+fn push_indexes_helper() -> Item {
+    Item::Raw(
+        r#"/// Scatter the set bits of `mask` to `out` as `base + bit`. Reserves once and
+/// writes unconditional chunks of 8 via raw pointer (overshoot masked by
+/// `set_len`), so there is no per-bit `push` capacity check.
+#[inline]
+fn push_indexes(mut mask: u64, base: u32, out: &mut Vec<u32>) {
+    let count = mask.count_ones() as usize;
+    if count == 0 {
+        return;
+    }
+    let len = out.len();
+    out.reserve(count + 8);
+    // SAFETY: capacity covers len + count + 8; chunked writes overshoot by at
+    // most 7 entries and set_len exposes only the real ones.
+    unsafe {
+        let mut ptr = out.as_mut_ptr().add(len);
+        let mut remaining = count as isize;
+        while remaining > 0 {
+            let mut j = 0;
+            while j < 8 {
+                *ptr.add(j) = base + mask.trailing_zeros();
+                mask &= mask.wrapping_sub(1);
+                j += 1;
+            }
+            ptr = ptr.add(8);
+            remaining -= 8;
+        }
+        out.set_len(len + count);
+    }
+}"#
+        .into(),
+    )
 }
 
 /// Lower one graph to a single `pub fn <name>(data: &[u8], out: &mut Vec<u32>)`.
@@ -693,20 +732,36 @@ impl Target {
         }
     }
 
-    /// Statement that records one structural position inside the mask drain.
-    fn emit_pos(self) -> Stmt {
+    /// Drain the output mask's set bits to the sink. Rust uses the unrolled
+    /// `push_indexes` scatter (reserve once + raw writes); C keeps a per-bit
+    /// loop (its sink is already a raw `out[count++]` store).
+    fn drain(self, mask_init: Expr) -> Vec<Stmt> {
         match self {
-            Target::Rust => Stmt::Expr(Expr::call(
-                Expr::path("out.push"),
-                vec![Expr::binary(
-                    BinOp::Add,
+            Target::Rust => vec![Stmt::Expr(Expr::call(
+                Expr::path("push_indexes"),
+                vec![
+                    mask_init,
                     Expr::cast(Expr::path("offset"), Type::name("u32")),
-                    Expr::call(Expr::path("mask.trailing_zeros"), vec![]),
-                )],
-            )),
-            Target::C => {
-                Stmt::Raw("out[(*out_count)++] = (uint32_t) offset + __builtin_ctzll(mask);".into())
-            }
+                    Expr::path("out"),
+                ],
+            ))],
+            Target::C => vec![
+                Stmt::let_("mask", true, Type::name("u64"), mask_init),
+                Stmt::While {
+                    cond: Expr::binary(BinOp::Ne, Expr::path("mask"), Expr::int(0)),
+                    body: Block(vec![
+                        Stmt::Raw(
+                            "out[(*out_count)++] = (uint32_t) offset + __builtin_ctzll(mask);"
+                                .into(),
+                        ),
+                        Stmt::assign_op(
+                            Expr::path("mask"),
+                            BinOp::BitAnd,
+                            Expr::binary(BinOp::Sub, Expr::path("mask"), Expr::int(1)),
+                        ),
+                    ]),
+                },
+            ],
         }
     }
 
@@ -772,18 +827,7 @@ fn block_body(
     } else {
         out_node
     };
-    b.push(Stmt::let_("mask", true, Type::name("u64"), mask_init));
-    b.push(Stmt::While {
-        cond: Expr::binary(BinOp::Ne, Expr::path("mask"), Expr::int(0)),
-        body: Block(vec![
-            target.emit_pos(),
-            Stmt::assign_op(
-                Expr::path("mask"),
-                BinOp::BitAnd,
-                Expr::binary(BinOp::Sub, Expr::path("mask"), Expr::int(1)),
-            ),
-        ]),
-    });
+    b.extend(target.drain(mask_init));
     b
 }
 
