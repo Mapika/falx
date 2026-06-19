@@ -14,6 +14,9 @@ toml = { version = "0.8", default-features = true, optional = true }
 # Pure-Rust DEFLATE (miniz_oxide backend) for the optional bgzf decompressor.
 # Optional + feature-gated so the core / generated kernels stay std-only.
 flate2 = { version = "1", optional = true }
+# CUDA driver + NVRTC (runtime CUDA-C compilation) for the experimental GPU
+# parser backend. dynamic-loading dlopens the CUDA libs — no link-time CUDA.
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12090"] }
 
 [dev-dependencies]
 arrow-array = "59.0.0"
@@ -34,6 +37,8 @@ spec = ["dep:toml"]
 cli = ["spec"]
 # Block-parallel bgzf decompression (genomics .vcf.gz / .fastq.gz).
 bgzf = ["dep:flate2"]
+# Experimental GPU (CUDA) structural-parsing backend via NVRTC.
+gpu = ["dep:cudarc"]
 
 [[bin]]
 name = "falx"
@@ -51,6 +56,10 @@ required-features = ["bgzf"]
 [[example]]
 name = "validate_vcf_gz"
 required-features = ["bgzf"]
+
+[[example]]
+name = "gpu_probe"
+required-features = ["gpu"]
 
 [profile.release]
 codegen-units = 1
