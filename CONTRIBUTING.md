@@ -134,8 +134,10 @@ Mirror the AVX2 template in `codegen.rs` to target a new architecture (e.g., ARM
 
 **Key steps**:
 
-1. Create `src/neon.rs` with the same module structure as `src/avx2.rs`.
-2. In `codegen.rs`, add `Flavor::Neon` and emit platform-specific code.
+1. Each ISA's kernel is emitted by `codegen.rs` as a self-contained `mod <arch>`
+   submodule (no hand-written backend files); ARM NEON, for example, derives
+   from the AVX2 template via `neon_driver` / `add_neon_dispatch`.
+2. In `codegen.rs`, add a `Flavor` variant for the ISA and emit its code.
 3. Implement the three arch-specific primitives:
    - **eq_mask(block, byte) -> u64**: Character-class membership (SIMD compare, reduce to bits).
    - **prefix_xor(x) -> u64**: Running parity. For NEON without PMUL, use scalar fallback or table-based approach.

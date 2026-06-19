@@ -203,12 +203,14 @@ genuinely interleaved blocks walk events). Bit-parallel ops map to one or two
 machine instructions; stateful ops carry a few bits across blocks — the kernel's
 entire memory, no lookback, no backtracking, no allocation.
 
-Three executors share these semantics:
+Several components share these semantics:
 
 - `src/interp.rs` — reference interpreter (ground truth, deliberately slow)
-- `src/codegen.rs` — emits the self-contained Rust kernel file
-- `src/avx2.rs` — the original hand-written CSV kernel, kept as the fidelity
-  baseline
+- `src/codegen.rs` — emits the self-contained Rust kernel file (string templates)
+- `src/emit/` — an experimental typed-AST emitter: lowers the same IR graph to a
+  typed code AST, then renders it to Rust *or* CUDA-C — one tree, many backends
+- `src/scalar.rs` — a byte-at-a-time reference indexer; the differential-test
+  oracle every SIMD kernel is checked against
 
 Format specs (TOML, see `specs/`) describe the *delimited* family: a structural
 byte set, an optional quote byte, an escape convention (RFC 4180 doubled quotes
@@ -351,7 +353,7 @@ emission. To force handwritten graphs for every target, run
 ## Roadmap
 
 - M0–M3 (done): hand-written AVX2 CSV indexer + benchmark methodology;
-  bitstream IR + interpreter + differential fuzzing; Rust codegen from the IR
+  bitstream IR + interpreter + differential testing; Rust codegen from the IR
   (within 2% of hand-written); declarative TOML spec + CLI emitting
   self-contained parser files.
 - M4–M5 (done): escape machinery and the wider delimited family (TSV, logfmt,
@@ -407,6 +409,14 @@ emission. To force handwritten graphs for every target, run
   feature); fused decompress→parse (`bgzf::parse_gz_par`); validation on real
   ClinVar against an independent scalar oracle; pyarrow Python bindings;
   value-by-value noodles parity tests in CI.
+- Experimental: **typed-AST emitter** (`src/emit/`) — a second code generator
+  beside the string-template `codegen`. It lowers an `ir::Graph` to a typed code
+  AST, then renders **Rust** (the full SIMD ladder: x86 AVX-512 → AVX2 → scalar
+  with PCLMULQDQ quote-parity, ARM NEON) or **CUDA-C** from one tree, comments
+  first-class. Each surface — structural index, record/field parse, typed
+  columns, nested-JSON tape, stat sinks — is validated by compiling the emitted
+  code (`rustc`/`cc`) and running it byte-for-byte against the interpreter and
+  the production kernels.
 - Experimental: **GPU backend** (research branch `gpu-backend`). The same
   emit-source model, now targeting CUDA: falx emits CUDA-C, NVRTC-compiles it at
   runtime (`cudarc`, no link-time CUDA), byte-exact vs the CPU kernels (~136
