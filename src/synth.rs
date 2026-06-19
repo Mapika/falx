@@ -2103,8 +2103,9 @@ fn step_byte(graph: &Graph, carries: u64, pos: u8, byte: u8, values: &mut [bool]
 }
 
 /// Byte-serial execution over a whole input — the prover's semantics,
-/// exposed so tests can differentially pin it against [`interp::run`].
-pub fn byte_serial_masks(graph: &Graph, input: &[u8]) -> Vec<u64> {
+/// used by the tests below to differentially pin it against [`interp::run`].
+#[cfg(test)]
+fn byte_serial_masks(graph: &Graph, input: &[u8]) -> Vec<u64> {
     let mut masks = vec![0u64; input.len().div_ceil(64)];
     let mut carries = seed_carries(graph);
     let mut values = vec![false; graph.nodes().len()];

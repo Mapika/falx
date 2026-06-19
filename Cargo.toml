@@ -47,6 +47,9 @@ name = "falx"
 path = "src/bin/falx.rs"
 required-features = ["cli"]
 
+# Examples needing optional backends are declared here for `required-features`.
+# Loose examples (benches, demos, probes, `generate`) have no feature gate and
+# build under `cargo build --all-targets`.
 [[example]]
 name = "bgzf_bench"
 required-features = ["bgzf"]
@@ -67,10 +70,6 @@ required-features = ["gpu"]
 name = "gpu_index"
 required-features = ["gpu"]
 
-[profile.release]
-codegen-units = 1
-lto = "thin"
-
 [[example]]
 name = "gpu_query"
 required-features = ["gpu"]
@@ -86,3 +85,7 @@ required-features = ["gpu", "bgzf"]
 [[example]]
 name = "gpu_pipeline_nvcomp"
 required-features = ["gpu", "bgzf"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
