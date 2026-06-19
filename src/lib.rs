@@ -27,6 +27,8 @@ pub mod avx2;
 pub mod bgzf;
 pub mod codegen;
 pub mod egraph;
+/// Experimental typed-AST code emitter (multi-backend), alongside `codegen`.
+pub mod emit;
 pub mod formats;
 pub mod graph_opt;
 pub mod interp;
