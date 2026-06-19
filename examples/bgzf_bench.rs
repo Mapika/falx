@@ -3,10 +3,13 @@
 //! Decompression is the wall in front of the SIMD parsers on `.vcf.gz` inputs
 //! (single-thread gunzip ~0.3 GiB/s vs a multi-GiB/s parser). bgzf blocks are
 //! independent, so this measures how well falx's block-parallel inflate (a
-//! boundary scan + scatter into disjoint slots, pure-Rust miniz_oxide core)
-//! feeds the parser, against the noodles-bgzf reader the genomics tools use.
+//! boundary scan + scatter into disjoint slots) feeds the parser, against the
+//! noodles-bgzf reader the genomics tools use. Run with `bgzf-libdeflate` to
+//! switch falx's inner inflater from pure-Rust miniz_oxide to C libdeflate.
 //!
 //! Run: `cargo run --release --features bgzf --example bgzf_bench -- [uncompressed_MiB] [iters]`
+//! Fastest inflater:
+//! `cargo run --release --features bgzf-libdeflate --example bgzf_bench -- [uncompressed_MiB] [iters]`
 //! (noodles-bgzf is a dev-dependency, so this example always has the baseline.)
 
 use std::io::{Read as _, Write as _};
@@ -132,7 +135,19 @@ fn main() {
         raw,
         "noodles parallel mismatch"
     );
-    println!("correctness: all paths reproduce the input byte-for-byte\n");
+    let processed: usize = falx::bgzf::process_blocks_par(
+        &comp,
+        threads,
+        || 0usize,
+        |sum, _block_index, chunk| *sum += chunk.len(),
+    )
+    .unwrap()
+    .into_iter()
+    .sum();
+    assert_eq!(processed, raw.len(), "falx block processor byte loss");
+    println!(
+        "correctness: materializing paths reproduce the input byte-for-byte; block processor counted all bytes\n"
+    );
 
     let u = raw.len();
     let fs = best(iters, || {
@@ -140,6 +155,18 @@ fn main() {
     });
     let fp = best(iters, || {
         std::hint::black_box(falx::bgzf::decompress_par(&comp, threads).unwrap());
+    });
+    let fb = best(iters, || {
+        let n: usize = falx::bgzf::process_blocks_par(
+            &comp,
+            threads,
+            || 0usize,
+            |sum, _block_index, chunk| *sum += chunk.len(),
+        )
+        .unwrap()
+        .into_iter()
+        .sum();
+        std::hint::black_box(n);
     });
     let ns = best(iters, || {
         std::hint::black_box(noodles_decompress(&comp));
@@ -163,6 +190,10 @@ fn main() {
         "  falx    parallel : {:>8.1}   ({:.2}x over its serial)",
         mibs(u, fp),
         mibs(u, fp) / mibs(u, fs)
+    );
+    println!(
+        "  falx    blocks   : {:>8.1}   (streaming consume)",
+        mibs(u, fb)
     );
     println!("  noodles serial   : {:>8.1}", mibs(u, ns));
     println!("  noodles parallel : {:>8.1}", mibs(u, np));

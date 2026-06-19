@@ -1140,18 +1140,18 @@ fn index_cells_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut ColumnS
     unsupported_cpu();
 }
 
-/// Parallel [`parse_columns`]: records are assigned to workers by
-/// terminator ownership — worker t skips to the first record
-/// boundary at or past its chunk start, and finishes the record it
-/// is mid-way through at chunk end — so every record is converted
-/// exactly once, with no tape built. Quote context is resolved per
-/// chunk inside the scope (one barrier), as in [`parse_par`]; column
-/// chunks concatenate, validity bitmaps stitch bit-shifted.
-pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
+/// Parallel [`parse_columns`] without a final concatenation pass.
+/// Records are assigned to workers by terminator ownership — worker
+/// t skips to the first record boundary at or past its chunk start,
+/// and finishes the record it is mid-way through at chunk end — so
+/// every record is converted exactly once, with no tape built. Quote
+/// context is resolved per chunk inside the scope (one barrier), as
+/// in [`parse_par`]. Returned chunks are in input order.
+pub fn parse_columns_chunks_par(data: &[u8], threads: usize) -> Vec<Columns<'_>> {
     let threads = threads.max(1).min(data.len() / 64 + 1);
     let chunk = (data.len() / threads + 63) & !63;
     if threads == 1 || chunk == 0 {
-        return parse_columns(data);
+        return vec![parse_columns(data)];
     }
     let bounds: Vec<usize> = (0..=threads)
         .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
@@ -1163,7 +1163,7 @@ pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
     let parity: Vec<std::sync::atomic::AtomicU64> =
         (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     let barrier = std::sync::Barrier::new(threads);
-    let parts: Vec<Columns<'_>> = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let (start, end) = (bounds[t], bounds[t + 1]);
@@ -1185,7 +1185,18 @@ pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("columns thread ok")).collect()
-    });
+    })
+}
+
+/// Parallel [`parse_columns`]: parses independent worker chunks,
+/// then concatenates them into the legacy single-`Columns` layout.
+/// Use [`parse_columns_chunks_par`] when chunked table output is
+/// acceptable and the final copy would dominate runtime.
+pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
+    let parts = parse_columns_chunks_par(data, threads);
+    if parts.len() == 1 {
+        return parts.into_iter().next().expect("one columns chunk");
+    }
     let mut cols = Columns::with_capacity(data, parts.iter().map(|p| p.rows).sum::<usize>());
     for part in &parts {
         let city_base = cols.city_data.len();

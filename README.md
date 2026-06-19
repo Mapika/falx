@@ -1,312 +1,194 @@
 # falx
 
-falx is a parser **generator**: it takes a declarative format spec and emits
-simdjson-style branchless SIMD parsing kernels. Hand-written SIMD parsers
-(simdjson, simdzone, simdutf, Sep) each take an expert months; the techniques
-they share are mechanical enough to compile from a spec. No other such
-generator currently exists.
+falx is a parser generator for high-throughput record and column parsers. It
+takes a declarative format spec and emits a self-contained Rust parser with
+runtime SIMD dispatch:
 
-```
-$ cargo run --features cli --bin falx -- build specs/logfmt.toml -o logfmt_parser.rs
-```
+- x86: AVX-512F/BW/VL + PCLMULQDQ first, then AVX2 + PCLMULQDQ
+- ARM: NEON, with PMULL where carry-less multiply is needed
+- std-only generated parser files for normal use
 
-The output is a single self-contained Rust file (std only): native SIMD
-structural indexers for **x86** (AVX-512F/BW/VL+PCLMULQDQ preferred over
-AVX2+PCLMULQDQ) and **ARM** (NEON, with PMULL for carry-less multiply), the
-backend chosen at runtime, plus a zero-copy record/field API, ready to drop into
-any project:
+The goal is not another hand-written parser. The goal is to compile the same
+bit-parallel tricks used by expert SIMD parsers from small specs, then reuse
+them across CSV, TSV, logfmt, NDJSON, FASTQ, VCF, and related delimited formats.
+
+```bash
+cargo run --features cli --bin falx -- build specs/logfmt.toml -o logfmt_parser.rs
+```
 
 ```rust
 let parsed = logfmt_parser::parse(&data);
 for record in parsed.records() {
-    for field in record.fields() {   // Cow<[u8]>: unquoted, unescaped,
-        handle(&field);              // borrows unless an escape forced a copy
+    for field in record.fields() {
+        handle(&field);
     }
 }
 ```
 
-Specs can also declare **typed columns**; the generated parser then emits
-columnar buffers directly — CSV to Arrow-layout typed arrays in one pass,
-skipping every undeclared field:
+## Current Status
+
+On the benchmark matrix we have actually run, falx is the fastest tested
+solution across CSV projection/materialization, CSV aggregation, NDJSON
+schema-aware aggregation, and BGZF block streaming. The claim is deliberately
+bounded: these are local, reproducible results on the datasets and libraries
+listed below, not a universal claim about every parser workload.
+
+Hardware for the latest runs: Xeon w7-3455, Sapphire Rapids, 24 physical cores,
+48 logical threads, AVX-512F/BW/VL + PCLMULQDQ. Parallel falx figures use 24
+threads unless noted. CSV and NDJSON files are 1 GiB.
+
+| Lane | falx | Fastest external baseline | Result |
+|---|---:|---:|---:|
+| CSV Latitude/Longitude materialization, chunked | 9.63 GiB/s | Polars 1.41.2: 4.64 GiB/s | 2.1x |
+| CSV City + Latitude/Longitude materialization | 2.13 GiB/s | PyArrow 24.0.0: 1.78 GiB/s | 1.2x |
+| CSV count/sum(Latitude)/sum(Longitude), fused | 9.80 GiB/s | Polars 1.41.2: 2.04 GiB/s | 4.8x |
+| NDJSON `sum(id + nested.score)` | 38.19 GiB/s | simdjson C++: 2.76 GiB/s | 13.9x |
+| BGZF block streaming, 1 GiB raw VCF | 0.074 s median | htslib bgzip: 0.10-0.12 s | ~1.4x |
+
+Important benchmark boundaries:
+
+- CSV materialization compares table output to table output. falx exposes
+  `parse_columns_chunks_par` so callers can keep worker chunks, matching the way
+  Polars and Arrow avoid a final flattening copy.
+- CSV fused aggregation compares against database-style projected aggregation.
+  falx does not build `Vec<f64>` columns for that lane.
+- NDJSON is schema-aware and matches the benchmark shape: read `id` and
+  `nested.score` and sum them. It is not claiming to beat a full JSON DOM parse
+  while doing less work.
+- BGZF streaming measures decompressed blocks delivered to a callback. The
+  older fully materialized decompression path still exists when callers need one
+  contiguous output buffer.
+
+## Why It Is Fast
+
+falx represents formats as bitstream graphs: one bit per input byte, processed
+64 bytes at a time. The IR contains byte-class membership, bitwise ops,
+carry-aware shifts, PCLMULQDQ prefix XOR for quote parity, and a small region
+resolver for comment and quoted-field dialects.
+
+Generated kernels do the expensive parts once:
+
+- structural bytes and quote/comment state are computed as SIMD masks
+- projected typed columns are filled directly from those masks
+- undeclared CSV fields are skipped instead of parsed
+- aggregate sinks can fuse parse + reduction without building a table
+- parallel parsers split by record ownership, so every record is converted once
+- chunked table output avoids the final memory-bandwidth-heavy concat pass
+
+The result is a generated parser that behaves like a hand-tuned SIMD parser but
+comes from a spec.
+
+## Typed Columns
+
+Specs can declare typed columns. The generated parser emits Arrow-compatible
+value buffers and validity bitmaps directly:
 
 ```toml
 [[columns]]
 index = 5
-type = "f64"      # also: "i64", "string" (cleaned, Arrow varbinary
-name = "latitude" #   layout), "bytes" (zero-copy raw spans)
+name = "latitude"
+type = "f64" # also: i64, string, bytes
 ```
 
 ```rust
-let cols = parser::parse_columns(&data);          // or parse_columns_par
-let lat: &[f64] = &cols.latitude;                 // one Vec per column
-let ok = parser::bitmap_get(&cols.latitude_valid, row);  // Arrow-style
-// validity bitmap: empty/malformed cells clear a bit, never panic
+let cols = parser::parse_columns(&data);
+let latitudes: &[f64] = &cols.latitude;
+let valid = parser::bitmap_get(&cols.latitude_valid, row);
 ```
 
-## Performance
+For parallel table output, prefer chunks when your downstream can accept them:
 
-Xeon w7-3455 (Sapphire Rapids, AVX-512F/BW/VL + PCLMULQDQ, 24 cores /
-48 threads, 8-channel DDR5); **1 GiB** synthetic file per format, **median of
-9 runs** (2 warmup) via `cargo run --release --example bench_sustained`, AVX-512
-path selected at runtime. These kernels are execution-port/bandwidth bound and
-**peak at 24 threads (physical cores)** — driving all 48 logical threads is
-slower — so every parallel figure uses 24 threads. Each row is gated by an
-equal-`Work` check: falx and the library it is timed against must emit identical
-record/byte/checksum counters before any timing is reported, so the comparisons
-are like-for-like, not a structural framer measured against a full semantic
-parser.
+```rust
+let chunks = parser::parse_columns_chunks_par(&data, 24);
+for chunk in &chunks {
+    consume(&chunk.latitude, &chunk.latitude_valid);
+}
+```
 
-**Same work on both sides** (enforced by the `Work` gate), 1 GiB per format:
+`parse_columns_par` remains available and returns the legacy single `Columns`
+layout by concatenating the worker chunks.
 
-| format (equal work) | falx serial | falx @24 cores | fastest library | per-core | @24 cores |
-|---|---|---|---|---|---|
-| FASTQ records | 7.8 | **111** | seq_io / needletail 2.7 | 2.8x | 40x |
-| VCF typed projection | 2.0 | **26** | noodles-vcf 0.34 | 5.8x | 77x |
-| TSV field bytes | 3.0 | **39** | csv crate 0.30 | 10x | 130x |
-| logfmt pairs | 1.0 | **14** | logfmt-zerocopy 0.21 | 4.9x | 66x |
-| CSV field bytes | 1.2 | **15** | csv crate 0.30 | 4.1x | 49x |
-| CSV geo, text + lat/lon | 0.86 | **12** | arrow-csv 0.27 | 3.2x | 44x |
-| CSV geo, lat/lon f64 | 1.1 | **13** | arrow-csv 0.31 | 3.4x | 43x |
+String columns are cleaned into Arrow varbinary-style buffers. Byte columns are
+zero-copy raw spans into the source.
 
-Throughput in GiB/s. The libraries are single-threaded, so **per-core** is the
-fairest kernel-efficiency comparison and **@24 cores** is end-to-end throughput
-(kernel + parallelism). FASTQ is the toughest field — `seq_io`/`needletail` are
-real SIMD-class parsers at ~2.7 GiB/s, so the 2.8x per-core win there is a
-genuine kernel result; the 130x over the `csv` crate partly reflects how slow
-that crate is.
+## Generated Format Coverage
 
-**Reported separately, *not* a faster-than claim:** falx frames NDJSON lines at
-8.4 GiB/s serial / 112 GiB/s @24, but that is line framing — `serde_json` (0.15)
-and `simd-json` (0.24) do full DOM/tape parsing, which is not equal work.
-Pure CSV structural indexing (every field + record boundary, no value work) runs
-6.0 / 40 GiB/s — less work than a parse, so it is the headroom indexing creates,
-not a library speedup.
+The same generator covers:
 
-The generated API also exposes `parse_into` (recycles the tape buffer — a fresh
-per-GiB tape soft-page-faults, so batch callers hand the previous parse back),
-a `fields_raw()` zero-copy span iterator that skips quote-stripping, and a
-`stream()` incremental mode for unbounded input; see `examples/`.
+- CSV/TSV/PSV-style delimited records
+- quoted CSV, doubled quotes, and JSON-style escapes
+- logfmt pairs
+- NDJSON line records and schema-aware reductions
+- nested bracket tapes for JSON-like structural navigation
+- comment-line dialects such as VCF/BED/GFF/SAM
+- FASTQ records via declarative `lines_per_record = 4`
+- VCF typed projections, including selected INFO sub-columns
 
-### Typed columns: CSV → Arrow-layout buffers
+Optional modules extend this into genomics pipelines:
 
-Extract Latitude/Longitude as `f64` columns with validity bitmaps, skipping the
-other five fields — a distinct column-*materialization* run (`bench_columns`,
-64 MiB synthetic, parallel figure at 48 threads):
+- `bgzf`: block-parallel BGZF inflate with pure-Rust miniz_oxide
+- `bgzf-libdeflate`: the faster libdeflate backend
+- fused `.vcf.gz` inflate -> parse paths that avoid materializing the full text
+- Python/Arrow integration work under `python/`
 
-| | throughput | vs csv crate |
-|---|---|---|
-| falx `parse_columns` | 0.77 GiB/s | 3.3x |
-| falx `parse_columns_par` | **5.9 GiB/s** | **26x** |
-| csv crate + `str::parse` | 0.23 GiB/s | 1.0x |
-| arrow-csv (projection enabled) | 0.29 GiB/s | 1.3x |
+## Correctness
 
-All four agree exactly on valid-row counts and value checksums (`cargo run
---release --example bench_columns`). The output layout *is* the Arrow
-primitive-array layout, so handing columns to Arrow is a buffer wrap —
-`examples/arrow_interop.rs` does it without copying. The path is *fused*:
-structural masks feed a projection sink directly, no tape is materialized, and
-undeclared fields cost one counter increment each. `string` columns materialize
-cleaned cells (quotes stripped, escapes resolved) straight into Arrow varbinary
-buffers in the same pass.
+The benchmark results are only useful because the outputs are checked.
 
-### Beyond CSV/JSON: formats researchers actually use
+The test suite compares generated SIMD kernels against independent references:
 
-The generator is the point — a new delimited or record format is a few lines of
-spec, not months of expert SIMD — so the same engine that does CSV does the
-formats genomics, ML, and scientific pipelines run on. VCF/BED/GFF/SAM are
-tab-delimited with `#` header lines (a comment dialect; parallelized by line
-ownership). FASTQ packs each read into 4 lines (`@header` / sequence / `+` /
-quality), and the quality line can contain `@`/`+`, so framing must count line
-boundaries rather than split on a sigil — falx finds them with the generated
-newline kernel and groups by 4 (`examples/fastq.rs`), 2.8x per core / 40x @24 vs
-the real SIMD-class `seq_io` and `needletail`, with sequence- and quality-byte
-checksums identical on all three. Matrix Market (sparse sci-compute) generates
-from a 4-line spec.
+- scalar record/field parsers
+- the bitstream IR interpreter
+- codegen drift tests for checked-in generated kernels
+- randomized CSV, quote, escape, comment, and nesting boundary cases
+- noodles parity for VCF and BGZF genomics paths
+- simdjson/Polars/PyArrow/DuckDB benchmark harness checksums where applicable
 
-CSV-with-`#`-comments (`csv_hash`) is the one dialect carrying both quotes and
-comments — a quote can hide a comment-start and a multi-line quoted field can
-hide a newline, so neither quote-parity nor line-ownership parallelism applies
-directly. Its region resolver fast-paths comment-free blocks through a
-PCLMULQDQ quote-parity (3.8 GiB/s serial), and it parallelizes via a per-chunk
-region *transfer function* (~5x at 24 threads); see [Parallelism](#parallelism).
+Run the main verification set:
 
-### Genomics: `.vcf.gz` → Arrow, end to end
+```bash
+cargo test --lib --tests
+cargo test --features bgzf-libdeflate --lib --tests
+```
 
-The delimited engine turned into a genuine genomics vertical — the path real VCF
-analytics actually runs, with the decompression that gates it.
+## Reproducing The Latest Benchmark Lanes
 
-- **INFO sub-columns.** A VCF row's `INFO` field is a `;`/`=` mini-format
-  (`DP=812;AF=0.001;…`); analytics wants a handful of those keys as typed
-  columns. A `Column` can carry an `info_key`: the generated parser extracts that
-  key from *inside* the parent field into a typed Arrow column with a validity
-  bit, and every INFO key sharing a parent is filled in **one** pass over the
-  field. Measured vs **noodles 0.88** (the scalar reference oxbow/exon/biobear/
-  polars-bio all wrap): ~1.85x on the typed projection, and the gap *grows* with
-  key count — noodles' `Info::get` rescans from the start per key, so a real
-  many-key projection is **2.0x at 4 keys, 4.6x at 8** (`examples/vcf_info_bench.rs`).
-- **bgzf decompression** (optional `bgzf` feature, pure-Rust miniz_oxide). bgzf
-  is block-independent gzip members, so blocks inflate across threads into
-  presized slots: **~5.3 GiB/s, ~3.4x noodles' `MultithreadedReader`**,
-  byte-exact. The decompression wall (~0.3 GiB/s single-thread) that otherwise
-  starves the parser is gone.
-- **Fused decompress → parse.** `bgzf::parse_gz_par` never materializes the
-  decompressed file: each worker inflates its own block group, completes the
-  record straddling into the next group, drops its leading partial (line
-  ownership), and parses the local buffer straight to typed Arrow columns.
-- **Validated on real data.** ClinVar GRCh38 (183 MiB bgzf → 1.8 GiB, 4.4M
-  records): bgzf byte-exact on real htslib framing, record count + POS + INFO
-  exact vs an independent scalar ground truth, **~6.5 GiB/s fused ≈ 15x the
-  noodles `.vcf.gz`→columns pipeline**. A `tests/noodles_parity.rs` suite checks
-  POS/REF/ALT/QUAL/DP/AF value-by-value against noodles (serial, parallel,
-  bgzf, fused) on every push.
-- **Python.** `falx_genomics.read_vcf_gz_columns(path) -> pyarrow.RecordBatch`
-  (pyo3, GIL released during the parallel parse), zero-copy into polars/pandas
-  (`python/`).
+CSV typed materialization:
 
-### Versus the real simdjson (C++)
+```bash
+cargo run --release --example bench_columns -- <csv-geo-1g.csv>
+```
 
-From the earlier Core Ultra 9 285H laptop session (simdjson C++ not rebuilt on
-the Xeon); the *relative* standing is the point. simdjson 4.6.4 (haswell kernel,
-`g++ -O3 -march=native`), same machine, byte-identical NDJSON, document counts
-matching exactly:
+CSV projected aggregation:
 
-| | throughput |
-|---|---|
-| falx NDJSON framing kernel | **6.61 GiB/s** |
-| falx JSON nested tape (`parse_nested_into`, recycled) | **2.84 GiB/s** |
-| simdjson `iterate_many`, count documents | 2.75 GiB/s |
-| simdjson `iterate_many`, read one field per doc | 2.48 GiB/s |
-| falx JSON nested tape, fresh allocation per call | 1.40 GiB/s |
-| simd-json (Rust port), full tape per document | 0.41 GiB/s |
+```bash
+cargo run --release --features mmap --example csv_geo_aggregate -- <csv-geo-1g.csv> 7 24
+```
 
-The nested rows are the bracket-matched tape (structure only — matched brackets
-and separator positions, values sliced lazily), built fused from the kernel's
-masks; serde_json parses the same stream at 0.30 GiB/s. simdjson parses document
-internals while falx frames records and slices fields lazily — the gap is what
-skipping in-document parsing buys on record-streaming workloads. (A parallel
-nested builder exists but currently only ties serial here: dense nested parsing
-saturates memory bandwidth and a serial prepass caps it,
-[#6](https://github.com/Mapika/falx/issues/6).)
+NDJSON schema-aware sum:
 
-## How it works
+```bash
+cargo run --release --example json_sum_par -- <ndjson-1g.ndjson> 9 24 full
+```
 
-A format spec compiles to a graph in a small **bitstream IR** (`src/ir.rs`):
-operations over bit vectors with one bit per input byte, executed 64 bytes per
-step. The algebra is small — character-class membership (byte compares or PSHUFB
-nibble tables for big classes), the four bitwise ops, `ShiftLeft1` ("previous
-byte matched", one carried bit), `PrefixXor` (running parity via carry-less
-multiply — the quote-context trick), carry-propagating `Add` (odd/even run
-detection, the simdjson backslash-escape trick), and one three-state resolver,
-`Regions`, that lets comment lines and quoted fields interleave exactly (its
-comment-free common path is bit-parallel via a PCLMULQDQ prefix-XOR; only
-genuinely interleaved blocks walk events). Bit-parallel ops map to one or two
-machine instructions; stateful ops carry a few bits across blocks — the kernel's
-entire memory, no lookback, no backtracking, no allocation.
+BGZF decompression and streaming:
 
-Several components share these semantics:
+```bash
+cargo run --release --features bgzf-libdeflate --example bgzf_bench -- 1024 7
+```
 
-- `src/interp.rs` — reference interpreter (ground truth, deliberately slow)
-- `src/codegen.rs` — emits the self-contained Rust kernel file (string templates)
-- `src/emit/` — an experimental typed-AST emitter: lowers the same IR graph to a
-  typed code AST, then renders it to Rust *or* CUDA-C — one tree, many backends
-- `src/scalar.rs` — a byte-at-a-time reference indexer; the differential-test
-  oracle every SIMD kernel is checked against
+Regenerate checked-in kernels:
 
-Format specs (TOML, see `specs/`) describe the *delimited* family: a structural
-byte set, an optional quote byte, an escape convention (RFC 4180 doubled quotes
-or JSON-style backslash), and an optional line-start comment byte
-(`comment = "#"` skips comment lines exactly, quotes-in-comments and
-comments-in-quotes included). Specs can also declare nesting bracket pairs
-(`nesting = ["{}", "[]"]`), adding a `parse_nested` API: the structural index
-feeds a bracket-matching tape with O(1) container skips and a zero-copy
-navigation API (the generated JSON parser, `specs/json.toml`, is differentially
-tested against serde_json). That one family covers CSV dialects (with or without
-`#` comments), TSV, logfmt, NDJSON framing, and separator-rich formats with
-arbitrarily large structural byte sets.
+```bash
+cargo run --example generate
+```
 
-Generated parsers also include a streaming API for unbounded input (pipes, log
-tails, larger-than-RAM files): `stream()` accepts arbitrary chunks and emits
-complete records through a callback. Kernel state carries across feeds, so
-quoted regions and escape runs split across chunk boundaries are handled
-exactly. Stream-vs-batch equivalence is differentially tested down to 1-byte
-feeds.
+## Building With falx
 
-### Parallelism
-
-Parallel indexing of quoted formats is normally blocked by quote context (a
-chunk can't know if it starts inside a string). falx handles each dialect family
-with no prepass over the data:
-
-- **Quoted (CSV/TSV/logfmt):** index each chunk **speculatively** as if it began
-  outside a quote; the chunk's quote parity is the kernel's final carry, so a
-  prefix-XOR of carries gives each chunk's true entry state — only the rare
-  chunk that began mid-quote is re-indexed.
-- **Comment-without-quote (VCF/BED/GFF/SAM):** chunk by **line ownership** —
-  each worker starts on a fresh line, so comment-region state never crosses a
-  boundary.
-- **Comment+quote (`csv_hash`):** the 3-state region machine isn't XOR-linear
-  and quoted fields span newlines, so neither scheme applies. Each chunk
-  computes its region **transfer function** (`state → state`) in parallel, the
-  true entry states follow from an O(threads) serial composition, and every
-  chunk is then indexed once in parallel with its known entry state.
-
-Chunk tapes scatter into one master tape concurrently. Every scheme is
-byte-identical to serial, differentially tested across thread counts with
-quoted/comment regions spanning every chunk boundary. (Dropping an earlier
-counting prepass for the speculative scheme was a measured interleaved-A/B win —
-1.27x at 48 threads, 2.34x at 24 — with unchanged-kernel controls held flat.)
-
-Correctness: every kernel is differential-tested — generated SIMD dispatch, the
-IR interpreter, and an independent byte-at-a-time reference must agree
-bit-for-bit across thousands of randomized inputs, including escape runs and
-quotes spanning 64-byte block boundaries. The benchmark additionally
-cross-checks structural counts between implementations at runtime.
-
-## falx-synth: the generator discovers its own kernels
-
-`src/synth.rs` inverts the generation direction. Instead of compiling a fixed
-set of known bit-parallel tricks, it searches for them: given a byte-at-a-time
-reference (the state machine a person would naively write), it enumerates the
-bitstream IR bottom-up to find an equivalent branchless graph. The search uses
-observational-equivalence dedup, CEGIS verification loops (a differential
-mismatch on fresh random inputs becomes a new corpus entry and the search
-restarts), and cost-weighted settling (the cheapest verified form, not the first
-match). It includes automatic abstraction discovery: exhausted rounds promote
-high-scoring banked terms to leaves and mine single-hole templates by
-anti-unification. Enumeration runs sharded across threads with a deterministic
-merge. Demo: `cargo run --release --example synth_demo`.
-
-Starting from only the escape-byte class and the even-position constant, the
-system re-derived the simdjson odd-backslash-run escape trick by inventing its
-own intermediate abstractions, and found a 9-node form (two carried states) that
-beats the 16-node hand derivation falx originally shipped — now the
-`escaped_positions` kernel in `src/formats.rs`, feeding JSON, NDJSON, and logfmt.
-
-Verification is exhaustive: every candidate passes 4,000-input CEGIS and
-50,000-input differential comparison with the hand graph. Beyond that, every IR
-op has an exact byte-serial form carrying at most one bit of state, so a graph
-is a finite automaton over bytes, and complete equivalence is proven via
-product-automaton reachability against the spec machine — equality for all
-inputs, no SMT solver (the escape kernel's proof has 224 product states). The
-prover also certifies impossibilities: CR-before-LF needs one byte of lookahead
-and every IR op is causal, so no graph of any size computes it
-([#3](https://github.com/Mapika/falx/issues/3)).
-
-Multi-output synthesis solves several specs against one corpus, later outputs
-reusing earlier ones in a shared-CSE graph. Before emission the selected graph
-passes a deterministic cost-weighted optimizer (prune unreachable nodes,
-canonicalize commutative ops, fold boolean identities); codegen accepts the
-rewrite only when the AVX2 cost model is lower, so equal-cost normalizations
-don't perturb instruction order.
-
-## Building on falx
-
-The intended integration is a build script: keep a `spec.toml` in your repo,
-generate the parser at compile time, ship no falx dependency at runtime (the
-generated file is std-only):
+The intended integration is a build script. Keep a spec in your repo, generate
+the parser at compile time, and ship only the generated Rust file at runtime.
 
 ```toml
-# Cargo.toml
 [build-dependencies]
 falx = { git = "https://github.com/Mapika/falx", features = ["spec"] }
 ```
@@ -314,120 +196,76 @@ falx = { git = "https://github.com/Mapika/falx", features = ["spec"] }
 ```rust
 // build.rs
 let spec = falx::spec::parse(&std::fs::read_to_string("spec.toml")?)?;
-let code = falx::codegen::emit_parser_with_columns(&spec.dialect, &spec.name, &spec.columns)?;
+let code = falx::codegen::emit_parser_with_columns(
+    &spec.dialect,
+    &spec.name,
+    &spec.columns,
+)?;
 std::fs::write(format!("{}/parser.rs", std::env::var("OUT_DIR")?), code)?;
 ```
 
 ```rust
 // src/main.rs
-mod parser { include!(concat!(env!("OUT_DIR"), "/parser.rs")); }
+mod parser {
+    include!(concat!(env!("OUT_DIR"), "/parser.rs"));
+}
 ```
 
-A complete runnable version lives in `examples/build-integration/`. The spec
-gallery in `specs/` covers CSV (comma and semicolon dialects), TSV, PSV, logfmt,
-and NDJSON framing; a new delimited format is usually a four-line TOML file.
+A complete runnable version lives in `examples/build-integration/`.
 
-Want to extend falx itself? `ARCHITECTURE.md` explains the bitstream IR and the
-generated-kernel anatomy; `CONTRIBUTING.md` has recipes for adding a format
-preset (~20 lines), an IR op, or a backend (x86 AVX-512/AVX2 and ARM NEON both
-ship; the codegen's `Flavor` enum is where a new ISA slots in) — the
-[issue tracker](https://github.com/Mapika/falx/issues) has scoped starter
-projects.
+## How The Generator Works
 
-## Running
+`src/ir.rs` defines the bitstream IR. `src/interp.rs` is the slow reference
+interpreter. `src/codegen.rs` emits the production Rust kernels. `src/synth.rs`
+can rediscover branchless kernels from byte-at-a-time reference machines using
+CEGIS-style differential search and finite-automaton proof.
 
-```
-cargo test                          # differential + drift tests
-cargo run --release --example bench # multi-format throughput benchmark
-cargo run --release --example bench_columns  # typed-column extraction vs csv/arrow-csv
-cargo run --example generate        # regenerate src/kernels/ from dialects
+The synthesis path has already rediscovered and improved escape handling for
+JSON/NDJSON/logfmt, and the e-graph optimizer in `src/egraph.rs` extracts
+cheaper equivalent graphs before codegen. The string-template codegen is the
+production path; `src/emit/` is an experimental typed-AST emitter that can render
+Rust or CUDA-C from the same lowered graph.
+
+## Development Commands
+
+```bash
+cargo test
+cargo test --features bgzf-libdeflate --lib --tests
+cargo run --release --example bench_sustained -- --formats csv-geo
+cargo run --example generate
 cargo run --features cli --bin falx -- build specs/csv-typed.toml -o parser.rs
 ```
 
-Kernel generation defaults to weighted auto-discovery plus cost-weighted graph
-optimization for supported dialects; unsupported dialects such as comment-region
-CSV stay on the handwritten graph path but still use the optimizer before
-emission. To force handwritten graphs for every target, run
-`cargo run --example generate -- --manual`.
+Useful optional features:
+
+- `spec`: TOML spec parsing
+- `cli`: command-line parser generator
+- `mmap`: memory-mapped file helpers
+- `bgzf`: pure-Rust BGZF inflate
+- `bgzf-libdeflate`: fastest BGZF inflate backend
+- `gpu`: experimental CUDA/NVRTC backend
 
 ## Roadmap
 
-- M0–M3 (done): hand-written AVX2 CSV indexer + benchmark methodology;
-  bitstream IR + interpreter + differential testing; Rust codegen from the IR
-  (within 2% of hand-written); declarative TOML spec + CLI emitting
-  self-contained parser files.
-- M4–M5 (done): escape machinery and the wider delimited family (TSV, logfmt,
-  NDJSON framing); records/fields span API with lazy spans, quote stripping, and
-  `Cow` unescaping that allocates only on a real escape.
-- M6 (done): typed projection — specs declare typed columns, parsers emit
-  Arrow-layout columnar buffers (values + validity bitmap), SWAR int and
-  Clinger-fast-path float parsing, serial and parallel.
-- M7 (done): nested structure — specs declare bracket pairs, parsers add a
-  matched-bracket tape with O(1) container skips and a navigation API; JSON
-  structural parsing differentially tested against serde_json.
-- M8–M9 (done): parallelism — speculative entry-state (no prepass) + parallel
-  scatter merge; comment-without-quote dialects parallelize by line ownership
-  (VCF/BED/GFF/SAM, Matrix Market); FASTQ framing via the newline kernel.
-- M10 (done): `csv_hash` (comment+quote — the last serial-only, scalar-resolver
-  kernel) reaches parity with the rest. The region resolver fast-paths
-  comment-free blocks through a PCLMULQDQ prefix-XOR (serial 1.96 → 3.84 GiB/s),
-  and a parallel parse falls out of a per-chunk region *transfer function*
-  (one combined single-pass 3-state scan) reconciled with no serial re-index —
-  scaling ~6x at 24 threads, with `parse_par_into` recycling the master tape.
-- M11 (done): declarative `lines_per_record` — a spec field that groups every N
-  newline-terminated lines into one generated record (FASTQ = 4), the lines
-  exposed as fields. The fixed-line-count record API, generated rather than
-  hand-written; differentially tested against the by-N reference grouping.
-- M12 (done): equality-saturation graph extraction (`src/egraph.rs`,
-  `GraphOptimizer::EqSat`) — the e-graph the two-candidate `graph_opt` simplifier
-  anticipated. It keeps every equivalent form of every subterm in a congruence
-  closure, saturates a superset of the old rewrites (plus AC normalization, De
-  Morgan, distributive factoring of shared subterms) and extracts the globally
-  cheapest graph, so it can speculate per-subterm where the global
-  conservative/speculative pick cannot. Associativity is handled by
-  *AC-flattening* (combine a whole same-op chain in one pass) rather than
-  pairwise rewrites (which Catalan-explode), and saturation is *staged* — the
-  cheap two-candidate rules reach a fixpoint first (so the result is never worse
-  than that optimizer), then the expensive new rules run under budget.
-  Deterministic (byte-identical codegen) and provably never costlier than the
-  input. Extraction emits operands deeper-subtree-first (Sethi–Ullman), matching
-  the rebuild's register-pressure ordering — without it, equal-cost extractions
-  schedule measurably worse (a benchmarked ~7% regression on `json` before the
-  fix). On the built-in dialects (≤18 nodes) it ties the two-candidate optimizer;
-  the advantage grows with graph size — `cargo run --example egraph_scaling`
-  curves it at +8–23% cheaper across 18–256-node random circuits, every point
-  differentially verified. Now the codegen **default**: regenerating the kernels
-  under it changed only 4 escape/region dialects (`json`, `logfmt`, `ndjson`,
-  `csv_hash`), all confirmed within the benchmark noise floor vs the previous
-  optimizer.
-- M13 (done): **ARM NEON backend** — codegen's `Flavor` enum emits NEON
-  structural kernels (table lookups via `vqtbl1q_u8`, movemask fold, PMULL for
-  the quote-parity prefix-XOR) alongside x86, dispatched at runtime. macOS arm64
-  CI runs the full suite, so ARM is byte-exact, not just compiled.
-- M14–M19 (done): **the genomics vertical** (see *Genomics: `.vcf.gz` → Arrow*).
-  VCF INFO sub-columns in codegen; block-parallel bgzf decompression (`bgzf`
-  feature); fused decompress→parse (`bgzf::parse_gz_par`); validation on real
-  ClinVar against an independent scalar oracle; pyarrow Python bindings;
-  value-by-value noodles parity tests in CI.
-- Experimental: **typed-AST emitter** (`src/emit/`) — a second code generator
-  beside the string-template `codegen`. It lowers an `ir::Graph` to a typed code
-  AST, then renders **Rust** (the full SIMD ladder: x86 AVX-512 → AVX2 → scalar
-  with PCLMULQDQ quote-parity, ARM NEON) or **CUDA-C** from one tree, comments
-  first-class. Each surface — structural index, record/field parse, typed
-  columns, nested-JSON tape, stat sinks — is validated by compiling the emitted
-  code (`rustc`/`cc`) and running it byte-for-byte against the interpreter and
-  the production kernels.
-- Experimental: **GPU backend** (research branch `gpu-backend`). The same
-  emit-source model, now targeting CUDA: falx emits CUDA-C, NVRTC-compiles it at
-  runtime (`cudarc`, no link-time CUDA), byte-exact vs the CPU kernels (~136
-  GiB/s structural index on a Blackwell). The payoff is *on-device*: a full
-  GPU-resident `.vcf.gz` → decompress (nvCOMP DEFLATE) → parse → filter →
-  aggregate pipeline keeps the decompressed text off PCIe and returns 16 bytes,
-  ~22x the CPU end-to-end. Not merged (needs the CUDA toolchain; `gpu` feature).
-- Headroom worth noting: the per-field clean path is already at the floor for
-  real data (~0.7 ns/field on the common borrow path); the only residual is the
-  `Vec` allocation in the rare doubled-quote copy path, which wants a
-  non-allocating `fields_into` buffer-reuse API rather than a `clean` change.
+Done:
+
+- declarative specs for delimited formats
+- generated AVX-512, AVX2, and NEON kernels
+- typed CSV/VCF projections into Arrow-style buffers
+- parallel parsing with quote/comment correctness
+- nested JSON structural tapes
+- FASTQ fixed-line records
+- VCF INFO sub-column extraction
+- block-parallel BGZF decompression
+- fused `.vcf.gz` parse paths
+- schema-aware NDJSON reductions
+- chunked parallel table materialization
+
+Experimental:
+
+- typed-AST emitter for Rust and CUDA-C
+- GPU-resident parsing/decompression/query pipelines
+- broader public SOTA benchmark harness
 
 ## License
 

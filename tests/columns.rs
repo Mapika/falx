@@ -314,6 +314,97 @@ fn assert_columns_match(
     }
 }
 
+fn assert_chunks_match_serial(
+    chunks: &[falx::kernels::csv_typed::Columns<'_>],
+    serial: &falx::kernels::csv_typed::Columns<'_>,
+    threads: usize,
+) {
+    let total_rows = chunks.iter().map(|chunk| chunk.rows).sum::<usize>();
+    assert_eq!(
+        total_rows, serial.rows,
+        "chunk rows should sum to serial rows with {} threads",
+        threads
+    );
+
+    let mut global_row = 0usize;
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        assert_eq!(
+            chunk.id.len(),
+            chunk.rows,
+            "id length mismatch in chunk {chunk_idx} with {threads} threads"
+        );
+        assert_eq!(
+            chunk.title_offsets.len(),
+            chunk.rows + 1,
+            "title offsets length mismatch in chunk {chunk_idx} with {threads} threads"
+        );
+        assert_eq!(
+            chunk.value.len(),
+            chunk.rows,
+            "value length mismatch in chunk {chunk_idx} with {threads} threads"
+        );
+        assert_eq!(
+            chunk.label.len(),
+            chunk.rows,
+            "label length mismatch in chunk {chunk_idx} with {threads} threads"
+        );
+
+        for local_row in 0..chunk.rows {
+            assert_eq!(
+                chunk.id[local_row], serial.id[global_row],
+                "id mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+            assert_eq!(
+                falx::kernels::csv_typed::bitmap_get(&chunk.id_valid, local_row),
+                falx::kernels::csv_typed::bitmap_get(&serial.id_valid, global_row),
+                "id validity mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+
+            assert_eq!(
+                falx::kernels::csv_typed::string_at(
+                    &chunk.title_offsets,
+                    &chunk.title_data,
+                    local_row,
+                ),
+                falx::kernels::csv_typed::string_at(
+                    &serial.title_offsets,
+                    &serial.title_data,
+                    global_row,
+                ),
+                "title mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+            assert_eq!(
+                falx::kernels::csv_typed::bitmap_get(&chunk.title_valid, local_row),
+                falx::kernels::csv_typed::bitmap_get(&serial.title_valid, global_row),
+                "title validity mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+
+            assert_eq!(
+                chunk.value[local_row].to_bits(),
+                serial.value[global_row].to_bits(),
+                "value mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+            assert_eq!(
+                falx::kernels::csv_typed::bitmap_get(&chunk.value_valid, local_row),
+                falx::kernels::csv_typed::bitmap_get(&serial.value_valid, global_row),
+                "value validity mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+
+            assert_eq!(
+                chunk.label[local_row], serial.label[global_row],
+                "label mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+            assert_eq!(
+                falx::kernels::csv_typed::bitmap_get(&chunk.label_valid, local_row),
+                falx::kernels::csv_typed::bitmap_get(&serial.label_valid, global_row),
+                "label validity mismatch at chunk {chunk_idx} local row {local_row} global row {global_row} with {threads} threads"
+            );
+
+            global_row += 1;
+        }
+    }
+}
+
 #[test]
 fn hand_picked_cells() {
     // Build a CSV with edge cases for i64, f64, label, and title parsing
@@ -664,6 +755,7 @@ fn parallel_matches_serial() {
 
         for threads in &[1, 2, 3, 7, 16] {
             let parallel = falx::kernels::csv_typed::parse_columns_par(&csv, *threads);
+            let chunks = falx::kernels::csv_typed::parse_columns_chunks_par(&csv, *threads);
 
             assert_eq!(
                 serial.rows, parallel.rows,
@@ -728,6 +820,8 @@ fn parallel_matches_serial() {
                 "label_valid mismatch with {} threads",
                 threads
             );
+
+            assert_chunks_match_serial(&chunks, &serial, *threads);
         }
     }
 }

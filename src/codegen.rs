@@ -4912,24 +4912,24 @@ fn push_columns_api(
         let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.quote, "data[start..end]");
         let _ = write!(
             code,
-            "/// Parallel [`parse_columns`]: records are assigned to workers by\n\
-             /// terminator ownership — worker t skips to the first record\n\
-             /// boundary at or past its chunk start, and finishes the record it\n\
-             /// is mid-way through at chunk end — so every record is converted\n\
-             /// exactly once, with no tape built. Quote context is resolved per\n\
-             /// chunk inside the scope (one barrier), as in [`parse_par`]; column\n\
-             /// chunks concatenate, validity bitmaps stitch bit-shifted.\n\
-             pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {{\n\
+            "/// Parallel [`parse_columns`] without a final concatenation pass.\n\
+             /// Records are assigned to workers by terminator ownership — worker\n\
+             /// t skips to the first record boundary at or past its chunk start,\n\
+             /// and finishes the record it is mid-way through at chunk end — so\n\
+             /// every record is converted exactly once, with no tape built. Quote\n\
+             /// context is resolved per chunk inside the scope (one barrier), as\n\
+             /// in [`parse_par`]. Returned chunks are in input order.\n\
+             pub fn parse_columns_chunks_par(data: &[u8], threads: usize) -> Vec<Columns<'_>> {{\n\
              \x20   let threads = threads.max(1).min(data.len() / 64 + 1);\n\
              \x20   let chunk = (data.len() / threads + 63) & !63;\n\
              \x20   if threads == 1 || chunk == 0 {{\n\
-             \x20       return parse_columns(data);\n\
+             \x20       return vec![parse_columns(data)];\n\
              \x20   }}\n\
              \x20   let bounds: Vec<usize> = (0..=threads)\n\
              \x20       .map(|t| if t == threads {{ data.len() }} else {{ (t * chunk).min(data.len()) }})\n\
              \x20       .collect();\n\
              {par_shared}\
-             \x20   let parts: Vec<Columns<'_>> = std::thread::scope(|s| {{\n\
+             \x20   std::thread::scope(|s| {{\n\
              \x20       let handles: Vec<_> = (0..threads)\n\
              \x20           .map(|t| {{\n\
              \x20               let (start, end) = (bounds[t], bounds[t + 1]);\n\
@@ -4943,7 +4943,17 @@ fn push_columns_api(
              \x20           }})\n\
              \x20           .collect();\n\
              \x20       handles.into_iter().map(|h| h.join().expect(\"columns thread ok\")).collect()\n\
-             \x20   }});\n\
+             \x20   }})\n\
+             }}\n\n\
+             /// Parallel [`parse_columns`]: parses independent worker chunks,\n\
+             /// then concatenates them into the legacy single-`Columns` layout.\n\
+             /// Use [`parse_columns_chunks_par`] when chunked table output is\n\
+             /// acceptable and the final copy would dominate runtime.\n\
+             pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {{\n\
+             \x20   let parts = parse_columns_chunks_par(data, threads);\n\
+             \x20   if parts.len() == 1 {{\n\
+             \x20       return parts.into_iter().next().expect(\"one columns chunk\");\n\
+             \x20   }}\n\
              \x20   let mut cols = Columns::with_capacity(data, parts.iter().map(|p| p.rows).sum::<usize>());\n\
              \x20   for part in &parts {{\n"
         );
@@ -5085,6 +5095,173 @@ pub fn parse_ndjson_lines_par(data: &[u8], threads: usize) -> NdjsonLineStats {
     NdjsonLineStats {
         records: records + ndjson_has_trailing_record(data) as u64,
     }
+}
+
+/// NDJSON benchmark summary for the generated dataset's schema:
+/// `sum(id + nested.score)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NdjsonIdScoreStats {
+    pub records: u64,
+    pub sum: i64,
+}
+
+impl NdjsonIdScoreStats {
+    #[inline]
+    fn add(&mut self, other: Self) {
+        self.records += other.records;
+        self.sum = self.sum.wrapping_add(other.sum);
+    }
+}
+
+/// Sum `id + nested.score` for each valid generated NDJSON record.
+///
+/// This is intentionally schema-aware, matching simdjson's `doc["id"]` and
+/// `doc["nested"]["score"]` benchmark shape while avoiding a generic JSON tape.
+pub fn parse_ndjson_id_score(data: &[u8]) -> NdjsonIdScoreStats {
+    let mut stats = NdjsonIdScoreStats::default();
+    let mut i = 0usize;
+    while i < data.len() {
+        while i < data.len() && matches!(data[i], b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= data.len() {
+            break;
+        }
+        i = ndjson_add_id_score_record(data, i, &mut stats);
+    }
+    stats
+}
+
+#[inline(always)]
+fn ndjson_add_id_score_record(
+    data: &[u8],
+    start: usize,
+    stats: &mut NdjsonIdScoreStats,
+) -> usize {
+    const ID_PREFIX: &[u8] = b"{\"id\":";
+    const SCORE_PREFIX: &[u8] = b"],\"nested\":{\"score\":";
+    if !data[start..].starts_with(ID_PREFIX) {
+        ndjson_invalid_id_score_record();
+    }
+    let (id, after_id) = parse_ndjson_i64_at(data, start + ID_PREFIX.len())
+        .unwrap_or_else(|| ndjson_invalid_id_score_record());
+    let score_key = after_id
+        + ndjson_find_bytes(&data[after_id..], SCORE_PREFIX)
+            .unwrap_or_else(|| ndjson_invalid_id_score_record());
+    let (score, after_score) = parse_ndjson_i64_at(data, score_key + SCORE_PREFIX.len())
+        .unwrap_or_else(|| ndjson_invalid_id_score_record());
+    stats.records += 1;
+    stats.sum = stats.sum.wrapping_add(id.wrapping_add(score));
+    match ndjson_find_byte(&data[after_score..], b'\n') {
+        Some(p) => after_score + p + 1,
+        None => data.len(),
+    }
+}
+
+#[cold]
+fn ndjson_invalid_id_score_record() -> ! {
+    panic!("invalid generated NDJSON id+score record")
+}
+
+/// Parallel [`parse_ndjson_id_score`] over newline-aligned chunks.
+pub fn parse_ndjson_id_score_par(data: &[u8], threads: usize) -> NdjsonIdScoreStats {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    if threads == 1 || data.is_empty() {
+        return parse_ndjson_id_score(data);
+    }
+    let bounds = ndjson_line_bounds(data, threads);
+    if bounds.len() <= 2 {
+        return parse_ndjson_id_score(data);
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = bounds
+            .windows(2)
+            .map(|range| {
+                let slice = &data[range[0]..range[1]];
+                s.spawn(move || parse_ndjson_id_score(slice))
+            })
+            .collect();
+        let mut stats = NdjsonIdScoreStats::default();
+        for h in handles {
+            stats.add(h.join().expect("ndjson id+score thread ok"));
+        }
+        stats
+    })
+}
+
+#[inline(always)]
+fn parse_ndjson_i64_at(data: &[u8], mut i: usize) -> Option<(i64, usize)> {
+    if i >= data.len() {
+        return None;
+    }
+    // SAFETY: checked i < data.len().
+    let neg = unsafe { *data.get_unchecked(i) } == b'-';
+    if neg {
+        i += 1;
+    }
+    if i >= data.len() {
+        return None;
+    }
+    // SAFETY: checked i < data.len().
+    let first = unsafe { *data.get_unchecked(i) };
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    let mut value = 0i64;
+    while i < data.len() {
+        // SAFETY: loop condition guarantees i < data.len().
+        let b = unsafe { *data.get_unchecked(i) };
+        if !b.is_ascii_digit() {
+            break;
+        }
+        value = value.wrapping_mul(10).wrapping_add((b - b'0') as i64);
+        i += 1;
+    }
+    Some((if neg { -value } else { value }, i))
+}
+
+#[inline(always)]
+fn ndjson_find_byte(data: &[u8], needle: u8) -> Option<usize> {
+    let mut i = 0usize;
+    while i + 8 <= data.len() {
+        // SAFETY: i + 8 <= data.len(), so an unaligned u64 load is in bounds.
+        let word = unsafe { std::ptr::read_unaligned(data.as_ptr().add(i) as *const u64) };
+        let mask = ndjson_swar_eq_mask(word, needle);
+        if mask != 0 {
+            return Some(i + (mask.trailing_zeros() as usize / 8));
+        }
+        i += 8;
+    }
+    data[i..]
+        .iter()
+        .position(|&b| b == needle)
+        .map(|p| i + p)
+}
+
+#[inline]
+fn ndjson_swar_eq_mask(word: u64, needle: u8) -> u64 {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let x = word ^ ((needle as u64).wrapping_mul(LO));
+    x.wrapping_sub(LO) & !x & HI
+}
+
+#[inline(always)]
+fn ndjson_find_bytes(data: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let mut i = 0usize;
+    while i + needle.len() <= data.len() {
+        let search_end = data.len() - needle.len() + 1;
+        let off = ndjson_find_byte(&data[i..search_end], needle[0])?;
+        i += off;
+        if data[i..].starts_with(needle) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn index_ndjson_lines_dispatch(data: &[u8]) -> u64 {

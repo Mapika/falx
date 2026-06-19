@@ -260,6 +260,29 @@ fn generated_csv_geo_targets_expose_fused_stats_api() {
 }
 
 #[test]
+fn generated_typed_column_targets_expose_chunked_parallel_api() {
+    for (name, dialect, columns) in falx::kernels::targets() {
+        if columns.is_empty() {
+            continue;
+        }
+        let generated = codegen::emit_parser_with_columns(&dialect, name, &columns)
+            .expect("codegen should succeed");
+        if !generated.contains("pub fn parse_columns_par(") {
+            continue;
+        }
+
+        assert!(
+            generated.contains("pub fn parse_columns_chunks_par("),
+            "{name} missing chunked parallel columns API"
+        );
+        assert!(
+            generated.contains("let parts = parse_columns_chunks_par(data, threads);"),
+            "{name} flattened columns API should reuse the chunked worker output"
+        );
+    }
+}
+
+#[test]
 fn generated_float_columns_emit_fixed_six_decimal_fast_path() {
     let target = falx::kernels::targets()
         .into_iter()
@@ -358,6 +381,9 @@ fn generated_ndjson_target_exposes_fused_line_stats_api() {
     assert!(generated.contains("pub fn parse_ndjson_lines("));
     assert!(generated.contains("pub fn parse_ndjson_lines_par("));
     assert!(generated.contains("pub fn index_ndjson_lines("));
+    assert!(generated.contains("pub struct NdjsonIdScoreStats"));
+    assert!(generated.contains("pub fn parse_ndjson_id_score("));
+    assert!(generated.contains("pub fn parse_ndjson_id_score_par("));
 }
 
 /// Test 2: Generated kernels differential test.

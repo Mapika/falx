@@ -226,6 +226,55 @@ fn bench_file(data: &[u8], label: &str, has_header: bool) {
         });
     }
 
+    // ========== falx::kernels::csv_geo::parse_columns_chunks_par ==========
+    {
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let mut times = Vec::new();
+        for _ in 0..WARMUP {
+            let _chunks =
+                falx::kernels::csv_geo::parse_columns_chunks_par(black_box(data), threads);
+            let _ = black_box(_chunks);
+        }
+        for _ in 0..RUNS {
+            let start = Instant::now();
+            let chunks = falx::kernels::csv_geo::parse_columns_chunks_par(black_box(data), threads);
+            let valid_count = chunks
+                .iter()
+                .flat_map(|chunk| chunk.latitude_valid.iter())
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>();
+            let sum_lat = black_box(
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.latitude.iter().copied().sum::<f64>())
+                    .sum::<f64>(),
+            );
+            let sum_lon = black_box(
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.longitude.iter().copied().sum::<f64>())
+                    .sum::<f64>(),
+            );
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            times.push((elapsed, valid_count, sum_lat, sum_lon));
+        }
+        times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let (best_ms, valid_count, sum_lat, sum_lon) = times[0];
+        let median_ms = times[RUNS / 2].0;
+        let throughput = file_size as f64 / (1024.0 * 1024.0 * 1024.0) / (median_ms / 1000.0);
+        results.push(BenchResult {
+            name: "falx chunks_par",
+            valid_count,
+            sum_lat,
+            sum_lon,
+            best_ms,
+            median_ms,
+            throughput,
+        });
+    }
+
     // ========== csv crate + str::parse::<f64> ==========
     {
         let mut times = Vec::new();

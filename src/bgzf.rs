@@ -7,8 +7,10 @@
 //! the whole point: we scan the boundaries in one cheap pass, presize the
 //! output from the `ISIZE` tags, and inflate the blocks across threads into
 //! disjoint slots — the same shape as the parallel structural indexer's scatter
-//! merge. The inner DEFLATE core is `flate2`'s pure-Rust `miniz_oxide` backend;
-//! we do not reimplement entropy decoding.
+//! merge. The default inner DEFLATE core is `flate2`'s pure-Rust
+//! `miniz_oxide` backend; enabling `bgzf-libdeflate` switches inflation to
+//! bundled C libdeflate for maximum throughput. We do not reimplement entropy
+//! decoding.
 //!
 //! This exists so the multi-GiB/s SIMD parsers are not starved behind a
 //! ~0.3 GiB/s single-threaded gunzip on compressed inputs. Gated behind the
@@ -17,6 +19,7 @@
 use std::io::{self, Error, ErrorKind};
 use std::ops::Range;
 
+#[cfg(not(feature = "bgzf-libdeflate"))]
 use flate2::{Decompress, FlushDecompress};
 
 /// Minimum bytes of a bgzf block header before the variable extra field.
@@ -106,18 +109,67 @@ pub fn scan(data: &[u8]) -> io::Result<Vec<Block>> {
     Ok(blocks)
 }
 
-/// Inflate one raw-DEFLATE block into its exact-size output slice.
-fn inflate_one(payload: &[u8], out: &mut [u8]) -> io::Result<()> {
-    let mut d = Decompress::new(false); // raw DEFLATE: bgzf carries no zlib header
-    d.decompress(payload, out, FlushDecompress::Finish)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-    if d.total_out() as usize != out.len() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "bgzf block ISIZE disagrees with inflated length",
-        ));
+#[cfg(feature = "bgzf-libdeflate")]
+struct InflateBackend {
+    decompressor: libdeflater::Decompressor,
+}
+
+#[cfg(feature = "bgzf-libdeflate")]
+impl InflateBackend {
+    fn new() -> Self {
+        Self {
+            decompressor: libdeflater::Decompressor::new(),
+        }
     }
-    Ok(())
+
+    fn inflate_one(&mut self, payload: &[u8], out: &mut [u8]) -> io::Result<()> {
+        let n = self
+            .decompressor
+            .deflate_decompress(payload, out)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        if n != out.len() {
+            return Err(inflated_len_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "bgzf-libdeflate"))]
+    fn name() -> &'static str {
+        "libdeflate"
+    }
+}
+
+#[cfg(not(feature = "bgzf-libdeflate"))]
+struct InflateBackend;
+
+#[cfg(not(feature = "bgzf-libdeflate"))]
+impl InflateBackend {
+    fn new() -> Self {
+        Self
+    }
+
+    /// Inflate one raw-DEFLATE block into its exact-size output slice.
+    fn inflate_one(&mut self, payload: &[u8], out: &mut [u8]) -> io::Result<()> {
+        let mut d = Decompress::new(false); // raw DEFLATE: bgzf carries no zlib header
+        d.decompress(payload, out, FlushDecompress::Finish)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        if d.total_out() as usize != out.len() {
+            return Err(inflated_len_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "bgzf-libdeflate"))]
+fn inflate_backend_name_for_test() -> &'static str {
+    InflateBackend::name()
+}
+
+fn inflated_len_error() -> io::Error {
+    Error::new(
+        ErrorKind::InvalidData,
+        "bgzf block ISIZE disagrees with inflated length",
+    )
 }
 
 /// Total uncompressed size of `blocks`.
@@ -128,9 +180,10 @@ fn span(blocks: &[Block]) -> usize {
 /// Inflate `blocks` (a contiguous run) sequentially into `out`, which must be
 /// exactly their combined uncompressed length.
 fn inflate_blocks_into(data: &[u8], blocks: &[Block], out: &mut [u8]) -> io::Result<()> {
+    let mut backend = InflateBackend::new();
     let mut off = 0usize;
     for b in blocks {
-        inflate_one(&data[b.payload.clone()], &mut out[off..off + b.isize])?;
+        backend.inflate_one(&data[b.payload.clone()], &mut out[off..off + b.isize])?;
         off += b.isize;
     }
     Ok(())
@@ -186,6 +239,69 @@ pub fn decompress_par(data: &[u8], threads: usize) -> io::Result<Vec<u8>> {
             .collect::<io::Result<Vec<()>>>()
     })?;
     Ok(out)
+}
+
+/// Process a bgzf stream block-by-block across `threads` workers without
+/// materializing one full decompressed output buffer.
+///
+/// Each worker owns one inflater, one reusable scratch buffer sized to the
+/// largest block in its contiguous block group, and one caller-defined state
+/// value from `init`. `process` is called in block order within that worker's
+/// group. The returned states are ordered by their input ranges, so callers can
+/// concatenate or reduce them in stream order.
+///
+/// This is the fastest shape for consumers that can process independent bgzf
+/// blocks directly, such as counters, checksums, and parsers with explicit
+/// carry handling.
+pub fn process_blocks_par<S, Init, F>(
+    data: &[u8],
+    threads: usize,
+    init: Init,
+    process: F,
+) -> io::Result<Vec<S>>
+where
+    S: Send,
+    Init: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, &[u8]) + Sync,
+{
+    let blocks = scan(data)?;
+    let n = blocks.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let threads = threads.max(1).min(n);
+    let per = n.div_ceil(threads);
+    let init = &init;
+    let process = &process;
+    let blocks = &blocks;
+
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .filter_map(|w| {
+                let start = w * per;
+                let end = ((w + 1) * per).min(n);
+                (start < end).then(|| {
+                    s.spawn(move || -> io::Result<S> {
+                        let group = &blocks[start..end];
+                        let max_isize = group.iter().map(|b| b.isize).max().unwrap_or(0);
+                        let mut scratch = vec![0u8; max_isize];
+                        let mut backend = InflateBackend::new();
+                        let mut state = init();
+                        for (local, b) in group.iter().enumerate() {
+                            backend
+                                .inflate_one(&data[b.payload.clone()], &mut scratch[..b.isize])?;
+                            process(&mut state, start + local, &scratch[..b.isize]);
+                        }
+                        Ok(state)
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("bgzf block processor panicked"))
+            .collect()
+    })
 }
 
 /// Fused parallel parse of a bgzf stream: never materializes the full
@@ -340,6 +456,19 @@ mod tests {
         assert!(decompress(b"not a gzip stream at all").is_err());
     }
 
+    #[cfg(feature = "bgzf-libdeflate")]
+    #[test]
+    fn libdeflate_backend_is_active_and_correct() {
+        let mut raw = Vec::new();
+        for i in 0..20_000u32 {
+            raw.extend_from_slice(format!("libdeflate record {i}\n").as_bytes());
+        }
+        let comp = bgzip(&raw);
+        assert_eq!(inflate_backend_name_for_test(), "libdeflate");
+        assert_eq!(decompress(&comp).unwrap(), raw);
+        assert_eq!(decompress_par(&comp, 4).unwrap(), raw);
+    }
+
     fn lines(s: &[u8]) -> Vec<Vec<u8>> {
         s.split(|&b| b == b'\n')
             .filter(|l| !l.is_empty())
@@ -365,5 +494,23 @@ mod tests {
             let merged: Vec<Vec<u8>> = parts.into_iter().flatten().collect();
             assert_eq!(merged, expect, "record loss/dup at boundaries, t={t}");
         }
+    }
+
+    #[test]
+    fn process_blocks_par_streams_blocks_in_order() {
+        let mut raw = Vec::new();
+        for i in 0..120_000u32 {
+            raw.extend_from_slice(format!("block-stream record {i}\n").as_bytes());
+        }
+        let comp = bgzip(&raw);
+        let parts = process_blocks_par(
+            &comp,
+            8,
+            Vec::<u8>::new,
+            |out: &mut Vec<u8>, _block_index, chunk| out.extend_from_slice(chunk),
+        )
+        .unwrap();
+        let merged: Vec<u8> = parts.into_iter().flatten().collect();
+        assert_eq!(merged, raw);
     }
 }

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use falx::kernels::json;
 use falx::kernels::json::{Nested, parse_nested, parse_nested_into};
+use falx::kernels::ndjson;
 
 #[inline]
 fn trim_ws(d: &[u8], mut s: usize, mut e: usize) -> (usize, usize) {
@@ -185,9 +186,13 @@ fn main() {
     let sn = sum_par(data, threads);
     let sf1 = sum_chunk_fused(data, &mut Vec::new());
     let sfn = sum_par_fused(data, threads);
+    let schema = ndjson::parse_ndjson_id_score(data);
+    let schema_par = ndjson::parse_ndjson_id_score_par(data, threads);
     assert_eq!(s1, sn, "parallel sum diverges from serial");
     assert_eq!(s1, sf1, "fused sum diverges from flat");
     assert_eq!(s1, sfn, "fused parallel sum diverges");
+    assert_eq!(schema.sum, s1, "schema-aware id+score sum diverges");
+    assert_eq!(schema_par, schema, "schema-aware parallel sum diverges");
     println!("file: {path}  ({gib:.3} GiB)  best of {iters}\ninteger sum = {s1}\n");
 
     let t1 = best(iters, || {
@@ -218,6 +223,16 @@ fn main() {
         black_box(sum_par_fused_local(data, &chunks));
         t.elapsed()
     });
+    let tid = best(iters, || {
+        let t = Instant::now();
+        black_box(ndjson::parse_ndjson_id_score(data));
+        t.elapsed()
+    });
+    let tidn = best(iters, || {
+        let t = Instant::now();
+        black_box(ndjson::parse_ndjson_id_score_par(data, threads));
+        t.elapsed()
+    });
     let g = |dt: Duration| gib / dt.as_secs_f64();
     let ms = |dt: Duration| dt.as_secs_f64() * 1000.0;
     println!("NDJSON → sum(all integers)         best(ms)   GiB/s");
@@ -242,9 +257,24 @@ fn main() {
         g(tfn)
     );
     println!(
+        "  falx id+score schema 1 thread  : {:>8.1}  {:>6.2}",
+        ms(tid),
+        g(tid)
+    );
+    println!(
+        "  falx id+score schema{threads:>2} threads  : {:>8.1}  {:>6.2}",
+        ms(tidn),
+        g(tidn)
+    );
+    println!(
         "\nfused vs flat: {:.2}x (1t) / {:.2}x ({threads}t) | fused scaling: {:.1}x",
         g(tf1) / g(t1),
         g(tfn) / g(tn),
         g(tfn) / g(tf1)
+    );
+    println!(
+        "schema id+score vs generic fused: {:.2}x (1t) / {:.2}x ({threads}t)",
+        g(tid) / g(tf1),
+        g(tidn) / g(tfn)
     );
 }
