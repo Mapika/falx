@@ -78,3 +78,7 @@ required-features = ["gpu", "bgzf"]
 [[example]]
 name = "gpu_nvcomp"
 required-features = ["gpu", "bgzf"]
+
+[[example]]
+name = "gpu_pipeline_nvcomp"
+required-features = ["gpu", "bgzf"]
