@@ -85,6 +85,9 @@ extern "C" __global__ void query(const unsigned char* d, const unsigned int* nl,
 }
 "#;
 
+/// (count, sum), GPU-compute seconds, end-to-end seconds, inflate seconds.
+type RunOut = ((u64, u64), f64, f64, f64);
+
 fn make_csv(rows: usize, cols: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(rows * cols * 7);
     let mut x = 0x1234_5678_9abc_def1u64;
@@ -274,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p_tp = d_temp.device_ptr(&stream).0;
     let p_sp = d_status.device_ptr(&stream).0;
 
-    let mut run = || -> Result<((u64, u64), f64, f64, f64), Box<dyn std::error::Error>> {
+    let mut run = || -> Result<RunOut, Box<dyn std::error::Error>> {
         let t_all = Instant::now();
         stream.memcpy_htod(&comp_pinned, &mut d_comp)?; // re-upload the compressed input
         let d_c = stream.alloc_zeros::<u64>(1)?;
