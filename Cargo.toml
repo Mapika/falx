@@ -63,6 +63,10 @@ required-features = ["bgzf"]
 name = "gpu_probe"
 required-features = ["gpu"]
 
+[[example]]
+name = "gpu_index"
+required-features = ["gpu"]
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
