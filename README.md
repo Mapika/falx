@@ -10,9 +10,11 @@ generator currently exists.
 $ cargo run --features cli --bin falx -- build specs/logfmt.toml -o logfmt_parser.rs
 ```
 
-The output is a single self-contained Rust file (std only): native x86 SIMD
-structural indexers (AVX-512F/BW/VL+PCLMULQDQ preferred over AVX2+PCLMULQDQ at
-runtime) plus a zero-copy record/field API, ready to drop into any project:
+The output is a single self-contained Rust file (std only): native SIMD
+structural indexers for **x86** (AVX-512F/BW/VL+PCLMULQDQ preferred over
+AVX2+PCLMULQDQ) and **ARM** (NEON, with PMULL for carry-less multiply), the
+backend chosen at runtime, plus a zero-copy record/field API, ready to drop into
+any project:
 
 ```rust
 let parsed = logfmt_parser::parse(&data);
@@ -127,6 +129,39 @@ hide a newline, so neither quote-parity nor line-ownership parallelism applies
 directly. Its region resolver fast-paths comment-free blocks through a
 PCLMULQDQ quote-parity (3.8 GiB/s serial), and it parallelizes via a per-chunk
 region *transfer function* (~5x at 24 threads); see [Parallelism](#parallelism).
+
+### Genomics: `.vcf.gz` → Arrow, end to end
+
+The delimited engine turned into a genuine genomics vertical — the path real VCF
+analytics actually runs, with the decompression that gates it.
+
+- **INFO sub-columns.** A VCF row's `INFO` field is a `;`/`=` mini-format
+  (`DP=812;AF=0.001;…`); analytics wants a handful of those keys as typed
+  columns. A `Column` can carry an `info_key`: the generated parser extracts that
+  key from *inside* the parent field into a typed Arrow column with a validity
+  bit, and every INFO key sharing a parent is filled in **one** pass over the
+  field. Measured vs **noodles 0.88** (the scalar reference oxbow/exon/biobear/
+  polars-bio all wrap): ~1.85x on the typed projection, and the gap *grows* with
+  key count — noodles' `Info::get` rescans from the start per key, so a real
+  many-key projection is **2.0x at 4 keys, 4.6x at 8** (`examples/vcf_info_bench.rs`).
+- **bgzf decompression** (optional `bgzf` feature, pure-Rust miniz_oxide). bgzf
+  is block-independent gzip members, so blocks inflate across threads into
+  presized slots: **~5.3 GiB/s, ~3.4x noodles' `MultithreadedReader`**,
+  byte-exact. The decompression wall (~0.3 GiB/s single-thread) that otherwise
+  starves the parser is gone.
+- **Fused decompress → parse.** `bgzf::parse_gz_par` never materializes the
+  decompressed file: each worker inflates its own block group, completes the
+  record straddling into the next group, drops its leading partial (line
+  ownership), and parses the local buffer straight to typed Arrow columns.
+- **Validated on real data.** ClinVar GRCh38 (183 MiB bgzf → 1.8 GiB, 4.4M
+  records): bgzf byte-exact on real htslib framing, record count + POS + INFO
+  exact vs an independent scalar ground truth, **~6.5 GiB/s fused ≈ 15x the
+  noodles `.vcf.gz`→columns pipeline**. A `tests/noodles_parity.rs` suite checks
+  POS/REF/ALT/QUAL/DP/AF value-by-value against noodles (serial, parallel,
+  bgzf, fused) on every push.
+- **Python.** `falx_genomics.read_vcf_gz_columns(path) -> pyarrow.RecordBatch`
+  (pyo3, GIL released during the parallel parse), zero-copy into polars/pandas
+  (`python/`).
 
 ### Versus the real simdjson (C++)
 
@@ -292,10 +327,10 @@ and NDJSON framing; a new delimited format is usually a four-line TOML file.
 
 Want to extend falx itself? `ARCHITECTURE.md` explains the bitstream IR and the
 generated-kernel anatomy; `CONTRIBUTING.md` has recipes for adding a format
-preset (~20 lines), an IR op, or a backend — the
+preset (~20 lines), an IR op, or a backend (x86 AVX-512/AVX2 and ARM NEON both
+ship; the codegen's `Flavor` enum is where a new ISA slots in) — the
 [issue tracker](https://github.com/Mapika/falx/issues) has scoped starter
-projects, including the ARM NEON backend (CI already verifies ARM correctness,
-so it's pure speed work).
+projects.
 
 ## Running
 
@@ -363,12 +398,26 @@ emission. To force handwritten graphs for every target, run
   under it changed only 4 escape/region dialects (`json`, `logfmt`, `ndjson`,
   `csv_hash`), all confirmed within the benchmark noise floor vs the previous
   optimizer.
-- Next: ARM NEON backend (CI already verifies ARM correctness, so it is pure
-  speed work). (The per-field clean path is already at the
-  floor for real data — ~0.7 ns/field on the common borrow path; the only
-  residual headroom is the `Vec` allocation in the rare doubled-quote copy path,
-  which would want a non-allocating `fields_into` buffer-reuse API rather than a
-  `clean` change.)
+- M13 (done): **ARM NEON backend** — codegen's `Flavor` enum emits NEON
+  structural kernels (table lookups via `vqtbl1q_u8`, movemask fold, PMULL for
+  the quote-parity prefix-XOR) alongside x86, dispatched at runtime. macOS arm64
+  CI runs the full suite, so ARM is byte-exact, not just compiled.
+- M14–M19 (done): **the genomics vertical** (see *Genomics: `.vcf.gz` → Arrow*).
+  VCF INFO sub-columns in codegen; block-parallel bgzf decompression (`bgzf`
+  feature); fused decompress→parse (`bgzf::parse_gz_par`); validation on real
+  ClinVar against an independent scalar oracle; pyarrow Python bindings;
+  value-by-value noodles parity tests in CI.
+- Experimental: **GPU backend** (research branch `gpu-backend`). The same
+  emit-source model, now targeting CUDA: falx emits CUDA-C, NVRTC-compiles it at
+  runtime (`cudarc`, no link-time CUDA), byte-exact vs the CPU kernels (~136
+  GiB/s structural index on a Blackwell). The payoff is *on-device*: a full
+  GPU-resident `.vcf.gz` → decompress (nvCOMP DEFLATE) → parse → filter →
+  aggregate pipeline keeps the decompressed text off PCIe and returns 16 bytes,
+  ~22x the CPU end-to-end. Not merged (needs the CUDA toolchain; `gpu` feature).
+- Headroom worth noting: the per-field clean path is already at the floor for
+  real data (~0.7 ns/field on the common borrow path); the only residual is the
+  `Vec` allocation in the rare doubled-quote copy path, which wants a
+  non-allocating `fields_into` buffer-reuse API rather than a `clean` change.
 
 ## License
 
