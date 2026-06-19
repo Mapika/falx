@@ -2,8 +2,7 @@
 //!
 //! For each format: ~64 MiB of synthetic data, 1 warmup + 7 timed runs per
 //! parser, best run reported (median printed for noise visibility). The
-//! generated SIMD kernel is compared against the hand-written M0 kernel
-//! (CSV only — the codegen fidelity check), and an ecosystem baseline where
+//! generated SIMD kernel is compared against an ecosystem baseline where
 //! a fair one exists (csv crate for CSV, serde_json line-parsing for
 //! NDJSON). Baselines do more work than structural indexing (they
 //! materialize values); the comparison shows the headroom indexing creates,
@@ -227,16 +226,10 @@ fn check_counts(format: &str, rows: &[Row]) {
 fn main() {
     // ---- CSV: generated vs hand-written vs scalar vs csv crate ----
     let data = generate_csv(TARGET_BYTES);
-    let mut rows = vec![
-        Row {
-            label: "generated kernel (SIMD)",
-            m: measure_indexer(&data, falx::kernels::csv::index_structurals),
-        },
-        Row {
-            label: "hand-written M0 kernel",
-            m: measure_indexer(&data, falx::index_structurals),
-        },
-    ];
+    let mut rows = vec![Row {
+        label: "generated kernel (SIMD)",
+        m: measure_indexer(&data, falx::kernels::csv::index_structurals),
+    }];
     rows.push(Row {
         label: "generated parallel x16",
         m: {
