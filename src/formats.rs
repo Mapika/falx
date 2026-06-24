@@ -31,6 +31,7 @@ pub struct Dialect {
     /// The full structural byte set, record terminators included (CSV is
     /// `[b',', b'\n']`).
     pub structural: Vec<u8>,
+    pub record_terminator: u8,
     /// Byte that opens/closes a region where structural bytes are inert.
     pub quote: Option<u8>,
     /// How quotes are escaped inside quoted regions.
@@ -56,6 +57,7 @@ pub struct Dialect {
 pub fn csv_dialect() -> Dialect {
     Dialect {
         structural: vec![b',', b'\n'],
+        record_terminator: b'\n',
         quote: Some(b'"'),
         escape: Escape::None,
         comment: None,
@@ -68,6 +70,7 @@ pub fn csv_dialect() -> Dialect {
 pub fn tsv_dialect() -> Dialect {
     Dialect {
         structural: vec![b'\t', b'\n'],
+        record_terminator: b'\n',
         quote: None,
         escape: Escape::None,
         comment: None,
@@ -80,6 +83,7 @@ pub fn tsv_dialect() -> Dialect {
 pub fn logfmt_dialect() -> Dialect {
     Dialect {
         structural: vec![b' ', b'=', b'\n'],
+        record_terminator: b'\n',
         quote: Some(b'"'),
         escape: Escape::Backslash(b'\\'),
         comment: None,
@@ -149,6 +153,7 @@ pub fn lines_dialect() -> Dialect {
 pub fn ndjson_dialect() -> Dialect {
     Dialect {
         structural: vec![b'\n'],
+        record_terminator: b'\n',
         quote: Some(b'"'),
         escape: Escape::Backslash(b'\\'),
         comment: None,
@@ -209,14 +214,14 @@ pub fn delimited_parts(dialect: &Dialect) -> DelimitedParts {
         .structural
         .iter()
         .copied()
-        .filter(|&b| b != b'\n')
+        .filter(|&b| b != dialect.record_terminator)
         .collect();
-    let terminators = g.class_byte(b'\n');
+    let terminators = g.class_byte(dialect.record_terminator);
     let candidates = if separators.is_empty() {
         terminators
     } else {
         let seps = g.class(CharClass::from_bytes(&separators));
-        if dialect.structural.contains(&b'\n') {
+        if dialect.structural.contains(&dialect.record_terminator) {
             g.or(seps, terminators)
         } else {
             seps
