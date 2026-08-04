@@ -110,7 +110,11 @@ pub struct Column {
 }
 
 impl Column {
-    fn field_name(&self) -> String {
+    /// The generated struct field name for this column: the declared `name`,
+    /// else the `info_key`, else `c{index}`. Public because the textual IR
+    /// always writes a resolved name, so a parsed module reproduces the same
+    /// generated field regardless of which form produced it.
+    pub fn field_name(&self) -> String {
         match (&self.name, &self.info_key) {
             (Some(name), _) => name.clone(),
             (None, Some(key)) => key.clone(),
@@ -388,6 +392,24 @@ pub fn emit_parser_with_columns_options(
     columns: &[Column],
     options: CodegenOptions,
 ) -> Result<String, CodegenError> {
+    let module = lower(dialect, format_name, columns, options)?;
+    emit_module(&module)
+}
+
+/// Lower a dialect to a backend-ready IR [`Module`]: select the graph source
+/// (handwritten or synthesized), run the graph optimizer, and pair the result
+/// with the node roles and surface attributes the backend needs.
+///
+/// This is the front half of code generation. [`emit_module`] is the back
+/// half, and [`crate::ir_text`] serializes what flows between them — so a
+/// producer that emits textual IR can skip this function entirely and still
+/// reach every backend.
+pub fn lower(
+    dialect: &crate::formats::Dialect,
+    format_name: &str,
+    columns: &[Column],
+    options: CodegenOptions,
+) -> Result<crate::ir_text::Module, CodegenError> {
     validate_columns(columns)?;
     validate_nesting(dialect)?;
     let parts = match options.graph_source {
@@ -414,11 +436,66 @@ pub fn emit_parser_with_columns_options(
             crate::egraph::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
         }
     };
+    Ok(crate::ir_text::Module {
+        name: format_name.to_string(),
+        dialect: dialect.clone(),
+        columns: columns.to_vec(),
+        graph: parts.graph,
+        terminators: parts.terminators,
+        nest: parts.nest,
+    })
+}
+
+/// Run the graph optimizer over an existing IR module.
+///
+/// [`lower`] already optimizes what it produces, so this exists for modules
+/// that came from somewhere else — hand-written IR, or IR from a producer with
+/// no optimizer of its own. Node roles are remapped along with the graph, so
+/// the result is a drop-in replacement for the input.
+pub fn optimize_module(
+    module: &crate::ir_text::Module,
+    optimizer: GraphOptimizer,
+) -> crate::ir_text::Module {
+    let parts = crate::formats::DelimitedParts {
+        graph: module.graph.clone(),
+        terminators: module.terminators,
+        nest: module.nest,
+    };
+    let parts = match optimizer {
+        GraphOptimizer::Disabled => parts,
+        GraphOptimizer::CostWeightedAvx2 => {
+            crate::graph_opt::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
+        }
+        GraphOptimizer::EqSat => {
+            crate::egraph::optimize_parts(parts, crate::synth::CostModel::avx2()).parts
+        }
+    };
+    crate::ir_text::Module {
+        name: module.name.clone(),
+        dialect: module.dialect.clone(),
+        columns: module.columns.clone(),
+        graph: parts.graph,
+        terminators: parts.terminators,
+        nest: parts.nest,
+    }
+}
+
+/// Emit a generated parser from an IR [`Module`] — the backend half of code
+/// generation, and the entry point for anything that produced its IR
+/// elsewhere (see [`crate::ir_text::parse`]).
+///
+/// The module's graph is emitted as given: graph-source selection and the
+/// optimizer already ran during [`lower`], so a hand-written or
+/// externally-optimized module is emitted verbatim rather than silently
+/// rewritten.
+pub fn emit_module(module: &crate::ir_text::Module) -> Result<String, CodegenError> {
+    validate_columns(&module.columns)?;
+    validate_nesting(&module.dialect)?;
     emit_with(
-        &parts.graph,
-        format_name,
-        Some((dialect, parts.terminators, parts.nest)),
-        columns,
+        &module.graph,
+        &module.name,
+        Some((&module.dialect, module.terminators, module.nest)),
+        &module.columns,
     )
 }
 

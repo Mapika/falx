@@ -91,6 +91,24 @@ impl std::fmt::Debug for CharClass {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NodeId(pub(crate) u32);
 
+impl NodeId {
+    /// This node's position in its graph. Nodes are numbered from 0 in
+    /// topological order, so the index is also a valid ordering key — the
+    /// textual IR uses it directly as the `%k` name.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// Build a reference to the node at `index`.
+    ///
+    /// Only meaningful against the graph the index came from; the graph
+    /// builders validate operands, and [`crate::ir_text`] validates that a
+    /// parsed reference points at an already-defined node.
+    pub const fn from_index(index: usize) -> Self {
+        NodeId(index as u32)
+    }
+}
+
 /// One bitstream operation.
 #[derive(Clone, Debug)]
 pub enum Op {

@@ -445,6 +445,8 @@ impl EGraph {
             let r = self.add(ENode::Not(or));
             self.union(cls, r);
         }
+        // Absorb: And(x, Or(x, y)) = x.
+        self.rules_absorb(cls, a, b, AndOrXor::And);
         if self.full {
             self.rules_ac(cls, a, b, AndOrXor::And);
             // Factor: And(Or(a,b), Or(a,c)) = Or(a, And(b,c)).
@@ -492,6 +494,8 @@ impl EGraph {
             let r = self.add(ENode::Not(and));
             self.union(cls, r);
         }
+        // Absorb: Or(x, And(x, y)) = x.
+        self.rules_absorb(cls, a, b, AndOrXor::Or);
         if self.full {
             self.rules_ac(cls, a, b, AndOrXor::Or);
             // Factor: Or(And(a,b), And(a,c)) = And(a, Or(b,c)).
@@ -685,6 +689,35 @@ impl EGraph {
             .iter()
             .filter_map(|n| op.match_node(n))
             .min()
+    }
+
+    /// Absorption: `And(x, Or(x, y)) = x` and `Or(x, And(x, y)) = x`, for
+    /// either operand order.
+    ///
+    /// Distinct from factoring, which needs the shared operand to appear in
+    /// *both* arms; here one whole arm is the shared operand, so the other arm
+    /// is pure overhead. Neither AC-flattening nor factoring subsumes this —
+    /// they only rewrite within one operator level — and the pattern shows up
+    /// wherever a mask is re-ANDed with a stream it already gates.
+    fn rules_absorb(&mut self, cls: EClassId, a: EClassId, b: EClassId, outer: AndOrXor) {
+        let inner = match outer {
+            AndOrXor::And => AndOrXor::Or,
+            AndOrXor::Or => AndOrXor::And,
+            // Xor does not absorb: x ^ (x | y) is not x.
+            AndOrXor::Xor => return,
+        };
+        for (whole, composite) in [(a, b), (b, a)] {
+            let whole = self.find_imm(whole);
+            let absorbs = self
+                .nodes_of(composite)
+                .iter()
+                .filter_map(|n| inner.match_node(n))
+                .any(|(x, y)| self.find_imm(x) == whole || self.find_imm(y) == whole);
+            if absorbs {
+                self.union(cls, whole);
+                return;
+            }
+        }
     }
 
     /// Whether some operand's complement is also present (`x` and `!x`).

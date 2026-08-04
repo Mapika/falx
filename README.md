@@ -286,6 +286,50 @@ mod parser {
 
 A complete runnable version lives in `examples/build-integration/`.
 
+## The IR Is The Contract
+
+falx compiles in two halves: `codegen::lower` turns a dialect into an IR
+module, and `codegen::emit_module` turns a module into Rust. The module has a
+stable textual form, so the halves can be used separately — and anything that
+can write that text reaches every backend falx has, without a spec file, a
+dialect builder, or a patch to the generator.
+
+```bash
+falx build     spec.toml   -o parser.rs   # both halves
+falx emit-ir   spec.toml   -o module.fxir # front half only
+falx opt       module.fxir -o opt.fxir    # optimize IR from anywhere
+falx build-ir  module.fxir -o parser.rs   # back half only
+falx check     spec.toml | module.fxir    # validate, write nothing
+```
+
+A complete pipe-delimited parser, written as IR by hand:
+
+```
+falx-ir 1
+format pipe_delimited
+structural 7c,0a          ; '|' and '\n'
+escape none
+column 0 id i64
+column 1 label string
+%0 = class 0a             ; record terminators
+%1 = class 7c,0a          ; all structural bytes
+output %1
+terminators %0
+```
+
+`falx build-ir` turns those ten lines into a std-only module with runtime SIMD
+dispatch, `parse`/`records`/`fields`, `parse_columns`, and the parallel entry
+points — it compiles with plain `rustc` and depends on nothing.
+
+The format is versioned and lossless: for every in-tree format, the test suite
+lowers it, prints the IR, parses it back, and asserts the regenerated code is
+byte-identical, with round-trip coverage of every opcode so an operation cannot
+enter the IR without a textual form. Printing is deterministic and idempotent,
+so checked-in IR diffs cleanly.
+
+Reference: [`docs/ir.md`](docs/ir.md) for the IR, [`docs/spec.md`](docs/spec.md)
+for the spec format.
+
 ## How The Generator Works
 
 `src/ir.rs` defines the bitstream IR. `src/interp.rs` is the slow reference

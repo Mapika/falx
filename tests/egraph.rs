@@ -4,7 +4,7 @@
 
 use falx::codegen::{self, CodegenOptions, GraphOptimizer};
 use falx::formats::{self, DelimitedParts, Dialect, Escape};
-use falx::ir::{Graph, NodeId};
+use falx::ir::{Graph, NodeId, Op};
 use falx::synth::{CostModel, graph_cost};
 use falx::{egraph, graph_opt};
 
@@ -273,4 +273,78 @@ fn codegen_with_eqsat_optimizer_succeeds() {
     .expect("eqsat codegen should succeed");
     assert!(code.contains("mod avx512"));
     assert!(!code.contains("pub mod fallback"));
+}
+
+#[test]
+fn absorption_removes_the_redundant_arm() {
+    // And(x, Or(x, y)) = x and Or(x, And(x, y)) = x. Neither AC-flattening nor
+    // factoring covers this: both rewrite within one operator level, while
+    // absorption spans two. The in-tree dialect graphs happen not to contain
+    // the pattern, so it is exercised directly here.
+    for outer_is_and in [true, false] {
+        let mut g = Graph::new();
+        let x = g.class_byte(b',');
+        let y = g.class_byte(b'|');
+        let inner = if outer_is_and {
+            g.or(x, y)
+        } else {
+            g.and(x, y)
+        };
+        let root = if outer_is_and {
+            g.and(x, inner)
+        } else {
+            g.or(x, inner)
+        };
+        g.set_output(root);
+        let terminators = x;
+        let parts = DelimitedParts {
+            graph: g,
+            terminators,
+            nest: None,
+        };
+        let opt = egraph::optimize_parts(parts, CostModel::avx2());
+
+        // The absorbed form is a single class node: the other operand and the
+        // inner combiner are both gone.
+        let live = live_node_count(&opt.parts.graph);
+        assert_eq!(
+            live, 1,
+            "absorption should reduce the output cone to one class node, got {live} \
+             (outer_is_and = {outer_is_and})"
+        );
+        assert!(
+            matches!(
+                opt.parts.graph.nodes()[opt.parts.graph.output().index()],
+                Op::Class(_)
+            ),
+            "the surviving output node should be the absorbed class"
+        );
+    }
+}
+
+/// Count nodes reachable from the graph's output — the cone that actually
+/// costs anything at runtime.
+fn live_node_count(graph: &Graph) -> usize {
+    let mut live = vec![false; graph.nodes().len()];
+    let mut stack = vec![graph.output().index()];
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut live[i], true) {
+            continue;
+        }
+        let mut push = |id: falx::ir::NodeId| stack.push(id.index());
+        match graph.nodes()[i] {
+            Op::Class(_) | Op::Const(_) => {}
+            Op::Not(a) | Op::ShiftLeft1(a) | Op::ShiftLeft1Seeded(a) | Op::PrefixXor(a) => push(a),
+            Op::And(a, b) | Op::Or(a, b) | Op::Xor(a, b) | Op::Add(a, b) => {
+                push(a);
+                push(b);
+            }
+            Op::Regions(a, b, c) => {
+                push(a);
+                push(b);
+                push(c);
+            }
+        }
+    }
+    live.iter().filter(|&&l| l).count()
 }

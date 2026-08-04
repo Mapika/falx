@@ -21,6 +21,7 @@ pub mod interp;
 #[cfg(feature = "mmap")]
 pub mod io;
 pub mod ir;
+pub mod ir_text;
 pub mod kernels;
 pub mod scalar;
 #[cfg(feature = "spec")]
