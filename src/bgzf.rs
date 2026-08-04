@@ -396,23 +396,18 @@ where
 /// boundaries.
 ///
 /// [`parse_framed_par`] hands you block payloads, which is only enough when
-/// records happen to align with blocks. This does not assume that. Each worker
-/// inflates its own contiguous block group exactly once and parses the records
-/// wholly inside it; the partial record at each end is kept as a small
-/// fragment, and the seams are stitched serially afterwards — at most one
-/// record per worker, so the cost is negligible against the parallel phase.
+/// records happen to align with blocks. This does not assume that.
 ///
-/// Inflating each block exactly once is the difference from [`parse_gz_par`],
-/// which finishes a straddling record by re-inflating blocks from the next
-/// group; correct, but it decompresses some blocks twice.
+/// The record stitching itself is format-agnostic and lives in
+/// [`crate::framing::parse_records_par`]; this supplies the bgzf-specific
+/// half — locating the blocks and inflating them. Each worker gets its own
+/// inflater and decodes one block at a time into a shared working buffer, so
+/// every block is inflated exactly once and the working set stays
+/// cache-resident. (That is the difference from [`parse_gz_par`], which
+/// finishes a straddling record by re-inflating blocks from the next group.)
 ///
-/// A stitched record is attributed to the worker whose region it *starts* in —
-/// the same record-ownership rule the parallel structural parsers use — so the
-/// returned states stay in stream order and can be concatenated or reduced
-/// directly. A record longer than an entire worker's group is handled: the
-/// carry simply spans as many workers as it needs.
-///
-/// `process` is always called with a slice containing only complete records.
+/// `process` is only ever called with complete records, and the returned
+/// states are in stream order.
 pub fn parse_framed_records_par<S, Init, F>(
     data: &[u8],
     framing: &crate::framing::Framing,
@@ -426,108 +421,43 @@ where
     Init: Fn() -> S + Sync,
     F: Fn(&mut S, &[u8]) + Sync,
 {
-    let blocks = scan_blocks(data, framing)?;
-    if blocks.is_empty() {
-        return Ok(Vec::new());
-    }
-    let threads = threads.max(1).min(blocks.len());
-    let per = blocks.len().div_ceil(threads);
-    let groups: Vec<&[Block]> = blocks.chunks(per).collect();
-
-    // Parallel phase: every block inflated exactly once.
-    type Edges = (Vec<u8>, Vec<u8>, bool);
-    let parts: Vec<io::Result<(S, Edges)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = groups
-            .into_iter()
-            .enumerate()
-            .map(|(w, group)| {
-                let init = &init;
-                let process = &process;
-                s.spawn(move || -> io::Result<(S, Edges)> {
-                    let mut backend = InflateBackend::new();
-                    let mut state = init();
-                    // Working set is one block plus the partial record carried
-                    // into it, so it stays cache-resident. Inflating the whole
-                    // group into one buffer instead would be simpler but costs
-                    // ~35% — the group is far larger than cache.
-                    let widest = group.iter().map(|b| b.isize).max().unwrap_or(0);
-                    let mut scratch = vec![0u8; widest];
-                    let mut pending: Vec<u8> = Vec::new();
-                    let mut prefix: Vec<u8> = Vec::new();
-                    let mut seen_terminator = false;
-
-                    for block in group {
-                        let out = &mut scratch[..block.isize];
-                        backend.inflate_one(&data[block.payload.clone()], out)?;
-                        pending.extend_from_slice(out);
-                        let Some(last) = pending.iter().rposition(|&b| b == terminator) else {
-                            // No record ends in this block; keep accumulating.
-                            continue;
-                        };
-                        let mut from = 0;
-                        if !seen_terminator && w != 0 {
-                            // Worker 0's leading bytes are the stream's first
-                            // record; every other worker's are the tail of the
-                            // previous worker's record and are handed back.
-                            let first = pending
-                                .iter()
-                                .position(|&b| b == terminator)
-                                .expect("a last terminator implies a first");
-                            prefix = pending[..=first].to_vec();
-                            from = first + 1;
-                        }
-                        seen_terminator = true;
-                        process(&mut state, &pending[from..=last]);
-                        // Whatever follows the last terminator is the start of
-                        // a record continuing into the next block.
-                        pending.drain(..=last);
-                    }
-
-                    let edges = if seen_terminator {
-                        (prefix, pending, true)
-                    } else {
-                        // The whole group is the middle of one long record.
-                        (pending, Vec::new(), false)
-                    };
-                    Ok((state, edges))
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("bgzf worker panicked"))
-            .collect()
-    });
-
-    let mut states = Vec::with_capacity(parts.len());
-    let mut edges = Vec::with_capacity(parts.len());
-    for part in parts {
-        let (state, edge) = part?;
-        states.push(state);
-        edges.push(edge);
+    let frames: Vec<crate::framing::Frame> = crate::framing::scan(framing, data)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.0))?
+        .into_iter()
+        // An empty member (the bgzf EOF marker) inflates to nothing.
+        .filter(|f| f.uncompressed != Some(0))
+        .collect();
+    if let Some(frame) = frames.iter().find(|f| f.uncompressed.is_none()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "framing must declare `uncompressed` to decompress in parallel \
+                 (frame at offset {})",
+                frame.start
+            ),
+        ));
     }
 
-    // Serial seam phase: rejoin the fragments the parallel phase set aside.
-    // `carry_owner` tracks which worker the in-flight record started in, which
-    // is what keeps the states in stream order.
-    let mut carry: Vec<u8> = Vec::new();
-    let mut carry_owner = 0usize;
-    for (t, (prefix, suffix, had_terminator)) in edges.iter().enumerate() {
-        carry.extend_from_slice(prefix);
-        if *had_terminator {
-            if !carry.is_empty() {
-                process(&mut states[carry_owner], &carry);
+    crate::framing::parse_records_par(
+        data,
+        &frames,
+        threads,
+        terminator,
+        init,
+        || {
+            // One inflater per worker, reused across that worker's blocks.
+            let mut backend = InflateBackend::new();
+            move |frame: &crate::framing::Frame, data: &[u8], out: &mut Vec<u8>| -> io::Result<()> {
+                let n = frame
+                    .uncompressed
+                    .expect("frames without a declared size were rejected above");
+                let at = out.len();
+                out.resize(at + n, 0);
+                backend.inflate_one(&data[frame.payload.clone()], &mut out[at..])
             }
-            carry.clear();
-            carry.extend_from_slice(suffix);
-            carry_owner = t;
-        }
-    }
-    // Whatever is left is a final record with no terminator.
-    if !carry.is_empty() {
-        process(&mut states[carry_owner], &carry);
-    }
-    Ok(states)
+        },
+        process,
+    )
 }
 
 /// Process a bgzf stream block-by-block across `threads` workers without

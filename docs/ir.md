@@ -201,14 +201,21 @@ let states = falx::bgzf::parse_framed_records_par(&data, &framing, threads, b'\n
 )?;
 ```
 
-Each worker inflates its own blocks exactly once, streaming block-by-block with
+Each worker decodes its own frames exactly once, streaming frame-by-frame with
 a small carry so the working set stays cache-resident; the partial record at
 each end is kept as a fragment and the seams are stitched serially afterwards —
 at most one record per worker. A stitched record is attributed to the worker
 whose region it *starts* in, the same record-ownership rule the parallel
 structural parsers use, so the returned states stay in stream order and can be
-concatenated directly. Records longer than a whole worker's group are handled;
+concatenated directly. Records longer than a whole worker's run are handled;
 so is a final record with no terminator.
+
+The stitching itself is format-agnostic and lives in
+`falx::framing::parse_records_par`, which takes the per-frame decoder as a
+parameter. `bgzf::parse_framed_records_par` is the thin wrapper that supplies
+an inflating one; with an identity decoder the same function parses records out
+of a plain, uncompressed length-prefixed container, and any other decompressor
+slots in the same way.
 
 This measures the same as the block-aligned form (~35 GiB/s on the benchmark
 above), so correctness across boundaries is not a tradeoff — prefer it for any

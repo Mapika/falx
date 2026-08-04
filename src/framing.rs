@@ -321,6 +321,147 @@ fn read_size_field(
     })
 }
 
+/// Parse **whole records** out of framed data across `threads` workers,
+/// including records that straddle frame and worker boundaries.
+///
+/// Frames are independent, but records generally are not aligned to them, so
+/// splitting work by frame and parsing each in isolation would cut records in
+/// half. This handles that generically, for any container and any per-frame
+/// decoding:
+///
+/// * Each worker takes a contiguous run of frames and decodes them one at a
+///   time, holding over whatever follows the last terminator in each. The
+///   working set is therefore one frame plus a partial record, which stays
+///   cache-resident — decoding a worker's whole run into a single buffer first
+///   is simpler but measurably slower once a run exceeds cache.
+/// * The partial record at each end of a worker's run is kept aside, and the
+///   seams are stitched serially afterwards: at most one record per worker.
+/// * A stitched record is attributed to the worker whose run it *starts* in,
+///   the same record-ownership rule the parallel structural parsers use, so
+///   the returned states stay in stream order and concatenate directly.
+///
+/// Records longer than a worker's entire run are handled (the carry simply
+/// spans as many workers as it needs), as is a final record with no
+/// terminator. `process` is only ever called with complete records.
+///
+/// `make_decoder` is called once per worker and returns that worker's decoder,
+/// which appends one frame's decoded bytes to the buffer it is given. For an
+/// uncompressed container that is a copy; [`crate::bgzf::parse_framed_records_par`]
+/// supplies one that inflates.
+pub fn parse_records_par<S, E, Init, MakeDecoder, Decoder, Process>(
+    data: &[u8],
+    frames: &[Frame],
+    threads: usize,
+    terminator: u8,
+    init: Init,
+    make_decoder: MakeDecoder,
+    process: Process,
+) -> Result<Vec<S>, E>
+where
+    S: Send,
+    E: Send,
+    Init: Fn() -> S + Sync,
+    MakeDecoder: Fn() -> Decoder + Sync,
+    Decoder: FnMut(&Frame, &[u8], &mut Vec<u8>) -> Result<(), E>,
+    Process: Fn(&mut S, &[u8]) + Sync,
+{
+    if frames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = threads.max(1).min(frames.len());
+    let per = frames.len().div_ceil(threads);
+
+    // Per worker: the leading partial record, the trailing partial record, and
+    // whether any record ended inside its run at all.
+    type Edges = (Vec<u8>, Vec<u8>, bool);
+
+    let parts: Vec<Result<(S, Edges), E>> = std::thread::scope(|s| {
+        let handles: Vec<_> = frames
+            .chunks(per)
+            .enumerate()
+            .map(|(w, group)| {
+                let init = &init;
+                let make_decoder = &make_decoder;
+                let process = &process;
+                s.spawn(move || -> Result<(S, Edges), E> {
+                    let mut decode = make_decoder();
+                    let mut state = init();
+                    let mut pending: Vec<u8> = Vec::new();
+                    let mut prefix: Vec<u8> = Vec::new();
+                    let mut seen_terminator = false;
+
+                    for frame in group {
+                        decode(frame, data, &mut pending)?;
+                        let Some(last) = pending.iter().rposition(|&b| b == terminator) else {
+                            // No record ends in this frame; keep accumulating.
+                            continue;
+                        };
+                        let mut from = 0;
+                        if !seen_terminator && w != 0 {
+                            // Worker 0's leading bytes are the stream's first
+                            // record; every other worker's are the tail of the
+                            // previous worker's record, handed back as a
+                            // fragment for the seam pass.
+                            let first = pending
+                                .iter()
+                                .position(|&b| b == terminator)
+                                .expect("a last terminator implies a first");
+                            prefix = pending[..=first].to_vec();
+                            from = first + 1;
+                        }
+                        seen_terminator = true;
+                        process(&mut state, &pending[from..=last]);
+                        // What follows the last terminator starts a record that
+                        // continues into the next frame.
+                        pending.drain(..=last);
+                    }
+
+                    let edges = if seen_terminator {
+                        (prefix, pending, true)
+                    } else {
+                        // The whole run is the middle of one long record.
+                        (pending, Vec::new(), false)
+                    };
+                    Ok((state, edges))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("framing worker panicked"))
+            .collect()
+    });
+
+    let mut states = Vec::with_capacity(parts.len());
+    let mut edges = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (state, edge) = part?;
+        states.push(state);
+        edges.push(edge);
+    }
+
+    // Serial seam pass. `carry_owner` tracks which worker the in-flight record
+    // started in, which is what keeps the states in stream order.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut carry_owner = 0usize;
+    for (w, (prefix, suffix, had_terminator)) in edges.iter().enumerate() {
+        carry.extend_from_slice(prefix);
+        if *had_terminator {
+            if !carry.is_empty() {
+                process(&mut states[carry_owner], &carry);
+            }
+            carry.clear();
+            carry.extend_from_slice(suffix);
+            carry_owner = w;
+        }
+    }
+    // Anything left is a final record with no terminator.
+    if !carry.is_empty() {
+        process(&mut states[carry_owner], &carry);
+    }
+    Ok(states)
+}
+
 /// The canonical bgzf block layout, as a framing descriptor.
 ///
 /// Provided as the worked reference for the model — [`crate::bgzf`] keeps its

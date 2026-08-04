@@ -639,3 +639,105 @@ fn states_are_returned_in_stream_order() {
         "concatenated states are not in stream order"
     );
 }
+
+/// The seam logic is format-agnostic: with an identity decoder it parses
+/// records out of a plain (uncompressed) length-prefixed container, no
+/// decompressor involved. This is what living in `framing` rather than `bgzf`
+/// buys — the record stitching is reusable by any container.
+#[test]
+fn record_stitching_works_without_a_decompressor() {
+    let f = Framing {
+        header: 4,
+        length_at: 0,
+        width: Width::U32,
+        endian: Endian::Be,
+        counts: Counts::Payload,
+        adjust: 0,
+        trailer: 0,
+        magic: None,
+        skip_empty: false,
+        uncompressed: None,
+    };
+    // Records split across frames at arbitrary offsets.
+    let mut payload = Vec::new();
+    for row in 0..3_000u64 {
+        payload.extend_from_slice(format!("{row}\n").as_bytes());
+    }
+    for chunk_size in [3usize, 7, 64, 999] {
+        let mut data = Vec::new();
+        for chunk in payload.chunks(chunk_size) {
+            data.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            data.extend_from_slice(chunk);
+        }
+        let frames = framing::scan(&f, &data).expect("scan");
+
+        for threads in [1usize, 2, 5, 16] {
+            let states: Vec<Vec<u64>> = framing::parse_records_par(
+                &data,
+                &frames,
+                threads,
+                b'\n',
+                Vec::new,
+                // Identity decoder: the payload is already plain bytes.
+                || {
+                    |frame: &framing::Frame, data: &[u8], out: &mut Vec<u8>| -> Result<(), ()> {
+                        out.extend_from_slice(&data[frame.payload.clone()]);
+                        Ok(())
+                    }
+                },
+                |state: &mut Vec<u64>, records: &[u8]| {
+                    for line in records.split(|&b| b == b'\n') {
+                        if !line.is_empty() {
+                            state.push(std::str::from_utf8(line).unwrap().parse().unwrap());
+                        }
+                    }
+                },
+            )
+            .expect("parse");
+
+            let flattened: Vec<u64> = states.concat();
+            let expected: Vec<u64> = (0..3_000).collect();
+            assert_eq!(
+                flattened, expected,
+                "records lost or reordered at chunk {chunk_size}, {threads} threads"
+            );
+        }
+    }
+}
+
+/// A decoder error propagates out rather than being swallowed or panicking.
+#[test]
+fn decoder_errors_propagate() {
+    let f = Framing {
+        header: 4,
+        length_at: 0,
+        width: Width::U32,
+        endian: Endian::Be,
+        counts: Counts::Payload,
+        adjust: 0,
+        trailer: 0,
+        magic: None,
+        skip_empty: false,
+        uncompressed: None,
+    };
+    let mut data = Vec::new();
+    for chunk in [b"aa\n".as_slice(), b"bb\n".as_slice()] {
+        data.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+        data.extend_from_slice(chunk);
+    }
+    let frames = framing::scan(&f, &data).expect("scan");
+    let result: Result<Vec<()>, &'static str> = framing::parse_records_par(
+        &data,
+        &frames,
+        2,
+        b'\n',
+        || (),
+        || {
+            |_f: &framing::Frame, _d: &[u8], _o: &mut Vec<u8>| -> Result<(), &'static str> {
+                Err("decoder failed")
+            }
+        },
+        |_s: &mut (), _r: &[u8]| {},
+    );
+    assert_eq!(result, Err("decoder failed"));
+}
