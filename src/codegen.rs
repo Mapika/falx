@@ -1035,7 +1035,11 @@ fn emit_with(
     } else {
         String::new()
     };
-    let field_byte_stats_mode = format_name == "csv" || format_name == "tsv";
+    // csv_hash joins csv/tsv here: comment records contribute no fields (the
+    // sink guards on the record's first byte) and its parallel seeding comes
+    // from the region transfer-function scheme.
+    let field_byte_stats_mode =
+        format_name == "csv" || format_name == "tsv" || format_name == "csv_hash";
     let field_byte_stats_cells = |code: String| {
         code.replace("index_cells", "index_field_bytes")
             .replace("ColumnSink", "FieldByteSink")
@@ -1998,8 +2002,8 @@ fn unsupported_cpu() -> ! {{
         if format_name == "ndjson" {
             push_ndjson_lines_api(&mut code);
         }
-        if format_name == "csv" || format_name == "tsv" {
-            push_field_byte_stats_api(&mut code, dialect);
+        if field_byte_stats_mode {
+            push_field_byte_stats_api(&mut code, dialect, region_par);
         }
         if !columns.is_empty() {
             push_columns_api(&mut code, dialect, columns, par_mode, region_par);
@@ -2938,6 +2942,54 @@ pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let (seps, ends) = scatter_tape(&parts);
     Parsed { data, seps, ends }
 }"#;
+
+/// Seeding fragments for a comment+quote dialect's parallel fused entry
+/// points, the region counterpart of [`par_seed_parts`]. A chunk's entry
+/// context is a region (NORMAL/QUOTE/COMMENT) whose transitions are not
+/// XOR-linear, so instead of a parity prefix each chunk's region *transfer
+/// function* is computed in parallel, composed serially in O(threads), and
+/// handed back as that chunk's entry state — the scheme `parse_par` uses,
+/// so no chunk is ever scanned twice. Both entry carries are packed into
+/// the one `seed` word the fused drivers take: bit 0 is the line-start
+/// carry, bits 1.. the region state. Indentation matches `par_seed_parts`
+/// (4 / 16 / 20 spaces) so the two are interchangeable in the templates.
+fn region_par_seed_parts() -> (String, String, String) {
+    (
+        "    // Line-start carry entering a chunk: region independent, = whether\n\
+         \x20   // the byte before it was a newline (CARRY_INIT at the file start).\n\
+         \x20   let line_start = |b: usize| -> u64 {\n\
+         \x20       if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }\n\
+         \x20   };\n\
+         \x20   // Phase 1 (parallel): each chunk's region transfer function.\n\
+         \x20   let transfer: Vec<[u64; 3]> = std::thread::scope(|s| {\n\
+         \x20       let handles: Vec<_> = (0..threads)\n\
+         \x20           .map(|t| {\n\
+         \x20               let slice = &data[bounds[t]..bounds[t + 1]];\n\
+         \x20               let ls = line_start(bounds[t]);\n\
+         \x20               s.spawn(move || {\n\
+         \x20                   let mut states = [0u64, 1, 2];\n\
+         \x20                   let mut c = [ls, 0];\n\
+         \x20                   region_scan3_dispatch(slice, &mut c, &mut states);\n\
+         \x20                   states\n\
+         \x20               })\n\
+         \x20           })\n\
+         \x20           .collect();\n\
+         \x20       handles.into_iter().map(|h| h.join().expect(\"scan thread ok\")).collect()\n\
+         \x20   });\n\
+         \x20   // Phase 2 (serial, O(threads)): compose to each chunk's entry state.\n\
+         \x20   let mut entry = vec![0u64; threads];\n\
+         \x20   let mut region = 0u64;\n\
+         \x20   for t in 0..threads {\n\
+         \x20       entry[t] = region;\n\
+         \x20       region = transfer[t][region as usize];\n\
+         \x20   }\n"
+            .to_string(),
+        "                let entry = &entry;\n".to_string(),
+        "                    // Phase 3: both entry carries packed into one seed.\n\
+         \x20                   let seed = line_start(start) | (entry[t] << 1);\n"
+            .to_string(),
+    )
+}
 
 fn par_seed_parts(quote: Option<u8>, chunk: &str) -> (String, String, String) {
     match quote {
@@ -5131,6 +5183,7 @@ fn push_columns_api(
         // fused sinks are unchanged — only the seed differs.
         let (chunks_par_doc, chunks_par_prologue, chunks_par_refs, chunks_par_seed) = if region_par
         {
+            let (shared, refs, seed) = region_par_seed_parts();
             (
                 "/// Parallel [`parse_columns`] without a final concatenation pass.\n\
                  /// Records are assigned to workers by terminator ownership — worker\n\
@@ -5140,39 +5193,9 @@ fn push_columns_api(
                  /// Region context (NORMAL/QUOTE/COMMENT) is resolved by the same\n\
                  /// three-phase transfer-function scheme [`parse_par`] uses, so no\n\
                  /// chunk is ever parsed twice. Returned chunks are in input order.\n",
-                "\x20   // Line-start carry entering a chunk: region independent, = whether\n\
-                 \x20   // the byte before it was a newline (CARRY_INIT at the file start).\n\
-                 \x20   let line_start = |b: usize| -> u64 {\n\
-                 \x20       if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }\n\
-                 \x20   };\n\
-                 \x20   // Phase 1 (parallel): each chunk's region transfer function.\n\
-                 \x20   let transfer: Vec<[u64; 3]> = std::thread::scope(|s| {\n\
-                 \x20       let handles: Vec<_> = (0..threads)\n\
-                 \x20           .map(|t| {\n\
-                 \x20               let slice = &data[bounds[t]..bounds[t + 1]];\n\
-                 \x20               let ls = line_start(bounds[t]);\n\
-                 \x20               s.spawn(move || {\n\
-                 \x20                   let mut states = [0u64, 1, 2];\n\
-                 \x20                   let mut c = [ls, 0];\n\
-                 \x20                   region_scan3_dispatch(slice, &mut c, &mut states);\n\
-                 \x20                   states\n\
-                 \x20               })\n\
-                 \x20           })\n\
-                 \x20           .collect();\n\
-                 \x20       handles.into_iter().map(|h| h.join().expect(\"scan thread ok\")).collect()\n\
-                 \x20   });\n\
-                 \x20   // Phase 2 (serial, O(threads)): compose to each chunk's entry state.\n\
-                 \x20   let mut entry = vec![0u64; threads];\n\
-                 \x20   let mut region = 0u64;\n\
-                 \x20   for t in 0..threads {\n\
-                 \x20       entry[t] = region;\n\
-                 \x20       region = transfer[t][region as usize];\n\
-                 \x20   }\n"
-                    .to_string(),
-                "                let entry = &entry;\n".to_string(),
-                "                    // Phase 3: both entry carries packed into one seed.\n\
-                 \x20                   let seed = line_start(start) | (entry[t] << 1);\n"
-                    .to_string(),
+                shared,
+                refs,
+                seed,
             )
         } else {
             (
@@ -5738,8 +5761,36 @@ fn ndjson_line_bounds(data: &[u8], threads: usize) -> Vec<usize> {
     );
 }
 
-fn push_field_byte_stats_api(code: &mut String, dialect: &crate::formats::Dialect) {
-    let (par_shared, par_refs, par_seed) = par_seed_parts(dialect.quote, "data[start..end]");
+fn push_field_byte_stats_api(
+    code: &mut String,
+    dialect: &crate::formats::Dialect,
+    region_par: bool,
+) {
+    let (par_shared, par_refs, par_seed) = if region_par {
+        region_par_seed_parts()
+    } else {
+        par_seed_parts(dialect.quote, "data[start..end]")
+    };
+    // A region dialect's seed packs both entry carries, so the serial call
+    // passes the packed stream-start state; a bare 0 would clear the
+    // line-start carry and stop a leading comment byte from opening one.
+    let serial_seed = if region_par {
+        "CARRY_INIT[0] | (CARRY_INIT[1] << 1)"
+    } else {
+        "0"
+    };
+    // Comment dialects: a comment line contributes no fields. `record_start`
+    // already points at the first byte of the record being flushed, so one
+    // load per field decides it (the guard mirrors the column sink's).
+    let comment_guard = match dialect.comment {
+        Some(c) => format!(
+            "        // Comment record: contributes no fields.\n\
+             \x20       if end > self.record_start && data[self.record_start as usize] == {c}u8 {{\n\
+             \x20           return;\n\
+             \x20       }}\n"
+        ),
+        None => String::new(),
+    };
     let field_len_helper = if dialect.quote.is_some() {
         r#"#[inline]
 fn field_byte_len(raw: &[u8]) -> u64 {
@@ -5789,7 +5840,7 @@ pub struct FieldByteStats {
 /// walking it again.
 pub fn parse_field_bytes(data: &[u8]) -> FieldByteStats {
     let mut sink = FieldByteSink::new(data, 0, data.len() as u32, true);
-    index_field_bytes_dispatch(data, 0, 0, &mut sink);
+    index_field_bytes_dispatch(data, @SERIAL_SEED@, 0, &mut sink);
     sink.finish()
 }
 
@@ -5949,7 +6000,7 @@ impl<'a> FieldByteSink<'a> {
     #[inline]
     fn flush_field(&mut self, end: u32, record_end: bool) {
         let data = self.data;
-        let to = if record_end && end > self.record_start && data[end as usize - 1] == b'\r' {
+@COMMENT_GUARD@        let to = if record_end && end > self.record_start && data[end as usize - 1] == b'\r' {
             end - 1
         } else {
             end
@@ -5978,6 +6029,8 @@ impl FieldByteStats {
         .replace("@PAR_SHARED@", &par_shared)
         .replace("@PAR_REFS@", &par_refs)
         .replace("@PAR_SEED@", &par_seed)
+        .replace("@SERIAL_SEED@", serial_seed)
+        .replace("@COMMENT_GUARD@", &comment_guard)
         .replace("@FIELD_LEN_HELPER@", field_len_helper);
 
     code.push_str(&api);

@@ -34,11 +34,12 @@ The emitted code exports `index_structurals(data: &[u8], out: &mut Vec<u32>)`, w
 
 ### Structure
 
-1. **Dispatch wrapper**: Runtime detection prefers AVX-512F/BW/VL + PCLMULQDQ, then AVX2 + PCLMULQDQ. Unsupported CPUs fail fast instead of embedding scalar fallback code in the generated parser.
+1. **Dispatch wrapper**: Runtime detection prefers AVX-512F/BW/VL + PCLMULQDQ, then AVX2 + PCLMULQDQ. Unsupported CPUs fail fast instead of embedding scalar fallback code in the generated parser. Fused sink drivers (columns, field-byte and typed stats) add a preferred tier above that: AVX-512 VBMI2 + BMI2, which extracts a block's structural positions with `vpcompressb` instead of walking set bits serially.
 2. **AVX-512 kernel** (`avx512` module):
    - Same `step()` logic but with target-feature attributes.
-   - `Class` via two 32-byte loads and AVX-512VL `_mm256_cmpeq_epi8_mask`, returning the 64-bit block mask without a movemask instruction.
+   - `Class` via one 64-byte `_mm512_loadu_si512` and `_mm512_cmpeq_epi8_mask` per class member, returning the 64-bit block mask without a movemask instruction.
    - `PrefixXor` via PCLMULQDQ-based carryless multiply.
+   - On VBMI2 + BMI2 hosts the fused drivers gain an `_compress` twin: `_mm512_maskz_compress_epi8` over a byte iota yields every structural position of the block at once and `_pext_u64` compacts the matching terminator flags, so the sink consumes a counted array (`drive_positions`) rather than a serial trailing-zero/clear-bit chain.
 3. **AVX2 kernel** (`avx2` module):
    - Same `step()` logic but with target-feature attributes.
    - `Class` via `_mm256_cmpeq_epi8` over two 32-byte halves; larger classes use PSHUFB nibble lookup tables.

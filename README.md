@@ -4,7 +4,8 @@ falx is a parser generator for high-throughput record and column parsers. It
 takes a declarative format spec and emits a self-contained Rust parser with
 runtime SIMD dispatch:
 
-- x86: AVX-512F/BW/VL + PCLMULQDQ first, then AVX2 + PCLMULQDQ
+- x86: AVX-512F/BW/VL + PCLMULQDQ first, then AVX2 + PCLMULQDQ; fused sink
+  drivers prefer AVX-512 VBMI2 + BMI2 where present
 - ARM: NEON, with PMULL where carry-less multiply is needed
 - std-only generated parser files for normal use
 
@@ -62,7 +63,8 @@ ratios are hardware-independent falx improvements:
 
 | Lane | falx before | falx after | Delta |
 |---|---:|---:|---:|
-| csv_hash (`#` comments + quotes) typed columns, chunked | 1.55 GiB/s serial-only | 16.11 GiB/s | 10.4x |
+| csv_hash (`#` comments + quotes) field bytes | 1.14 GiB/s tape, serial-only | 35.64 GiB/s | 31x |
+| csv_hash typed columns, chunked | 1.55 GiB/s serial-only | 16.11 GiB/s | 10.4x |
 | CSV City + Latitude/Longitude materialization, parallel | 5.13 GiB/s | 16.03 GiB/s | 3.1x |
 | CSV Latitude/Longitude materialization, parallel | 9.36 GiB/s | 17.57 GiB/s | 1.9x |
 | CSV City + Latitude/Longitude materialization, serial | 0.99 GiB/s | 1.32 GiB/s | +34% |
@@ -74,20 +76,26 @@ ratios are hardware-independent falx improvements:
 Same-box context: the `csv` crate materializes the same columns at 0.42 GiB/s
 and `arrow-csv` at 0.53 GiB/s, checksum-identical to falx on every lane.
 
-The csv_hash row is a new capability rather than a tuning win: comment+quote
-dialects previously had no fused parallel projection at all, because a chunk's
-entry context there is a region (NORMAL/QUOTE/COMMENT) that no parity prefix can
+The two csv_hash rows are new capabilities rather than tuning wins: comment+quote
+dialects previously had no fused parallel path at all, because a chunk's entry
+context there is a region (NORMAL/QUOTE/COMMENT) that no parity prefix can
 recover — a `"` can hide a `#` and vice versa. They now reach the same fused
 sinks through the three-phase transfer-function scheme `parse_par` already used
 (each chunk's region transfer function computed in parallel, composed serially
-in O(threads), then one seeded pass per chunk), so no chunk is parsed twice. At
-96 threads that lane reaches 61.97 GiB/s.
+in O(threads), then one seeded pass per chunk), so no chunk is parsed twice. The
+field-byte lane previously had to build a tape and walk it; the column lane had
+no parallel entry point at all. At 96 threads the column lane reaches 61.97
+GiB/s. Both are checked against independent references: columns against serial
+`parse_columns`, field bytes against the tape/span `records()` API, over region
+hazards, every chunk-boundary offset, and randomized documents.
 
 What changed (all in the code generator; kernels regenerated):
 
 - comment+quote dialects gain `parse_columns_par` /
-  `parse_columns_chunks_par` via the region transfer-function scheme; their
-  fused sink drivers take both entry carries packed into one seed
+  `parse_columns_chunks_par` and `parse_field_bytes` / `parse_field_bytes_par`
+  via the region transfer-function scheme; their fused sink drivers take both
+  entry carries packed into one seed, and the field-byte sink skips comment
+  records by testing the record's first byte
 - fixed-shape decimal cells (`[-]d{1,3}.d{6}`) parse via one unaligned load and
   a SWAR all-digits test instead of digit-at-a-time branching, with the sign
   applied by ORing the sign bit (nonnegative mantissa) — random-sign data was
