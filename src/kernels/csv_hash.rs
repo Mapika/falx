@@ -279,7 +279,125 @@ fn scatter_tape_into(parts: &[TapePart], mut seps: Vec<u32>, mut ends: Vec<u64>)
     }
     (seps, ends)
 }
-/// Record-aware tape indexing used by [`parse`].
+
+/// Append per-chunk index parts to `out`, copying each into its own disjoint
+/// slot concurrently. The previous single-threaded concat serialized an
+/// O(positions) copy and was the parallel scaling ceiling.
+fn scatter_u32(out: &mut Vec<u32>, parts: &[Vec<u32>]) {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let start = out.len();
+    out.reserve(total);
+    {
+        let mut rest = &mut out.spare_capacity_mut()[..total];
+        let mut slots: Vec<&mut [std::mem::MaybeUninit<u32>]> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let (head, tail) = rest.split_at_mut(p.len());
+            slots.push(head);
+            rest = tail;
+        }
+        std::thread::scope(|s| {
+            for (slot, part) in slots.into_iter().zip(parts.iter()) {
+                s.spawn(move || {
+                    // SAFETY: slot.len() == part.len(); the copy initializes
+                    // exactly this disjoint slice of `out`'s spare capacity.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.as_ptr(),
+                            slot.as_mut_ptr().cast::<u32>(),
+                            part.len(),
+                        );
+                    }
+                });
+            }
+        });
+    }
+    // SAFETY: the scatter initialized every element of spare[..total].
+    unsafe { out.set_len(start + total); }
+}
+
+fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::index_structurals_seeded(data, seed, base, out) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { neon::index_structurals_seeded(data, seed, base, out) };
+    }
+    unsupported_cpu()
+}
+
+pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        index_structurals(data, out);
+        return;
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // Line-start carry entering a chunk: region independent, = whether the byte
+    // before it was a newline (CARRY_INIT at the file start).
+    let line_start = |b: usize| -> u64 {
+        if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }
+    };
+    // Phase 1 (parallel): each chunk's region transfer function.
+    let transfer: Vec<[u64; 3]> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let ls = line_start(bounds[t]);
+                s.spawn(move || {
+                    let mut states = [0u64, 1, 2];
+                    let mut c = [ls, 0];
+                    region_scan3_dispatch(slice, &mut c, &mut states);
+                    states
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("scan thread ok")).collect()
+    });
+    // Phase 2 (serial, O(threads)): compose to each chunk's entry state.
+    let mut entry = vec![0u64; threads];
+    let mut region = 0u64;
+    for t in 0..threads {
+        entry[t] = region;
+        region = transfer[t][region as usize];
+    }
+    // Phase 3 (parallel): index every chunk exactly once with its true carries.
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                let seed = line_start(bounds[t]) | (entry[t] << 1);
+                s.spawn(move || {
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    let _ = index_structurals_seeded_dispatch(slice, seed, base, &mut part);
+                    part
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
+    });
+    scatter_u32(out, &parts);
+}/// Record-aware tape indexing used by [`parse`].
 fn index_tape(data: &[u8], seps: &mut Vec<u32>, ends: &mut Vec<u64>) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
@@ -1750,6 +1868,31 @@ mod avx512 {
         }
     }
 
+    /// Like `index_structurals` but seeded with the entry carries packed
+    /// into one word (bit 0 line-start, bits 1.. region state) and an
+    /// absolute base offset. The parallel driver resolves those carries
+    /// ahead of time, so the return value is unused here.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset), &mut carries) }.0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr(), &mut carries) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
+        }
+        0
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
@@ -2206,6 +2349,31 @@ mod avx2 {
         }
     }
 
+    /// Like `index_structurals` but seeded with the entry carries packed
+    /// into one word (bit 0 line-start, bits 1.. region state) and an
+    /// absolute base offset. The parallel driver resolves those carries
+    /// ahead of time, so the return value is unused here.
+    #[target_feature(enable = "avx2", enable = "pclmulqdq")]
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset), &mut carries) }.0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr(), &mut carries) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
+        }
+        0
+    }
+
     /// Index the full 64-byte blocks of `data` (carries persist across
     /// calls); returns the number of bytes consumed. Streaming primitive.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
@@ -2552,6 +2720,31 @@ mod neon {
             ends.push(((base_count + below) << 32) | (base + idx) as u64);
             t &= t - 1;
         }
+    }
+
+    /// Like `index_structurals` but seeded with the entry carries packed
+    /// into one word (bit 0 line-start, bits 1.. region state) and an
+    /// absolute base offset. The parallel driver resolves those carries
+    /// ahead of time, so the return value is unused here.
+    #[target_feature(enable = "neon", enable = "aes")]
+    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = 0usize;
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let mask = unsafe { step(data.as_ptr().add(offset), &mut carries) }.0;
+            push_indexes(mask, base + offset as u32, out);
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let mask = unsafe { step(block.as_ptr(), &mut carries) }.0 & ((1u64 << rem) - 1);
+            push_indexes(mask, base + offset as u32, out);
+        }
+        0
     }
 
     /// Index the full 64-byte blocks of `data` (carries persist across

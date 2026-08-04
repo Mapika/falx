@@ -232,6 +232,94 @@ fn field_bytes_match_reference_on_random_documents() {
     }
 }
 
+/// The parallel structural index must be byte-identical to the serial one —
+/// same positions, same order — for every hazard shape and thread count.
+#[test]
+fn index_structurals_par_matches_serial() {
+    let cases: &[(&str, &[u8])] = &[
+        ("plain", b"a,1\nb,2\nc,3\n"),
+        ("leading comment", b"# header\na,1\nb,2\n"),
+        ("comment only", b"# just a comment\n"),
+        ("quoted newline", b"\"a\nb\",1\nc,2\n"),
+        ("hash inside quotes", b"\"a#b\",1\n\"#\",2\n"),
+        ("quote inside comment", b"# a \" b\na,1\n"),
+        ("unbalanced quote in comment", b"# \"\na,1\nb,2\n"),
+        ("doubled quotes", b"\"a\"\"b\",1\n# c\n"),
+        ("no trailing newline", b"a,1\nb,2"),
+        ("crlf with comment", b"a,1\r\n# c\r\nb,2\r\n"),
+    ];
+    for (label, data) in cases {
+        let mut want = Vec::new();
+        csv_hash::index_structurals(data, &mut want);
+        for &threads in &[1usize, 2, 3, 4, 8, 16] {
+            let mut got = Vec::new();
+            csv_hash::index_structurals_par(data, threads, &mut got);
+            assert_eq!(
+                want, got,
+                "{label}: parallel index differs from serial at {threads} threads"
+            );
+        }
+    }
+}
+
+/// Same, over padded hazards (so the hazard crosses chunk boundaries) and
+/// randomized documents.
+#[test]
+fn index_structurals_par_matches_serial_across_boundaries() {
+    let hazards: &[&[u8]] = &[
+        b"\"x\ny\",7\n",
+        b"# c \" c\n",
+        b"\"#\",7\n",
+        b"\"a\"\"b\",7\n",
+    ];
+    for hazard in hazards {
+        for pad_rows in 0..24usize {
+            let mut data = Vec::new();
+            for i in 0..pad_rows {
+                data.extend_from_slice(format!("k{i},{i}\n").as_bytes());
+            }
+            data.extend_from_slice(hazard);
+            data.extend_from_slice(b"tail,99\n");
+            let mut want = Vec::new();
+            csv_hash::index_structurals(&data, &mut want);
+            for &threads in &[2usize, 4, 8] {
+                let mut got = Vec::new();
+                csv_hash::index_structurals_par(&data, threads, &mut got);
+                assert_eq!(
+                    want, got,
+                    "pad {pad_rows}: parallel index differs at {threads} threads"
+                );
+            }
+        }
+    }
+
+    let mut rng = Rng(0x1DEA_7F02_5C31_9AB6);
+    for doc in 0..80 {
+        let rows = 1 + (rng.next() % 40) as usize;
+        let mut data = Vec::new();
+        for _ in 0..rows {
+            match rng.next() % 6 {
+                0 => data.extend_from_slice(b"# comment with \" quote\n"),
+                1 => data.extend_from_slice(b"\"quoted\nnewline\",42\n"),
+                2 => data.extend_from_slice(b"\"has#hash\",7\n"),
+                3 => data.extend_from_slice(b"\"a\"\"b\",13\n"),
+                4 => data.extend_from_slice(b",\n"),
+                _ => data.extend_from_slice(b"key,1\n"),
+            }
+        }
+        let mut want = Vec::new();
+        csv_hash::index_structurals(&data, &mut want);
+        for &threads in &[2usize, 5, 9] {
+            let mut got = Vec::new();
+            csv_hash::index_structurals_par(&data, threads, &mut got);
+            assert_eq!(
+                want, got,
+                "random doc {doc}: parallel index differs at {threads} threads"
+            );
+        }
+    }
+}
+
 /// Chunked output concatenates to exactly the flattened output.
 #[test]
 fn chunks_par_concatenates_to_parse_columns_par() {

@@ -162,6 +162,7 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
     unsupported_cpu()
 }
 
+
 /// Parallel [`parse`] for a comment dialect; line-aligned chunking (see
 /// [`index_structurals_par`]). Chunk tapes concatenate; each end entry's
 /// cumulative separator count is rebased during the merge.

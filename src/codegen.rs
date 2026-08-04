@@ -594,14 +594,27 @@ fn emit_with(
     // inside a quoted region), which the parallel driver recovers for free
     // instead of running a separate counting prepass.
     let carry_ret = if carry_count == 1 { "carries[0]" } else { "0" };
+    // Region dialects decode both entry carries out of the packed seed, the
+    // same convention the fused sink drivers use; their parallel index gets
+    // each chunk's entry state from the transfer-function composition rather
+    // than from the returned carry, which is why `carry_ret` is 0 for them.
+    let seeded_doc = if region_par {
+        "    /// Like `index_structurals` but seeded with the entry carries packed\n\
+         \x20   /// into one word (bit 0 line-start, bits 1.. region state) and an\n\
+         \x20   /// absolute base offset. The parallel driver resolves those carries\n\
+         \x20   /// ahead of time, so the return value is unused here."
+    } else {
+        "    /// Like `index_structurals` but seeded with the entry quote-parity carry\n\
+         \x20   /// and an absolute base offset; returns the *final* carry so the parallel\n\
+         \x20   /// driver can recover each chunk's quote parity without a counting prepass."
+    };
+    let seeded_init = cells_seed_init.clone();
     let seeded_kernel = |loads: &str, tail_loads: &str, attr: &str| {
         format!(
             r#"
-    /// Like `index_structurals` but seeded with the entry quote-parity carry
-    /// and an absolute base offset; returns the *final* carry so the parallel
-    /// driver can recover each chunk's quote parity without a counting prepass.
+{seeded_doc}
 {attr}    pub fn index_structurals_seeded(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {{
-{seed_init}        let mut offset = 0usize;
+{seeded_init}        let mut offset = 0usize;
         while offset + 64 <= data.len() {{
             {loads}
             push_indexes(mask, base + offset as u32, out);
@@ -619,7 +632,7 @@ fn emit_with(
 "#
         )
     };
-    let avx512_seeded = if par_mode {
+    let avx512_seeded = if par_mode || region_par {
         seeded_kernel(
             &format!(
                 "// SAFETY: offset + 64 <= data.len().\n            let mask = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};"
@@ -632,7 +645,7 @@ fn emit_with(
     } else {
         String::new()
     };
-    let avx2_seeded = if par_mode {
+    let avx2_seeded = if par_mode || region_par {
         seeded_kernel(
             &format!(
                 "// SAFETY: offset + 64 <= data.len().\n            let mask = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }}{sel};"
@@ -1267,66 +1280,14 @@ fn emit_with(
         } else {
             SPEC_PARSE_PAR
         };
+        let shared_index_par_helpers = SHARED_INDEX_PAR_HELPERS;
         format!(
             r#"
 {tape_part}
 
 {index_par_body}
 
-/// Append per-chunk index parts to `out`, copying each into its own disjoint
-/// slot concurrently. The previous single-threaded concat serialized an
-/// O(positions) copy and was the parallel scaling ceiling.
-fn scatter_u32(out: &mut Vec<u32>, parts: &[Vec<u32>]) {{
-    let total: usize = parts.iter().map(|p| p.len()).sum();
-    let start = out.len();
-    out.reserve(total);
-    {{
-        let mut rest = &mut out.spare_capacity_mut()[..total];
-        let mut slots: Vec<&mut [std::mem::MaybeUninit<u32>]> = Vec::with_capacity(parts.len());
-        for p in parts {{
-            let (head, tail) = rest.split_at_mut(p.len());
-            slots.push(head);
-            rest = tail;
-        }}
-        std::thread::scope(|s| {{
-            for (slot, part) in slots.into_iter().zip(parts.iter()) {{
-                s.spawn(move || {{
-                    // SAFETY: slot.len() == part.len(); the copy initializes
-                    // exactly this disjoint slice of `out`'s spare capacity.
-                    unsafe {{
-                        std::ptr::copy_nonoverlapping(
-                            part.as_ptr(),
-                            slot.as_mut_ptr().cast::<u32>(),
-                            part.len(),
-                        );
-                    }}
-                }});
-            }}
-        }});
-    }}
-    // SAFETY: the scatter initialized every element of spare[..total].
-    unsafe {{ out.set_len(start + total); }}
-}}
-
-fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {{
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vl")
-        && std::arch::is_x86_feature_detected!("pclmulqdq")
-    {{
-        // SAFETY: the required target features were just detected.
-        return unsafe {{ avx512::index_structurals_seeded(data, seed, base, out) }};
-    }}
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("pclmulqdq")
-    {{
-        // SAFETY: the required target features were just detected.
-        return unsafe {{ avx2::index_structurals_seeded(data, seed, base, out) }};
-    }}
-    unsupported_cpu()
-}}
+{shared_index_par_helpers}
 
 {parse_par_body}
 
@@ -1415,7 +1376,7 @@ fn index_tape_seeded_dispatch(data: &[u8], seed: u64, base: u32, seps: &mut Vec<
 "#
         )
     } else if region_par {
-        REGION_PARSE_PAR.to_string()
+        format!("{REGION_PARSE_PAR}\n{SHARED_INDEX_PAR_HELPERS}\n{REGION_INDEX_PAR}")
     } else {
         String::new()
     };
@@ -2745,6 +2706,132 @@ fn scatter_tape_into(parts: &[TapePart], mut seps: Vec<u32>, mut ends: Vec<u64>)
     (seps, ends)
 }
 "#;
+
+/// Helpers shared by every parallel structural-index driver: the
+/// concurrent per-chunk scatter and the seeded-kernel dispatch. Emitted
+/// once into whichever parallel block a dialect gets (parity or region).
+const SHARED_INDEX_PAR_HELPERS: &str = r#"/// Append per-chunk index parts to `out`, copying each into its own disjoint
+/// slot concurrently. The previous single-threaded concat serialized an
+/// O(positions) copy and was the parallel scaling ceiling.
+fn scatter_u32(out: &mut Vec<u32>, parts: &[Vec<u32>]) {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let start = out.len();
+    out.reserve(total);
+    {
+        let mut rest = &mut out.spare_capacity_mut()[..total];
+        let mut slots: Vec<&mut [std::mem::MaybeUninit<u32>]> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let (head, tail) = rest.split_at_mut(p.len());
+            slots.push(head);
+            rest = tail;
+        }
+        std::thread::scope(|s| {
+            for (slot, part) in slots.into_iter().zip(parts.iter()) {
+                s.spawn(move || {
+                    // SAFETY: slot.len() == part.len(); the copy initializes
+                    // exactly this disjoint slice of `out`'s spare capacity.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.as_ptr(),
+                            slot.as_mut_ptr().cast::<u32>(),
+                            part.len(),
+                        );
+                    }
+                });
+            }
+        });
+    }
+    // SAFETY: the scatter initialized every element of spare[..total].
+    unsafe { out.set_len(start + total); }
+}
+
+fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mut Vec<u32>) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx512::index_structurals_seeded(data, seed, base, out) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        return unsafe { avx2::index_structurals_seeded(data, seed, base, out) };
+    }
+    unsupported_cpu()
+}
+"#;
+
+/// Parallel structural indexing for comment+quote dialects: byte-identical to
+/// [`index_structurals`], split across `threads` chunks. A chunk's entry
+/// context here is a region (NORMAL/QUOTE/COMMENT), and the region machine is
+/// not XOR-linear — a quote can hide a comment-start and vice versa — so the
+/// speculative entry-parity scheme does not apply. This reuses `parse_par`'s
+/// three-phase transfer-function scheme instead: every chunk's region transfer
+/// function is computed in parallel, composed serially in O(threads), and each
+/// chunk is then indexed exactly once with its true entry carries. No chunk is
+/// ever indexed twice, regardless of how many boundaries land mid-quote or
+/// mid-comment.
+const REGION_INDEX_PAR: &str = r#"pub fn index_structurals_par(data: &[u8], threads: usize, out: &mut Vec<u32>) {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        index_structurals(data, out);
+        return;
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // Line-start carry entering a chunk: region independent, = whether the byte
+    // before it was a newline (CARRY_INIT at the file start).
+    let line_start = |b: usize| -> u64 {
+        if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }
+    };
+    // Phase 1 (parallel): each chunk's region transfer function.
+    let transfer: Vec<[u64; 3]> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let ls = line_start(bounds[t]);
+                s.spawn(move || {
+                    let mut states = [0u64, 1, 2];
+                    let mut c = [ls, 0];
+                    region_scan3_dispatch(slice, &mut c, &mut states);
+                    states
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("scan thread ok")).collect()
+    });
+    // Phase 2 (serial, O(threads)): compose to each chunk's entry state.
+    let mut entry = vec![0u64; threads];
+    let mut region = 0u64;
+    for t in 0..threads {
+        entry[t] = region;
+        region = transfer[t][region as usize];
+    }
+    // Phase 3 (parallel): index every chunk exactly once with its true carries.
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let base = bounds[t] as u32;
+                let seed = line_start(bounds[t]) | (entry[t] << 1);
+                s.spawn(move || {
+                    let mut part = Vec::with_capacity(slice.len() / 16 + 8);
+                    let _ = index_structurals_seeded_dispatch(slice, seed, base, &mut part);
+                    part
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("index thread ok")).collect()
+    });
+    scatter_u32(out, &parts);
+}"#;
 
 const SPEC_INDEX_PAR: &str = r#"/// Parallel structural indexing: byte-identical to [`index_structurals`],
 /// split across `threads` chunks. Each chunk is indexed speculatively as if

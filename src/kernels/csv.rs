@@ -210,6 +210,7 @@ fn index_structurals_seeded_dispatch(data: &[u8], seed: u64, base: u32, out: &mu
     unsupported_cpu()
 }
 
+
 /// Parallel [`parse`]: identical tape, built across `threads` chunks.
 pub fn parse_par(data: &[u8], threads: usize) -> Parsed<'_> {
     let threads = threads.max(1).min(data.len() / 64 + 1);

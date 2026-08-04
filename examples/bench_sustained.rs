@@ -423,10 +423,24 @@ fn bench_csv_hash(data: &[u8], options: &Options) {
 
     // Structural indexing — the row where the `Regions` resolver runs. Falx-only
     // (no comparable library produces a structural index of quoted CSV).
-    let index_rows = vec![Row {
-        label: "falx index_structurals".into(),
-        measurement: bench_indexer(data, options, falx::kernels::csv_hash::index_structurals),
-    }];
+    let index_rows = vec![
+        Row {
+            label: "falx index_structurals".into(),
+            measurement: bench_indexer(data, options, falx::kernels::csv_hash::index_structurals),
+        },
+        Row {
+            label: format!("falx index_structurals_par x{threads}"),
+            measurement: {
+                let mut out = Vec::with_capacity(data.len() / 16);
+                measure(options, || {
+                    out.clear();
+                    falx::kernels::csv_hash::index_structurals_par(data, threads, &mut out);
+                    out.len() as u64
+                })
+            },
+        },
+    ];
+    assert_same_work("csv_hash", "index", &index_rows);
     report(
         "csv_hash structural indexing (# comments + quotes)",
         data.len(),
