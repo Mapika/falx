@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 
 use crate::codegen::{Column, ColumnType};
 use crate::formats::{Dialect, Escape};
-use crate::framing::{Counts, Endian, Framing, Width};
+use crate::framing::{Counts, Endian, Framing, SizeField, Width};
 use crate::ir::{CharClass, Graph, NodeId, Op};
 
 /// Version of the textual IR this build reads and writes.
@@ -144,6 +144,18 @@ pub fn print(module: &Module) -> String {
         );
         if let Some((offset, bytes)) = &f.magic {
             let _ = write!(out, " magic={offset}:{}", print_bytes(bytes));
+        }
+        if let Some(size) = &f.uncompressed {
+            let _ = write!(
+                out,
+                " uncompressed={}:{}:{}",
+                size.at,
+                size.width.as_str(),
+                match size.endian {
+                    Endian::Le => "le",
+                    Endian::Be => "be",
+                }
+            );
         }
         if f.skip_empty {
             let _ = write!(out, " skip-empty=true");
@@ -418,6 +430,7 @@ pub fn parse(text: &str) -> Result<Module, IrError> {
                 let mut trailer = 0usize;
                 let mut magic = None;
                 let mut skip_empty = false;
+                let mut uncompressed = None;
                 for field in words {
                     let (key, value) = field.split_once('=').ok_or_else(|| {
                         err(lineno, format!("`frame` field `{field}` needs key=value"))
@@ -484,6 +497,42 @@ pub fn parse(text: &str) -> Result<Module, IrError> {
                                 .map_err(|_| err(lineno, "`magic` offset must be a number"))?;
                             magic = Some((offset, parse_byte_list(bytes, lineno)?));
                         }
+                        "uncompressed" => {
+                            let mut parts = value.split(':');
+                            let at: i64 =
+                                parts.next().and_then(|p| p.parse().ok()).ok_or_else(|| {
+                                    err(
+                                        lineno,
+                                        "`uncompressed` looks like <offset>:<width>:<endian>",
+                                    )
+                                })?;
+                            let width = match parts.next() {
+                                Some("u8") => Width::U8,
+                                Some("u16") => Width::U16,
+                                Some("u32") => Width::U32,
+                                Some("u64") => Width::U64,
+                                other => {
+                                    return Err(err(
+                                        lineno,
+                                        format!(
+                                            "`uncompressed` width must be u8/u16/u32/u64, got `{}`",
+                                            other.unwrap_or("nothing")
+                                        ),
+                                    ));
+                                }
+                            };
+                            let endian = match parts.next() {
+                                Some("le") | None => Endian::Le,
+                                Some("be") => Endian::Be,
+                                Some(other) => {
+                                    return Err(err(
+                                        lineno,
+                                        format!("unknown endianness `{other}`"),
+                                    ));
+                                }
+                            };
+                            uncompressed = Some(SizeField { at, width, endian });
+                        }
                         "skip-empty" => skip_empty = value == "true",
                         other => {
                             return Err(err(lineno, format!("unknown `frame` field `{other}`")));
@@ -500,6 +549,7 @@ pub fn parse(text: &str) -> Result<Module, IrError> {
                     trailer,
                     magic,
                     skip_empty,
+                    uncompressed,
                 });
             }
             "output" => output = Some(parse_ref(words.next(), next_node, lineno)?),

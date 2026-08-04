@@ -145,6 +145,13 @@ frame header=18 length-at=16 width=u16 endian=le counts=total adjust=1 trailer=8
 | `trailer` | Bytes at the end of the frame that are not payload (bgzf's CRC32 + ISIZE). |
 | `magic` | `<offset>:<hex bytes>` that must match, else the frame is rejected. |
 | `skip-empty` | `true` drops frames whose payload is empty. |
+| `uncompressed` | `<offset>:<width>:<endian>` — where the frame records its *uncompressed* payload size. A non-negative offset counts from the frame start, negative from the frame end, so bgzf's trailing `ISIZE` is `-4:u32:le`. |
+
+`uncompressed` is what makes parallel decompression possible: knowing every
+block's inflated length up front lets the output be presized once and carved
+into disjoint slots, so workers inflate concurrently with no locking and no
+merge pass. Without it a decompressor has to grow buffers sequentially, and
+falx refuses rather than guessing.
 
 A module with framing additionally generates:
 
@@ -161,11 +168,34 @@ to workers and returns their states in stream order. This is the shape
 it: `tests/framing.rs` asserts the generalized scanner finds exactly the block
 boundaries and payload ranges the hand-written bgzf scanner does.
 
-**What this does not do.** falx locates frames; it does not decode entropy-coded
-payloads. For a block-compressed container the flow is: `scan_frames` →
-your decompressor → the generated payload parser. Formats whose *payload*
-grammar is not a structural byte stream (Parquet's encoded column chunks, say)
-are framed by this layer but not parsed by the bitstream graph.
+**With a decompressor.** falx does not decode entropy-coded payloads, but the
+`bgzf` feature wires the framing layer to its DEFLATE core, so a described
+container can be decompressed and parsed without hand-written code:
+
+```rust
+// Locate blocks by description, inflate them in parallel.
+let bytes = falx::bgzf::decompress_framed_par(&data, &framing, threads)?;
+
+// Or fuse: inflate into a reusable per-worker buffer and parse each block,
+// never materializing the whole stream.
+let states = falx::bgzf::parse_framed_par(&data, &framing, threads,
+    || MyState::default(),
+    |state, _block_index, decompressed| state.absorb(parse_columns(decompressed)),
+)?;
+```
+
+On 0.5 GiB of bgzf-compressed CSV at 24 threads, the fused form runs at
+**~35 GiB/s** of uncompressed throughput against ~6.9 GiB/s for
+decompress-then-parse — the gain is not the parsing, it is never writing a
+whole-stream buffer. `decompress_framed_par` and the hand-written
+`decompress_par` are equivalent in throughput and byte-identical in output.
+
+Records that span a block boundary are the caller's concern: these deliver
+block payloads, not records.
+
+**What this does not do.** Formats whose *payload* grammar is not a structural
+byte stream (Parquet's encoded column chunks, say) are framed by this layer but
+not parsed by the bitstream graph.
 
 ### Roles
 

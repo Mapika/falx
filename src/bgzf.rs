@@ -241,6 +241,156 @@ pub fn decompress_par(data: &[u8], threads: usize) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+// --- framing-driven entry points -------------------------------------------
+//
+// The functions above are specific to bgzf: `scan` knows the gzip member
+// layout and walks the extra field to find `BSIZE` wherever it sits. The ones
+// below take a [`crate::framing::Framing`] descriptor instead, so any
+// block-compressed container whose blocks are raw DEFLATE can be decompressed
+// in parallel from a description rather than hand-written code — the framing
+// layer locates the blocks, this module inflates them.
+//
+// The descriptor must declare where each frame records its uncompressed size
+// (bgzf's `ISIZE`). That is what makes the parallelism possible: with every
+// block's inflated length known up front, the output is presized once and
+// carved into disjoint slots, so workers never lock and nothing is merged
+// afterwards.
+
+/// Locate blocks with `framing` in a single pass.
+///
+/// Frames are converted and empty ones dropped as they are found, rather than
+/// materializing a `Vec<Frame>` and mapping it: a `Frame` is twice the size of
+/// a `Block`, and the intermediate vector cost a measurable few percent on
+/// whole-stream decompression.
+fn scan_blocks(data: &[u8], framing: &crate::framing::Framing) -> io::Result<Vec<Block>> {
+    let mut blocks = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let frame = crate::framing::frame_at(framing, data, pos)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e.0))?;
+        pos = frame.start + frame.len;
+        let isize = frame.uncompressed.ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "framing must declare `uncompressed` to decompress in parallel",
+            )
+        })?;
+        // An empty member (the bgzf EOF marker) inflates to nothing and would
+        // only complicate the slot carving.
+        if isize > 0 {
+            blocks.push(Block {
+                payload: frame.payload,
+                isize,
+            });
+        }
+    }
+    Ok(blocks)
+}
+
+/// Locate blocks with `framing`, then decompress the whole stream across
+/// `threads` workers.
+///
+/// The framing-described counterpart of [`decompress_par`]. For canonical bgzf
+/// the two agree byte for byte, which is what `tests/framing.rs` checks.
+pub fn decompress_framed_par(
+    data: &[u8],
+    framing: &crate::framing::Framing,
+    threads: usize,
+) -> io::Result<Vec<u8>> {
+    let blocks = scan_blocks(data, framing)?;
+    let threads = threads.max(1).min(blocks.len().max(1));
+    let mut out = vec![0u8; span(&blocks)];
+    if threads == 1 || blocks.len() <= 1 {
+        inflate_blocks_into(data, &blocks, &mut out)?;
+        return Ok(out);
+    }
+    let per = blocks.len().div_ceil(threads);
+    let groups: Vec<&[Block]> = blocks.chunks(per).collect();
+    let mut slots: Vec<&mut [u8]> = Vec::with_capacity(groups.len());
+    let mut rest = out.as_mut_slice();
+    for g in &groups {
+        let (head, tail) = rest.split_at_mut(span(g));
+        slots.push(head);
+        rest = tail;
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = groups
+            .into_iter()
+            .zip(slots)
+            .map(|(group, slot)| s.spawn(move || inflate_blocks_into(data, group, slot)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("bgzf worker panicked"))
+            .collect::<io::Result<Vec<()>>>()
+    })?;
+    Ok(out)
+}
+
+/// Locate blocks with `framing` and stream their decompressed bytes to
+/// `process`, across `threads` workers, without materializing one full output
+/// buffer.
+///
+/// This is the end-to-end compressed-container path: framing finds the blocks,
+/// this inflates them into a reusable per-worker scratch buffer, and `process`
+/// runs a parser over each decompressed block. Blocks are delivered in stream
+/// order *within* a worker, and the returned states are ordered by input
+/// position, so callers can concatenate or reduce them in stream order.
+///
+/// Records that span a block boundary are the caller's concern — as with
+/// [`process_blocks_par`], this delivers block payloads, not records.
+pub fn parse_framed_par<S, Init, F>(
+    data: &[u8],
+    framing: &crate::framing::Framing,
+    threads: usize,
+    init: Init,
+    process: F,
+) -> io::Result<Vec<S>>
+where
+    S: Send,
+    Init: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, &[u8]) + Sync,
+{
+    let blocks = scan_blocks(data, framing)?;
+    let threads = threads.max(1).min(blocks.len().max(1));
+    if blocks.is_empty() {
+        return Ok(vec![init()]);
+    }
+    let per = blocks.len().div_ceil(threads);
+    let groups: Vec<(usize, &[Block])> = blocks
+        .chunks(per)
+        .enumerate()
+        .map(|(i, g)| (i * per, g))
+        .collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = groups
+            .into_iter()
+            .map(|(first_index, group)| {
+                let init = &init;
+                let process = &process;
+                s.spawn(move || -> io::Result<S> {
+                    let mut backend = InflateBackend::new();
+                    let mut state = init();
+                    // One scratch buffer per worker, sized to its largest
+                    // block, so inflation allocates once rather than per block.
+                    let widest = group.iter().map(|b| b.isize).max().unwrap_or(0);
+                    let mut scratch = vec![0u8; widest];
+                    for (i, block) in group.iter().enumerate() {
+                        let out = &mut scratch[..block.isize];
+                        backend.inflate_one(&data[block.payload.clone()], out)?;
+                        process(&mut state, first_index + i, out);
+                    }
+                    Ok(state)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("bgzf worker panicked"))
+            .collect::<io::Result<Vec<S>>>()
+    })
+}
+
 /// Process a bgzf stream block-by-block across `threads` workers without
 /// materializing one full decompressed output buffer.
 ///

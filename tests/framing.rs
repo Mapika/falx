@@ -107,6 +107,7 @@ fn varint_framing_walks_a_length_delimited_stream() {
         trailer: 0,
         magic: None,
         skip_empty: false,
+        uncompressed: None,
     };
     // Payload lengths spanning the 1-byte/2-byte varint boundary (128).
     let lengths = [0usize, 1, 5, 127, 128, 300];
@@ -152,6 +153,7 @@ fn big_endian_payload_counted_framing() {
         trailer: 2,
         magic: None,
         skip_empty: false,
+        uncompressed: None,
     };
     let mut data = Vec::new();
     for payload in [b"abc".as_slice(), b"".as_slice(), b"defgh".as_slice()] {
@@ -179,6 +181,7 @@ fn skip_empty_drops_empty_payloads() {
         trailer: 0,
         magic: None,
         skip_empty: false,
+        uncompressed: None,
     };
     let mut data = Vec::new();
     for payload in [b"ab".as_slice(), b"".as_slice(), b"cd".as_slice()] {
@@ -243,6 +246,7 @@ fn malformed_framing_is_rejected() {
         trailer: 0,
         magic: None,
         skip_empty: false,
+        uncompressed: None,
     };
     assert!(
         framing::scan(&runaway, &[0x80, 0x80, 0x80]).is_err(),
@@ -258,7 +262,7 @@ fn framing_round_trips_through_textual_ir_and_generates_code() {
 falx-ir 1
 format bgzf_container
 structural 0a
-frame header=18 length-at=16 width=u16 endian=le counts=total adjust=1 trailer=8 magic=0:1f,8b
+frame header=18 length-at=16 width=u16 endian=le counts=total adjust=1 trailer=8 magic=0:1f,8b uncompressed=-4:u32:le
 %0 = class 0a
 output %0
 terminators %0
@@ -320,4 +324,144 @@ terminators %0
         falx::codegen::emit_module(&module).is_err(),
         "a length field outside the header should be rejected at emit time"
     );
+}
+
+/// Decompression driven by the framing descriptor must agree byte-for-byte
+/// with the hand-written bgzf path. This is the end-to-end check that the
+/// generalized container model can actually drive a real decompressor.
+#[cfg(feature = "bgzf")]
+#[test]
+fn framing_driven_decompression_matches_handwritten_bgzf() {
+    let payloads: Vec<Vec<u8>> = (0..97)
+        .map(|i| format!("row {i},{},{}\n", i * 3, "payload".repeat(i % 11)).into_bytes())
+        .collect();
+    let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let data = build_bgzf(&refs);
+    let expected: Vec<u8> = payloads.concat();
+
+    for threads in [1usize, 2, 4, 16] {
+        let handwritten = falx::bgzf::decompress_par(&data, threads).expect("hand-written path");
+        let framed = falx::bgzf::decompress_framed_par(&data, &bgzf(), threads)
+            .expect("framing-driven path");
+        assert_eq!(
+            handwritten, expected,
+            "hand-written decompression lost data at {threads} threads"
+        );
+        assert_eq!(
+            framed, handwritten,
+            "framing-driven decompression differs from the hand-written path at {threads} threads"
+        );
+    }
+}
+
+/// The full compressed-container pipeline: framing locates blocks, bgzf
+/// inflates them in parallel, and a generated payload parser runs over each
+/// decompressed block. This is the path the framing layer exists to enable.
+///
+/// The result is checked against decompress-then-parse of the whole stream —
+/// two independent routes to the same answer. `latitude_checksum` is a
+/// wrapping sum of f64 bit patterns, so it is additive across blocks and the
+/// comparison is exact rather than approximate.
+#[cfg(feature = "bgzf")]
+#[test]
+fn compressed_container_feeds_a_generated_payload_parser() {
+    // CSV payload split on record boundaries, so no record spans a block
+    // (block-spanning records are the caller's concern, as documented).
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut expected_rows = 0usize;
+    for block in 0..40 {
+        let mut chunk = Vec::new();
+        for row in 0..25 {
+            let lat = (block * 25 + row) as f64 / 8.0;
+            chunk.extend_from_slice(
+                format!("cc,city{row},accent,region,999,{lat:.6},-1.500000\n").as_bytes(),
+            );
+            expected_rows += 1;
+        }
+        chunks.push(chunk);
+    }
+    let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+    let data = build_bgzf(&refs);
+
+    // Route A: inflate + parse each block in parallel.
+    let states = falx::bgzf::parse_framed_par(
+        &data,
+        &bgzf(),
+        8,
+        || (0u64, 0u64),
+        |state, _index, block| {
+            let stats = falx::kernels::csv_geo::parse_csv_geo_stats(block);
+            state.0 += stats.records;
+            state.1 = state.1.wrapping_add(stats.latitude_checksum);
+        },
+    )
+    .expect("framed parse");
+    let rows: u64 = states.iter().map(|s| s.0).sum();
+    let checksum: u64 = states.iter().fold(0u64, |acc, s| acc.wrapping_add(s.1));
+
+    // Route B: decompress the whole stream, then parse it once.
+    let whole = falx::bgzf::decompress_framed_par(&data, &bgzf(), 8).expect("decompress");
+    let direct = falx::kernels::csv_geo::parse_csv_geo_stats(&whole);
+
+    assert_eq!(
+        rows as usize, expected_rows,
+        "row count through the compressed pipeline"
+    );
+    assert_eq!(
+        direct.records as usize, expected_rows,
+        "row count via decompress-then-parse"
+    );
+    assert_eq!(
+        checksum, direct.latitude_checksum,
+        "the streamed and decompress-then-parse routes disagree"
+    );
+}
+
+/// Framing without an `uncompressed` declaration cannot drive parallel
+/// decompression — there is no way to presize the output — and must say so
+/// rather than guessing.
+#[cfg(feature = "bgzf")]
+#[test]
+fn decompression_requires_a_declared_uncompressed_size() {
+    let data = build_bgzf(&[b"hello"]);
+    let without = Framing {
+        uncompressed: None,
+        ..bgzf()
+    };
+    assert!(
+        falx::bgzf::decompress_framed_par(&data, &without, 4).is_err(),
+        "decompression without a declared uncompressed size should be refused"
+    );
+}
+
+/// The uncompressed-size field decodes correctly and survives the IR round trip.
+#[test]
+fn uncompressed_size_field_decodes_and_round_trips() {
+    let payloads: [&[u8]; 3] = [b"a", b"bbbb", b"cc"];
+    let data = build_bgzf(&payloads);
+    let frames = framing::scan(&bgzf(), &data).expect("scan");
+    let sizes: Vec<usize> = frames
+        .iter()
+        .map(|f| f.uncompressed.expect("isize"))
+        .collect();
+    assert_eq!(sizes, vec![1, 4, 2], "decoded ISIZE per block");
+
+    let text = "\
+falx-ir 1
+format framed
+structural 0a
+frame header=18 length-at=16 width=u16 endian=le counts=total adjust=1 trailer=8 magic=0:1f,8b uncompressed=-4:u32:le
+%0 = class 0a
+output %0
+terminators %0
+";
+    let module = falx::ir_text::parse(text).expect("parse");
+    assert_eq!(
+        module.framing.as_ref().unwrap().uncompressed,
+        bgzf().uncompressed
+    );
+    let printed = falx::ir_text::print(&module);
+    assert!(printed.contains("uncompressed=-4:u32:le"));
+    let reparsed = falx::ir_text::parse(&printed).expect("reparse");
+    assert_eq!(reparsed.framing, module.framing);
 }

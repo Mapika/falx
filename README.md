@@ -353,8 +353,22 @@ asserts the generalized scanner finds exactly the block boundaries and payload
 ranges `falx::bgzf::scan` does, and that frames tile the input with no gap or
 overlap.
 
-falx locates frames; it does not decode entropy-coded payloads. A compressed
-container is `scan_frames` → your decompressor → the generated payload parser.
+falx does not decode entropy-coded payloads itself, but the `bgzf` feature
+wires the framing layer to its DEFLATE core, so a *described* container is
+decompressed and parsed without hand-written code:
+
+```rust
+let bytes  = falx::bgzf::decompress_framed_par(&data, &framing, threads)?;
+let states = falx::bgzf::parse_framed_par(&data, &framing, threads, init, process)?;
+```
+
+`parse_framed_par` inflates into a reusable per-worker buffer and parses each
+block in the same pass. On 0.5 GiB of bgzf-compressed CSV at 24 threads that
+runs at **~35 GiB/s** of uncompressed throughput against ~6.9 GiB/s for
+decompress-then-parse — the win is never writing a whole-stream buffer, not the
+parsing. Byte-identical to the hand-written path, and equivalent to it in
+throughput (`cargo run --release --features bgzf-libdeflate --example
+bgzf_framed_bench`).
 
 Reference: [`docs/ir.md`](docs/ir.md) for the IR, [`docs/spec.md`](docs/spec.md)
 for the spec format.

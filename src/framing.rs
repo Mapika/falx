@@ -75,6 +75,23 @@ pub enum Counts {
     Payload,
 }
 
+/// Where a frame records its *uncompressed* payload size.
+///
+/// Block-compressed containers usually carry this (bgzf's `ISIZE`), and it is
+/// what makes parallel decompression possible: knowing every block's inflated
+/// size up front lets the output be presized once and carved into disjoint
+/// slots, so workers inflate concurrently with no locking and no merge pass.
+/// Without it a decompressor has to grow buffers sequentially.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SizeField {
+    /// Offset of the field. Non-negative counts from the frame start;
+    /// negative counts back from the frame end, so bgzf's trailing `ISIZE`
+    /// is `-4`.
+    pub at: i64,
+    pub width: Width,
+    pub endian: Endian,
+}
+
 /// How a stream is divided into length-prefixed frames.
 ///
 /// The canonical bgzf block is
@@ -101,6 +118,8 @@ pub struct Framing {
     pub magic: Option<(usize, Vec<u8>)>,
     /// Drop frames whose payload is empty.
     pub skip_empty: bool,
+    /// Where the frame records its uncompressed payload size, if it does.
+    pub uncompressed: Option<SizeField>,
 }
 
 /// One located frame: its extent in the input and the payload within it.
@@ -112,6 +131,8 @@ pub struct Frame {
     pub len: usize,
     /// The payload's range in the input.
     pub payload: Range<usize>,
+    /// Decoded uncompressed payload size, when the framing declares one.
+    pub uncompressed: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -242,10 +263,61 @@ pub fn frame_at(framing: &Framing, data: &[u8], pos: usize) -> Result<Frame, Fra
         )));
     }
 
+    let uncompressed = match framing.uncompressed {
+        Some(field) => Some(read_size_field(&field, data, pos, len)?),
+        None => None,
+    };
+
     Ok(Frame {
         start: pos,
         len,
         payload: pos + payload_start..pos + len - framing.trailer,
+        uncompressed,
+    })
+}
+
+/// Read a size field relative to a located frame.
+fn read_size_field(
+    field: &SizeField,
+    data: &[u8],
+    pos: usize,
+    len: usize,
+) -> Result<usize, FramingError> {
+    let size = field
+        .width
+        .fixed_size()
+        .ok_or_else(|| FramingError("a size field cannot be varint-encoded".into()))?;
+    let from = if field.at >= 0 {
+        pos + field.at as usize
+    } else {
+        let back = field.at.unsigned_abs() as usize;
+        if back > len {
+            return Err(FramingError(format!(
+                "size field at {} lies before the frame at offset {pos}",
+                field.at
+            )));
+        }
+        pos + len - back
+    };
+    let to = from + size;
+    // The frame's extent was already validated against the input, so the only
+    // way to land outside it is a size field declared out of range.
+    if to > pos + len || to > data.len() {
+        return Err(FramingError(format!(
+            "size field at {} lies outside the frame at offset {pos}",
+            field.at
+        )));
+    }
+    let mut buf = [0u8; 8];
+    Ok(match field.endian {
+        Endian::Le => {
+            buf[..size].copy_from_slice(&data[from..to]);
+            u64::from_le_bytes(buf) as usize
+        }
+        Endian::Be => {
+            buf[8 - size..].copy_from_slice(&data[from..to]);
+            u64::from_be_bytes(buf) as usize
+        }
     })
 }
 
@@ -267,5 +339,11 @@ pub fn bgzf_framing() -> Framing {
         trailer: 8,
         magic: Some((0, vec![0x1f, 0x8b])),
         skip_empty: false,
+        // ISIZE: the last four bytes of the block.
+        uncompressed: Some(SizeField {
+            at: -4,
+            width: Width::U32,
+            endian: Endian::Le,
+        }),
     }
 }
