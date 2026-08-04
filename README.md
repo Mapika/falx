@@ -62,6 +62,7 @@ ratios are hardware-independent falx improvements:
 
 | Lane | falx before | falx after | Delta |
 |---|---:|---:|---:|
+| csv_hash (`#` comments + quotes) typed columns, chunked | 1.55 GiB/s serial-only | 16.11 GiB/s | 10.4x |
 | CSV City + Latitude/Longitude materialization, parallel | 5.13 GiB/s | 16.03 GiB/s | 3.1x |
 | CSV Latitude/Longitude materialization, parallel | 9.36 GiB/s | 17.57 GiB/s | 1.9x |
 | CSV City + Latitude/Longitude materialization, serial | 0.99 GiB/s | 1.32 GiB/s | +34% |
@@ -73,8 +74,20 @@ ratios are hardware-independent falx improvements:
 Same-box context: the `csv` crate materializes the same columns at 0.42 GiB/s
 and `arrow-csv` at 0.53 GiB/s, checksum-identical to falx on every lane.
 
+The csv_hash row is a new capability rather than a tuning win: comment+quote
+dialects previously had no fused parallel projection at all, because a chunk's
+entry context there is a region (NORMAL/QUOTE/COMMENT) that no parity prefix can
+recover — a `"` can hide a `#` and vice versa. They now reach the same fused
+sinks through the three-phase transfer-function scheme `parse_par` already used
+(each chunk's region transfer function computed in parallel, composed serially
+in O(threads), then one seeded pass per chunk), so no chunk is parsed twice. At
+96 threads that lane reaches 61.97 GiB/s.
+
 What changed (all in the code generator; kernels regenerated):
 
+- comment+quote dialects gain `parse_columns_par` /
+  `parse_columns_chunks_par` via the region transfer-function scheme; their
+  fused sink drivers take both entry carries packed into one seed
 - fixed-shape decimal cells (`[-]d{1,3}.d{6}`) parse via one unaligned load and
   a SWAR all-digits test instead of digit-at-a-time branching, with the sign
   applied by ORing the sign bit (nonnegative mantissa) — random-sign data was

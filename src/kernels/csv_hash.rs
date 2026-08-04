@@ -1065,11 +1065,11 @@ pub fn string_at<'b>(offsets: &[i32], data: &'b [u8], row: usize) -> &'b [u8] {
 /// built and only the declared columns' bytes are ever inspected.
 pub fn parse_columns(data: &[u8]) -> Columns<'_> {
     let mut sink = ColumnSink::new(data, 0, data.len() as u32, true);
-    index_cells_dispatch(data, &mut sink);
+    index_cells_dispatch(data, CARRY_INIT[0] | (CARRY_INIT[1] << 1), 0, &mut sink);
     sink.finish()
 }
 
-fn index_cells_dispatch(data: &[u8], sink: &mut ColumnSink) {
+fn index_cells_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut ColumnSink) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -1079,7 +1079,7 @@ fn index_cells_dispatch(data: &[u8], sink: &mut ColumnSink) {
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx512::index_cells_compress(data, sink) };
+        unsafe { avx512::index_cells_compress(data, seed, start, sink) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -1089,7 +1089,7 @@ fn index_cells_dispatch(data: &[u8], sink: &mut ColumnSink) {
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx512::index_cells(data, sink) };
+        unsafe { avx512::index_cells(data, seed, start, sink) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -1097,7 +1097,7 @@ fn index_cells_dispatch(data: &[u8], sink: &mut ColumnSink) {
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { avx2::index_cells(data, sink) };
+        unsafe { avx2::index_cells(data, seed, start, sink) };
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -1105,10 +1105,193 @@ fn index_cells_dispatch(data: &[u8], sink: &mut ColumnSink) {
         && std::arch::is_aarch64_feature_detected!("aes")
     {
         // SAFETY: the required target features were just detected.
-        unsafe { neon::index_cells(data, sink) };
+        unsafe { neon::index_cells(data, seed, start, sink) };
         return;
     }
     unsupported_cpu();
+}
+
+/// Parallel [`parse_columns`] without a final concatenation pass.
+/// Records are assigned to workers by terminator ownership — worker
+/// t skips to the first record boundary at or past its chunk start,
+/// and finishes the record it is mid-way through at chunk end — so
+/// every record is converted exactly once, with no tape built.
+/// Region context (NORMAL/QUOTE/COMMENT) is resolved by the same
+/// three-phase transfer-function scheme [`parse_par`] uses, so no
+/// chunk is ever parsed twice. Returned chunks are in input order.
+pub fn parse_columns_chunks_par(data: &[u8], threads: usize) -> Vec<Columns<'_>> {
+    let threads = threads.max(1).min(data.len() / 64 + 1);
+    let chunk = (data.len() / threads + 63) & !63;
+    if threads == 1 || chunk == 0 {
+        return vec![parse_columns(data)];
+    }
+    let bounds: Vec<usize> = (0..=threads)
+        .map(|t| if t == threads { data.len() } else { (t * chunk).min(data.len()) })
+        .collect();
+    // Line-start carry entering a chunk: region independent, = whether
+    // the byte before it was a newline (CARRY_INIT at the file start).
+    let line_start = |b: usize| -> u64 {
+        if b == 0 { CARRY_INIT[0] } else { (data[b - 1] == 10u8) as u64 }
+    };
+    // Phase 1 (parallel): each chunk's region transfer function.
+    let transfer: Vec<[u64; 3]> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let slice = &data[bounds[t]..bounds[t + 1]];
+                let ls = line_start(bounds[t]);
+                s.spawn(move || {
+                    let mut states = [0u64, 1, 2];
+                    let mut c = [ls, 0];
+                    region_scan3_dispatch(slice, &mut c, &mut states);
+                    states
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("scan thread ok")).collect()
+    });
+    // Phase 2 (serial, O(threads)): compose to each chunk's entry state.
+    let mut entry = vec![0u64; threads];
+    let mut region = 0u64;
+    for t in 0..threads {
+        entry[t] = region;
+        region = transfer[t][region as usize];
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (start, end) = (bounds[t], bounds[t + 1]);
+                let entry = &entry;
+                s.spawn(move || {
+                    // Phase 3: both entry carries packed into one seed.
+                    let seed = line_start(start) | (entry[t] << 1);
+                    let mut sink = ColumnSink::new(data, start as u32, end as u32, t == 0);
+                    index_cells_dispatch(data, seed, start, &mut sink);
+                    sink.finish()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("columns thread ok")).collect()
+    })
+}
+
+/// Parallel [`parse_columns`]: parses independent worker chunks, then
+/// scatters them into the legacy single-`Columns` layout concurrently.
+/// Destination buffers are exact-sized up front and carved into one
+/// disjoint uninitialized slice per part, so every worker copies (and
+/// rebases string offsets) in parallel; only the validity bitmaps —
+/// rows/8 bytes, bit-shifted across each seam — join serially.
+/// Use [`parse_columns_chunks_par`] when chunked table output is
+/// acceptable and even the parallel copy would dominate runtime.
+pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
+    let parts = parse_columns_chunks_par(data, threads);
+    if parts.len() == 1 {
+        return parts.into_iter().next().expect("one columns chunk");
+    }
+    let rows_total: usize = parts.iter().map(|p| p.rows).sum();
+    let mut cols = Columns::with_capacity(data, rows_total);
+    let key_total: usize = parts.iter().map(|p| p.key_data.len()).sum();
+    assert!(
+        key_total <= i32::MAX as usize,
+        "string column 'key' exceeds the 2 GiB Arrow i32-offset limit"
+    );
+    cols.key_data.reserve(key_total);
+    cols.key_offsets.reserve(rows_total);
+    cols.amount.reserve(rows_total);
+    {
+        let mut key_data_rest =
+            &mut cols.key_data.spare_capacity_mut()[..key_total];
+        let mut key_data_slots: Vec<&mut [std::mem::MaybeUninit<u8>]> =
+            Vec::with_capacity(parts.len());
+        let mut key_offsets_rest =
+            &mut cols.key_offsets.spare_capacity_mut()[..rows_total];
+        let mut key_offsets_slots: Vec<&mut [std::mem::MaybeUninit<i32>]> =
+            Vec::with_capacity(parts.len());
+        let mut amount_rest = &mut cols.amount.spare_capacity_mut()[..rows_total];
+        let mut amount_slots: Vec<&mut [std::mem::MaybeUninit<i64>]> =
+            Vec::with_capacity(parts.len());
+        for part in &parts {
+            assert_eq!(part.key_offsets.len(), part.rows + 1, "one offset per row");
+            let (head, tail) = key_data_rest.split_at_mut(part.key_data.len());
+            key_data_slots.push(head);
+            key_data_rest = tail;
+            let (head, tail) = key_offsets_rest.split_at_mut(part.rows);
+            key_offsets_slots.push(head);
+            key_offsets_rest = tail;
+            assert_eq!(part.amount.len(), part.rows, "one cell per row");
+            let (head, tail) = amount_rest.split_at_mut(part.rows);
+            amount_slots.push(head);
+            amount_rest = tail;
+        }
+        std::thread::scope(|s| {
+            let mut key_data_slots = key_data_slots.into_iter();
+            let mut key_offsets_slots = key_offsets_slots.into_iter();
+            let mut key_base = 0usize;
+            let mut amount_slots = amount_slots.into_iter();
+            for part in &parts {
+                let key_data_slot = key_data_slots.next().expect("slot per part");
+                let key_offsets_slot = key_offsets_slots.next().expect("slot per part");
+                let key_rebase = key_base as i32;
+                key_base += part.key_data.len();
+                let amount_slot = amount_slots.next().expect("slot per part");
+                s.spawn(move || {
+                    // SAFETY: the slot is this part's disjoint slice of spare
+                    // capacity, split to exactly the source length; the copy
+                    // initializes every element.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.key_data.as_ptr(),
+                            key_data_slot.as_mut_ptr().cast::<u8>(),
+                            part.key_data.len(),
+                        );
+                    }
+                    for (dst, &o) in key_offsets_slot.iter_mut().zip(&part.key_offsets[1..]) {
+                        dst.write(o + key_rebase);
+                    }
+                    // SAFETY: disjoint slot of spare capacity, exact length.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.amount.as_ptr(),
+                            amount_slot.as_mut_ptr().cast::<i64>(),
+                            part.amount.len(),
+                        );
+                    }
+                });
+            }
+        });
+    }
+    // SAFETY: the scatter initialized every element reserved above.
+    unsafe {
+        cols.key_data.set_len(key_total);
+        cols.key_offsets.set_len(1 + rows_total);
+        cols.amount.set_len(rows_total);
+    }
+    // Validity bitmaps are rows/8 bytes; the serial bit-shift join
+    // is noise next to the scattered column copies above.
+    let mut rows_done = 0usize;
+    for part in &parts {
+        append_bitmap(&mut cols.key_valid, rows_done, &part.key_valid, part.rows);
+        append_bitmap(&mut cols.amount_valid, rows_done, &part.amount_valid, part.rows);
+        rows_done += part.rows;
+    }
+    cols.rows = rows_total;
+    cols
+}
+
+/// Append `src_rows` bits of `src` onto a bitmap currently holding
+/// `dst_rows` bits. Bits past each bitmap's row count are zero, an
+/// invariant `push_row` maintains and this function preserves.
+fn append_bitmap(dst: &mut Vec<u64>, dst_rows: usize, src: &[u64], src_rows: usize) {
+    let words = src_rows.div_ceil(64);
+    let shift = dst_rows & 63;
+    if shift == 0 {
+        dst.extend_from_slice(&src[..words]);
+    } else {
+        for &word in &src[..words] {
+            *dst.last_mut().expect("non-aligned dst has a partial word") |= word << shift;
+            dst.push(word >> (64 - shift));
+        }
+        dst.truncate((dst_rows + src_rows).div_ceil(64));
+    }
 }
 
 /// Parse an integer cell with the exact acceptance rules of
@@ -1358,11 +1541,13 @@ mod avx512 {
     }
 
     /// Fused projection driver: structural masks go straight into the
-    /// column sink; no tape is materialized.
+    /// column sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
-    pub(crate) fn index_cells(data: &[u8], sink: &mut super::ColumnSink) {
-        let mut carries = super::CARRY_INIT;
-        let mut offset = 0usize;
+    pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = start;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
             let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
@@ -1386,11 +1571,13 @@ mod avx512 {
     /// [`index_cells`] twin for AVX-512 VBMI2 + BMI2 hosts: block structural
     /// positions arrive via one `vpcompressb` over a byte iota and terminator
     /// flags via `pext`, replacing the serial trailing-zero/clear-bit walk
-    /// with a counted loop of independent loads.
+    /// with a counted loop of independent loads. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "avx512vbmi2", enable = "bmi2", enable = "pclmulqdq")]
-    pub(crate) fn index_cells_compress(data: &[u8], sink: &mut super::ColumnSink) {
-        let mut carries = super::CARRY_INIT;
-        let mut offset = 0usize;
+    pub(crate) fn index_cells_compress(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = start;
         let iota = byte_iota();
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
@@ -1733,11 +1920,13 @@ mod avx2 {
     }
 
     /// Fused projection driver: structural masks go straight into the
-    /// column sink; no tape is materialized.
+    /// column sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
     #[target_feature(enable = "avx2", enable = "pclmulqdq")]
-    pub(crate) fn index_cells(data: &[u8], sink: &mut super::ColumnSink) {
-        let mut carries = super::CARRY_INIT;
-        let mut offset = 0usize;
+    pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = start;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
             let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
@@ -2051,11 +2240,13 @@ mod neon {
     }
 
     /// Fused projection driver: structural masks go straight into the
-    /// column sink; no tape is materialized.
+    /// column sink; no tape is materialized. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
     #[target_feature(enable = "neon", enable = "aes")]
-    pub(crate) fn index_cells(data: &[u8], sink: &mut super::ColumnSink) {
-        let mut carries = super::CARRY_INIT;
-        let mut offset = 0usize;
+    pub(crate) fn index_cells(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed & 1, seed >> 1];
+        let mut offset = start;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
             let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };

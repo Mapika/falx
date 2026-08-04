@@ -445,8 +445,10 @@ fn bench_csv_hash(data: &[u8], options: &Options) {
         }
         total
     };
-    // Serial only: csv_hash has no fused parallel field-byte API (its parallel
-    // path, the Regions transfer-function `parse_par`, is benchmarked in
+    // Serial only: csv_hash has no fused parallel *field-byte* API. Its fused
+    // parallel paths are the typed-column projection (`parse_columns_par`, via
+    // the Regions transfer-function scheme; see
+    // examples/bench_csv_hash_columns.rs) and the tape `parse_par` (see
     // examples/bench_csv_hash_par.rs). Parallelizing only the index while
     // materializing fields serially would under-represent it, so it is omitted.
     let _ = threads;
