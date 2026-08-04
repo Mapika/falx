@@ -502,7 +502,7 @@ pub fn emit_module(module: &crate::ir_text::Module) -> Result<String, CodegenErr
         &module.columns,
     )?;
     if let Some(framing) = &module.framing {
-        code.push_str(&emit_framing(framing)?);
+        code.push_str(&emit_framing(framing, module.dialect.lines_per_record)?);
     }
     Ok(code)
 }
@@ -514,7 +514,10 @@ pub fn emit_module(module: &crate::ir_text::Module) -> Result<String, CodegenErr
 /// value decoded from this one — but it is bounded work per frame and touches
 /// no payload bytes, so the parallel driver that follows is where the time
 /// goes. See [`crate::framing`].
-fn emit_framing(framing: &crate::framing::Framing) -> Result<String, CodegenError> {
+fn emit_framing(
+    framing: &crate::framing::Framing,
+    lines_per_record: u32,
+) -> Result<String, CodegenError> {
     use crate::framing::{Counts, Endian, Width};
 
     if let Some(size) = framing.width.fixed_size() {
@@ -763,8 +766,171 @@ where
             ""
         },
     );
+
+    // Record-aware driver. Records are delimited by the dialect's record
+    // terminator, so this only makes sense when one terminator ends one
+    // record; a grouped-line format (FASTQ-style) ends a record every Nth
+    // terminator, which this stitching does not track.
+    if lines_per_record == 1 {
+        code.push_str(RECORDS_PAR_TPL);
+    } else {
+        let _ = write!(
+            code,
+            "\n// A record here spans {lines_per_record} terminators, so the \
+             record-aware\n// driver is not emitted: stitching on single \
+             terminators would cut\n// records mid-group. Use `frames_par` and \
+             group the lines yourself.\n"
+        );
+    }
     Ok(code)
 }
+
+/// The emitted record-aware driver: whole records out of framed data, across
+/// threads, including records that straddle frame and worker boundaries.
+///
+/// Mirrors [`crate::framing::parse_records_par`], but self-contained and
+/// std-only — the generated file depends on nothing. Decoding is a caller
+/// parameter for exactly that reason: a generated parser cannot link a
+/// decompressor, so the caller supplies one (or an identity closure for an
+/// uncompressed container).
+const RECORDS_PAR_TPL: &str = r#"
+/// The byte that ends a record in this format.
+pub const RECORD_TERMINATOR: u8 = b'\n';
+
+/// Parse whole records out of framed data across `threads` workers, including
+/// records that straddle frame and worker boundaries.
+///
+/// [`frames_par`] hands you frame payloads, which is only enough when records
+/// happen to align with frames. This does not assume that:
+///
+/// * Each worker takes a contiguous run of frames and decodes them one at a
+///   time, holding over whatever follows the last terminator in each, so the
+///   working set is one frame plus a partial record and stays cache-resident.
+/// * The partial record at each end of a worker's run is kept aside and the
+///   seams are stitched serially afterwards — at most one record per worker.
+/// * A stitched record is attributed to the worker whose run it *starts* in,
+///   so the returned states are in stream order and concatenate directly.
+///
+/// Records longer than a worker's entire run are handled, as is a final record
+/// with no terminator. `process` is only ever called with complete records.
+///
+/// `make_decoder` is called once per worker and returns that worker's decoder,
+/// which appends one frame's decoded bytes to the buffer it is given. For an
+/// uncompressed container that is a copy of `data[frame.payload]`; for a
+/// compressed one it inflates. Keeping it a parameter is what lets this file
+/// stay std-only.
+pub fn parse_records_par<S, E, Init, MakeDecoder, Decoder, Process>(
+    data: &[u8],
+    frames: &[Frame],
+    threads: usize,
+    init: Init,
+    make_decoder: MakeDecoder,
+    process: Process,
+) -> Result<Vec<S>, E>
+where
+    S: Send,
+    E: Send,
+    Init: Fn() -> S + Sync,
+    MakeDecoder: Fn() -> Decoder + Sync,
+    Decoder: FnMut(&Frame, &[u8], &mut Vec<u8>) -> Result<(), E>,
+    Process: Fn(&mut S, &[u8]) + Sync,
+{
+    if frames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = threads.max(1).min(frames.len());
+    let per = frames.len().div_ceil(threads);
+    // Per worker: leading partial record, trailing partial record, and whether
+    // any record ended inside its run at all.
+    type Edges = (Vec<u8>, Vec<u8>, bool);
+
+    let parts: Vec<Result<(S, Edges), E>> = std::thread::scope(|s| {
+        let handles: Vec<_> = frames
+            .chunks(per)
+            .enumerate()
+            .map(|(w, group)| {
+                let init = &init;
+                let make_decoder = &make_decoder;
+                let process = &process;
+                s.spawn(move || -> Result<(S, Edges), E> {
+                    let mut decode = make_decoder();
+                    let mut state = init();
+                    let mut pending: Vec<u8> = Vec::new();
+                    let mut prefix: Vec<u8> = Vec::new();
+                    let mut seen_terminator = false;
+
+                    for frame in group {
+                        decode(frame, data, &mut pending)?;
+                        let last = match pending.iter().rposition(|&b| b == RECORD_TERMINATOR) {
+                            Some(last) => last,
+                            // No record ends in this frame; keep accumulating.
+                            None => continue,
+                        };
+                        let mut from = 0;
+                        if !seen_terminator && w != 0 {
+                            // Worker 0's leading bytes are the stream's first
+                            // record; every other worker's are the tail of the
+                            // previous worker's, handed back for the seam pass.
+                            let first = pending
+                                .iter()
+                                .position(|&b| b == RECORD_TERMINATOR)
+                                .expect("a last terminator implies a first");
+                            prefix = pending[..=first].to_vec();
+                            from = first + 1;
+                        }
+                        seen_terminator = true;
+                        process(&mut state, &pending[from..=last]);
+                        // What follows the last terminator starts a record that
+                        // continues into the next frame.
+                        pending.drain(..=last);
+                    }
+
+                    let edges = if seen_terminator {
+                        (prefix, pending, true)
+                    } else {
+                        // The whole run is the middle of one long record.
+                        (pending, Vec::new(), false)
+                    };
+                    Ok((state, edges))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("framing worker panicked"))
+            .collect()
+    });
+
+    let mut states = Vec::with_capacity(parts.len());
+    let mut edges = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (state, edge) = part?;
+        states.push(state);
+        edges.push(edge);
+    }
+
+    // Serial seam pass. `carry_owner` tracks which worker the in-flight record
+    // started in, which is what keeps the states in stream order.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut carry_owner = 0usize;
+    for (w, (prefix, suffix, had_terminator)) in edges.iter().enumerate() {
+        carry.extend_from_slice(prefix);
+        if *had_terminator {
+            if !carry.is_empty() {
+                process(&mut states[carry_owner], &carry);
+            }
+            carry.clear();
+            carry.extend_from_slice(suffix);
+            carry_owner = w;
+        }
+    }
+    // Anything left is a final record with no terminator.
+    if !carry.is_empty() {
+        process(&mut states[carry_owner], &carry);
+    }
+    Ok(states)
+}
+"#;
 
 /// Parser-mode emission inputs: the dialect, its record-terminator node,
 /// and — when the dialect declares nesting — the live open/close bracket

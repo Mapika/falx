@@ -160,7 +160,25 @@ pub struct Frame { pub start: usize, pub len: usize, pub payload: Range<usize> }
 pub fn frame_at(data: &[u8], pos: usize) -> Result<Frame, FrameError>;
 pub fn scan_frames(data: &[u8]) -> Result<Vec<Frame>, FrameError>;
 pub fn frames_par<S, Init, F>(data, frames, threads, init, process) -> Vec<S>;
+
+// Whole records, including those straddling frames — see below.
+pub const RECORD_TERMINATOR: u8;
+pub fn parse_records_par<S, E, Init, MakeDecoder, Decoder, Process>(
+    data, frames, threads, init, make_decoder, process,
+) -> Result<Vec<S>, E>;
 ```
+
+`parse_records_par` is the generated twin of
+`falx::framing::parse_records_par`: same stitching, but self-contained, so a
+standalone parser reassembles records across frames without linking falx.
+Decoding is a caller parameter for exactly that reason — a generated file
+cannot link a decompressor, so you pass one in (or an identity closure that
+copies `data[frame.payload]` for an uncompressed container).
+
+It is not emitted for grouped-line formats (`lines-per-record` > 1), where a
+record ends every Nth terminator rather than every one; the generated file
+explains the omission instead of shipping stitching that would cut records
+mid-group.
 
 `scan_frames` is the sequential pass; `frames_par` hands contiguous frame runs
 to workers and returns their states in stream order. This is the shape

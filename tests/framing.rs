@@ -741,3 +741,67 @@ fn decoder_errors_propagate() {
     );
     assert_eq!(result, Err("decoder failed"));
 }
+
+/// A framed module emits the record-aware driver, so a standalone generated
+/// parser can reassemble records across frames without linking falx. Decoding
+/// is a caller parameter, which is what keeps the generated file std-only.
+#[test]
+fn framed_modules_emit_the_record_aware_driver() {
+    let text = "\
+falx-ir 1
+format framed_csv
+structural 2c,0a
+frame header=4 length-at=0 width=u32 endian=be counts=payload adjust=0 trailer=0
+%0 = class 0a
+%1 = class 2c,0a
+output %1
+terminators %0
+";
+    let module = falx::ir_text::parse(text).expect("parse");
+    let code = falx::codegen::emit_module(&module).expect("emit");
+    for item in [
+        "pub fn parse_records_par",
+        "pub const RECORD_TERMINATOR: u8 = b'\\n';",
+        "MakeDecoder",
+    ] {
+        assert!(code.contains(item), "generated code is missing `{item}`");
+    }
+    // std-only: no falx paths leak into the generated file.
+    assert!(
+        !code.contains("falx::"),
+        "generated code must not reference falx"
+    );
+}
+
+/// A record in a grouped-line format ends every Nth terminator, which the
+/// single-terminator stitching does not track — so the driver is deliberately
+/// not emitted, and the generated file says why rather than shipping something
+/// that would cut records mid-group.
+#[test]
+fn grouped_line_formats_omit_the_record_aware_driver() {
+    let text = "\
+falx-ir 1
+format framed_fastq
+structural 0a
+lines-per-record 4
+frame header=4 length-at=0 width=u32 endian=be counts=payload adjust=0 trailer=0
+%0 = class 0a
+output %0
+terminators %0
+";
+    let module = falx::ir_text::parse(text).expect("parse");
+    let code = falx::codegen::emit_module(&module).expect("emit");
+    assert!(
+        code.contains("pub fn scan_frames"),
+        "frame location should still be emitted"
+    );
+    assert!(
+        !code.contains("pub fn parse_records_par"),
+        "the record-aware driver must not be emitted for grouped-line formats"
+    );
+    assert!(
+        code.contains("spans 4 terminators"),
+        "the generated file should explain the omission, got:\n{}",
+        &code[code.len().saturating_sub(600)..]
+    );
+}
