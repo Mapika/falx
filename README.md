@@ -364,11 +364,26 @@ let states = falx::bgzf::parse_framed_par(&data, &framing, threads, init, proces
 
 `parse_framed_par` inflates into a reusable per-worker buffer and parses each
 block in the same pass. On 0.5 GiB of bgzf-compressed CSV at 24 threads that
-runs at **~35 GiB/s** of uncompressed throughput against ~6.9 GiB/s for
+runs at **~35 GiB/s** of uncompressed throughput against ~7 GiB/s for
 decompress-then-parse — the win is never writing a whole-stream buffer, not the
 parsing. Byte-identical to the hand-written path, and equivalent to it in
 throughput (`cargo run --release --features bgzf-libdeflate --example
 bgzf_framed_bench`).
+
+Records rarely align with block boundaries, so there is a record-aware form
+that delivers only whole records:
+
+```rust
+let states = falx::bgzf::parse_framed_records_par(&data, &framing, threads, b'\n', init, process)?;
+```
+
+Each worker inflates its blocks exactly once, streaming with a small carry so
+the working set stays cache-resident, and the at-most-one-record-per-worker
+seams are stitched serially afterwards. Stitched records are attributed to the
+worker whose region they *start* in, so the states stay in stream order.
+Records longer than a whole worker's group, and a final record with no
+terminator, both work. It measures the same ~35 GiB/s as the block-aligned
+form, so spanning correctness costs nothing.
 
 Reference: [`docs/ir.md`](docs/ir.md) for the IR, [`docs/spec.md`](docs/spec.md)
 for the spec format.

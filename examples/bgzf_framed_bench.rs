@@ -118,6 +118,21 @@ fn main() {
         s.iter().sum()
     });
 
+    bench("framed inflate + parse, record-aware (spanning)", &|| {
+        let s = falx::bgzf::parse_framed_records_par(
+            &data,
+            &framing,
+            threads,
+            b'\n',
+            || 0u64,
+            |acc, recs| {
+                *acc += falx::kernels::csv_geo::parse_csv_geo_stats(recs).records;
+            },
+        )
+        .unwrap();
+        s.iter().sum()
+    });
+
     // Correctness: both routes agree.
     let a = falx::bgzf::decompress_par(&data, threads).unwrap();
     let b = falx::bgzf::decompress_framed_par(&data, &framing, threads).unwrap();

@@ -190,8 +190,29 @@ decompress-then-parse — the gain is not the parsing, it is never writing a
 whole-stream buffer. `decompress_framed_par` and the hand-written
 `decompress_par` are equivalent in throughput and byte-identical in output.
 
-Records that span a block boundary are the caller's concern: these deliver
-block payloads, not records.
+`parse_framed_par` delivers block *payloads*, which is only enough when records
+happen to align with blocks. When they don't — the normal case — use the
+record-aware form, which delivers only whole records:
+
+```rust
+let states = falx::bgzf::parse_framed_records_par(&data, &framing, threads, b'\n',
+    || MyState::default(),
+    |state, records| state.absorb(parse_columns(records)),  // whole records only
+)?;
+```
+
+Each worker inflates its own blocks exactly once, streaming block-by-block with
+a small carry so the working set stays cache-resident; the partial record at
+each end is kept as a fragment and the seams are stitched serially afterwards —
+at most one record per worker. A stitched record is attributed to the worker
+whose region it *starts* in, the same record-ownership rule the parallel
+structural parsers use, so the returned states stay in stream order and can be
+concatenated directly. Records longer than a whole worker's group are handled;
+so is a final record with no terminator.
+
+This measures the same as the block-aligned form (~35 GiB/s on the benchmark
+above), so correctness across boundaries is not a tradeoff — prefer it for any
+delimited payload.
 
 **What this does not do.** Formats whose *payload* grammar is not a structural
 byte stream (Parquet's encoded column chunks, say) are framed by this layer but

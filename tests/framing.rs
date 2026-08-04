@@ -465,3 +465,177 @@ terminators %0
     let reparsed = falx::ir_text::parse(&printed).expect("reparse");
     assert_eq!(reparsed.framing, module.framing);
 }
+
+/// Records that straddle block boundaries must still be parsed exactly once
+/// and in full.
+///
+/// The payload here is split at arbitrary byte positions — deliberately *not*
+/// on record boundaries — so most blocks begin and end mid-record. The result
+/// must match parsing the whole decompressed stream, which is the only
+/// reference that cannot itself be wrong about boundaries.
+#[cfg(feature = "bgzf")]
+#[test]
+fn records_spanning_block_boundaries_are_parsed_exactly_once() {
+    let mut csv = Vec::new();
+    for row in 0..20_000u64 {
+        csv.extend_from_slice(
+            format!(
+                "cc,city{row},accent,region,999,{:.6},-1.500000\n",
+                row as f64 / 8.0
+            )
+            .as_bytes(),
+        );
+    }
+    let reference = falx::kernels::csv_geo::parse_csv_geo_stats(&csv);
+
+    // Several block sizes, all chosen to be coprime-ish with the record length
+    // so boundaries land inside records rather than between them.
+    for chunk_size in [37usize, 512, 1000, 4096, 60_000] {
+        let chunks: Vec<&[u8]> = csv.chunks(chunk_size).collect();
+        let data = build_bgzf(&chunks);
+
+        // Sanity: this really is a boundary-straddling layout.
+        let inflated = falx::bgzf::decompress_framed_par(&data, &bgzf(), 4).expect("decompress");
+        assert_eq!(inflated, csv, "round trip lost data at chunk {chunk_size}");
+
+        for threads in [1usize, 2, 3, 8, 32] {
+            let states = falx::bgzf::parse_framed_records_par(
+                &data,
+                &bgzf(),
+                threads,
+                b'\n',
+                || (0u64, 0u64, 0u64),
+                |state, records| {
+                    let s = falx::kernels::csv_geo::parse_csv_geo_stats(records);
+                    state.0 += s.records;
+                    state.1 = state.1.wrapping_add(s.latitude_checksum);
+                    state.2 = state.2.wrapping_add(s.longitude_checksum);
+                },
+            )
+            .expect("record-aware framed parse");
+
+            let rows: u64 = states.iter().map(|s| s.0).sum();
+            let lat = states.iter().fold(0u64, |a, s| a.wrapping_add(s.1));
+            let lon = states.iter().fold(0u64, |a, s| a.wrapping_add(s.2));
+            assert_eq!(
+                rows, reference.records,
+                "row count differs at chunk {chunk_size}, {threads} threads"
+            );
+            assert_eq!(
+                lat, reference.latitude_checksum,
+                "latitude checksum differs at chunk {chunk_size}, {threads} threads"
+            );
+            assert_eq!(
+                lon, reference.longitude_checksum,
+                "longitude checksum differs at chunk {chunk_size}, {threads} threads"
+            );
+        }
+    }
+}
+
+/// A record longer than an entire worker's block group: the carry has to span
+/// several workers, and blocks with no terminator at all must not be dropped.
+#[cfg(feature = "bgzf")]
+#[test]
+fn a_record_longer_than_a_worker_group_survives() {
+    // One enormous record, then a few small ones.
+    let mut csv = Vec::new();
+    csv.extend_from_slice(b"cc,");
+    csv.extend_from_slice(&vec![b'x'; 300_000]);
+    csv.extend_from_slice(b",accent,region,999,1.000000,-1.500000\n");
+    for row in 0..5u64 {
+        csv.extend_from_slice(
+            format!("cc,city{row},accent,region,999,2.000000,-2.500000\n").as_bytes(),
+        );
+    }
+    let reference = falx::kernels::csv_geo::parse_csv_geo_stats(&csv);
+
+    let chunks: Vec<&[u8]> = csv.chunks(1024).collect();
+    let data = build_bgzf(&chunks);
+    for threads in [1usize, 4, 16, 64] {
+        let states = falx::bgzf::parse_framed_records_par(
+            &data,
+            &bgzf(),
+            threads,
+            b'\n',
+            || (0u64, 0u64),
+            |state, records| {
+                let s = falx::kernels::csv_geo::parse_csv_geo_stats(records);
+                state.0 += s.records;
+                state.1 = state.1.wrapping_add(s.latitude_checksum);
+            },
+        )
+        .expect("parse");
+        let rows: u64 = states.iter().map(|s| s.0).sum();
+        let lat = states.iter().fold(0u64, |a, s| a.wrapping_add(s.1));
+        assert_eq!(rows, reference.records, "row count at {threads} threads");
+        assert_eq!(
+            lat, reference.latitude_checksum,
+            "checksum at {threads} threads"
+        );
+    }
+}
+
+/// A stream whose final record has no terminator must still be delivered.
+#[cfg(feature = "bgzf")]
+#[test]
+fn unterminated_final_record_is_delivered() {
+    let csv = b"cc,a,accent,region,999,1.000000,-1.500000\n\
+                cc,b,accent,region,999,2.000000,-2.500000";
+    let reference = falx::kernels::csv_geo::parse_csv_geo_stats(csv);
+    let chunks: Vec<&[u8]> = csv.chunks(17).collect();
+    let data = build_bgzf(&chunks);
+    for threads in [1usize, 2, 8] {
+        let states = falx::bgzf::parse_framed_records_par(
+            &data,
+            &bgzf(),
+            threads,
+            b'\n',
+            || 0u64,
+            |state, records| *state += falx::kernels::csv_geo::parse_csv_geo_stats(records).records,
+        )
+        .expect("parse");
+        assert_eq!(
+            states.iter().sum::<u64>(),
+            reference.records,
+            "unterminated trailing record lost at {threads} threads"
+        );
+    }
+}
+
+/// States come back in stream order, so a caller that concatenates rather than
+/// reduces still sees the input's record order.
+#[cfg(feature = "bgzf")]
+#[test]
+fn states_are_returned_in_stream_order() {
+    let mut csv = Vec::new();
+    for row in 0..5_000u64 {
+        csv.extend_from_slice(format!("{row}\n").as_bytes());
+    }
+    let chunks: Vec<&[u8]> = csv.chunks(97).collect();
+    let data = build_bgzf(&chunks);
+
+    let states = falx::bgzf::parse_framed_records_par(
+        &data,
+        &bgzf(),
+        8,
+        b'\n',
+        Vec::<u64>::new,
+        |state, records| {
+            for line in records.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                state.push(std::str::from_utf8(line).unwrap().parse().unwrap());
+            }
+        },
+    )
+    .expect("parse");
+
+    let flattened: Vec<u64> = states.concat();
+    let expected: Vec<u64> = (0..5_000).collect();
+    assert_eq!(
+        flattened, expected,
+        "concatenated states are not in stream order"
+    );
+}
