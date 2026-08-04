@@ -179,7 +179,7 @@ pub fn parse(toml_text: &str) -> Result<Spec, String> {
                 .filter(|&n| n >= 1)
                 .ok_or("'lines_per_record' must be a positive integer")?;
             if n > 1
-                && (structural != [b'\n']
+                && (structural != *b"\n"
                     || quote.is_some()
                     || comment.is_some()
                     || escape != crate::formats::Escape::None

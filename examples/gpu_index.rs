@@ -117,7 +117,7 @@ fn exclusive_prefix_sum(counts: &[u32]) -> (Vec<u32>, usize) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let structural = [b',', b'\n'];
+    let structural = *b",\n";
     let data = make_csv(4_000_000, 8); // ~150 MiB
     let n = data.len();
     println!(

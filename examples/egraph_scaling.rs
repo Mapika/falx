@@ -38,7 +38,7 @@ fn random_parts(seed: u64, internal: usize) -> DelimitedParts {
     let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
     let mut g = Graph::new();
     let mut pool: Vec<NodeId> = Vec::new();
-    for b in [b',', b';', b'|', b'\t', b':', b' '] {
+    for b in *b",;|\t: " {
         pool.push(g.class_byte(b));
     }
     pool.push(g.constant(0x5555_5555_5555_5555)); // even-position mask

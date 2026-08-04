@@ -520,15 +520,15 @@ fn emit_framing(
 ) -> Result<String, CodegenError> {
     use crate::framing::{Counts, Endian, Width};
 
-    if let Some(size) = framing.width.fixed_size() {
-        if framing.length_at + size > framing.header {
-            return Err(CodegenError(format!(
-                "frame length field at {}..{} lies outside the {}-byte header",
-                framing.length_at,
-                framing.length_at + size,
-                framing.header
-            )));
-        }
+    if let Some(size) = framing.width.fixed_size()
+        && framing.length_at + size > framing.header
+    {
+        return Err(CodegenError(format!(
+            "frame length field at {}..{} lies outside the {}-byte header",
+            framing.length_at,
+            framing.length_at + size,
+            framing.header
+        )));
     }
 
     let mut code = String::new();

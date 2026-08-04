@@ -141,7 +141,7 @@ fn par_matches_serial_on_random_documents() {
                 }
             }
         }
-        if rng.next() % 4 == 0 {
+        if rng.next().is_multiple_of(4) {
             data.pop();
         }
         for &threads in &[2usize, 3, 5, 8, 17] {

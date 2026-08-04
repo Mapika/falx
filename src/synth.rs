@@ -2396,7 +2396,7 @@ mod tests {
         for _ in 0..500 {
             let len = (rng.next() % 300) as usize;
             let input: Vec<u8> = (0..len)
-                .map(|_| [b'\\', b'x', b'"'][(rng.next() % 3) as usize])
+                .map(|_| (*b"\\x\"")[(rng.next() % 3) as usize])
                 .collect();
             let serial = byte_serial_masks(&g, &input);
             let mut positions = Vec::new();

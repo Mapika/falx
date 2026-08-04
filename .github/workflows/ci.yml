@@ -28,4 +28,9 @@ jobs:
         if: matrix.runtime_tests
       - run: cargo test --lib --features cli,bgzf
         if: ${{ !matrix.runtime_tests }}
+      # Generated parsers carry every SIMD backend behind `cfg(target_arch)`,
+      # so the NEON module is only ever *compiled* on aarch64. Run the
+      # rustc compile check here too — the x86 runners cannot cover it.
+      - run: cargo test --test generated_compiles --features cli,bgzf
+        if: ${{ !matrix.runtime_tests }}
       - run: cargo build --release --features cli,bgzf
