@@ -874,7 +874,10 @@ impl<'a> Columns<'a> {
             data,
             rows: 0,
             key_offsets: { let mut v = Vec::with_capacity(rows + 1); v.push(0); v },
-            key_data: Vec::new(),
+            // Seeded at 8 bytes/cell so steady-state fills skip the
+            // doubling-realloc memcpys; overshoot is only untouched
+            // virtual pages, undershoot just resumes doubling.
+            key_data: Vec::with_capacity(rows * 8),
             key_valid: Vec::with_capacity(rows / 64 + 1),
             amount: Vec::with_capacity(rows),
             amount_valid: Vec::with_capacity(rows / 64 + 1),
@@ -949,6 +952,43 @@ impl<'a> ColumnSink<'a> {
         }
     }
 
+    /// [`Self::drive`] twin fed pre-extracted block positions by the
+    /// AVX-512 VBMI2 driver: identical per-position semantics, but the
+    /// loop is counted and every position load is independent, so no
+    /// serial trailing-zero/clear-bit chain forms. Bit j of `term`
+    /// flags position j as a terminator (`pext`-compacted).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {
+        for &p8 in &pos[..count] {
+            let p = base + p8 as u32;
+            if term & 1 != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+            0 => { self.pending[0] = (self.field_start, p); self.found |= 1; }
+            1 => { self.pending[1] = (self.field_start, p); self.found |= 2; }
+                _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            term >>= 1;
+        }
+    }
+
     /// Emit the row terminated (exclusively) at `end`.
     fn flush(&mut self, end: u32) {
         let data = self.cols.data;
@@ -975,7 +1015,7 @@ impl<'a> ColumnSink<'a> {
         let (cfrom, cto) = self.pending[0];
         let ok = self.found & 1 != 0;
         if ok {
-            append_clean(&mut self.cols.key_data, &data[cfrom as usize..cto as usize]);
+            append_clean(&mut self.cols.key_data, data, cfrom as usize, cto as usize);
         }
         assert!(
             self.cols.key_data.len() <= i32::MAX as usize,
@@ -1030,6 +1070,18 @@ pub fn parse_columns(data: &[u8]) -> Columns<'_> {
 }
 
 fn index_cells_dispatch(data: &[u8], sink: &mut ColumnSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_cells_compress(data, sink) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -1122,10 +1174,13 @@ fn parse_8_digits(v: u64) -> u64 {
     (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
 }
 
-/// Append `raw` cleaned: outer quotes stripped, doubled quotes
-/// collapsed. Unquoted cells are one memcpy.
-fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
+/// Append the `data[from..to]` cell cleaned: outer quotes stripped,
+/// doubled quotes collapsed. Unquoted cells of up to 16 bytes clear of
+/// the input tail take one unconditional 16-byte copy into reserved
+/// spare capacity; longer unquoted cells are one memcpy.
+fn append_clean(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize) {
     const Q: u8 = 34u8;
+    let raw = &data[from..to];
     if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {
         let inner = &raw[1..raw.len() - 1];
         let mut i = 0;
@@ -1136,6 +1191,19 @@ fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
             } else {
                 i += 1;
             }
+        }
+    } else if raw.len() <= 16 && to + 16 <= data.len() {
+        out.reserve(16);
+        // SAFETY: 16 bytes are readable at `data[from..]` (checked above)
+        // and 16 spare bytes were just reserved; set_len exposes only the
+        // cell's bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(from),
+                out.as_mut_ptr().add(out.len()),
+                16,
+            );
+            out.set_len(out.len() + raw.len());
         }
     } else {
         out.extend_from_slice(raw);
@@ -1261,12 +1329,12 @@ mod avx512 {
         let mut offset = 0usize;
         while offset + 64 <= data.len() {
             // SAFETY: offset + 64 <= data.len().
-            let (lo, hi) = unsafe { (_mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i), _mm256_loadu_si256(data.as_ptr().add(offset + 32) as *const __m256i)) };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+            let v = unsafe { _mm512_loadu_si512(data.as_ptr().add(offset) as *const __m512i) };
+        let v0 = eq_mask(v, 10u8); // class "\n"
         let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
-        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v2 = eq_mask(v, 35u8); // class "#"
         let v3 = v1 & v2;
-        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let v4 = eq_mask(v, 34u8); // class "\""
         let _ = resolve_regions(v4, v3, v0, &mut states[0]);
         let _ = resolve_regions(v4, v3, v0, &mut states[1]);
         let _ = resolve_regions(v4, v3, v0, &mut states[2]);
@@ -1277,12 +1345,12 @@ mod avx512 {
             let mut blk = [0u8; 64];
             blk[..rem].copy_from_slice(&data[offset..]);
             // SAFETY: blk is a readable 64-byte buffer (zero padded).
-            let (lo, hi) = unsafe { (_mm256_loadu_si256(blk.as_ptr() as *const __m256i), _mm256_loadu_si256(blk.as_ptr().add(32) as *const __m256i)) };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+            let v = unsafe { _mm512_loadu_si512(blk.as_ptr() as *const __m512i) };
+        let v0 = eq_mask(v, 10u8); // class "\n"
         let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
-        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v2 = eq_mask(v, 35u8); // class "#"
         let v3 = v1 & v2;
-        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let v4 = eq_mask(v, 34u8); // class "\""
         let _ = resolve_regions(v4, v3, v0, &mut states[0]);
         let _ = resolve_regions(v4, v3, v0, &mut states[1]);
         let _ = resolve_regions(v4, v3, v0, &mut states[2]);
@@ -1315,23 +1383,82 @@ mod avx512 {
         }
     }
 
+    /// [`index_cells`] twin for AVX-512 VBMI2 + BMI2 hosts: block structural
+    /// positions arrive via one `vpcompressb` over a byte iota and terminator
+    /// flags via `pext`, replacing the serial trailing-zero/clear-bit walk
+    /// with a counted loop of independent loads.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "avx512vbmi2", enable = "bmi2", enable = "pclmulqdq")]
+    pub(crate) fn index_cells_compress(data: &[u8], sink: &mut super::ColumnSink) {
+        let mut carries = super::CARRY_INIT;
+        let mut offset = 0usize;
+        let iota = byte_iota();
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            let mask = mask & live;
+            let term = term & live;
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+        }
+    }
+
+    /// The bytes 0..64 in lane order: compressing this under a structural
+    /// mask yields the in-block byte offset of every set bit.
+    #[target_feature(enable = "avx512f")]
+    fn byte_iota() -> __m512i {
+        const IOTA: [u8; 64] = {
+            let mut a = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        };
+        // SAFETY: `IOTA` is a readable 64-byte buffer.
+        unsafe { _mm512_loadu_si512(IOTA.as_ptr() as *const __m512i) }
+    }
+
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v = unsafe { _mm512_loadu_si512(ptr as *const __m512i) };
+        let v0 = eq_mask(v, 10u8); // class "\n"
         let v1 = { let shifted = (v0 << 1) | carries[0]; carries[0] = v0 >> 63; shifted };
-        let v2 = eq_mask(lo, hi, 35u8); // class "#"
+        let v2 = eq_mask(v, 35u8); // class "#"
         let v3 = v1 & v2;
-        let v4 = eq_mask(lo, hi, 34u8); // class "\""
+        let v4 = eq_mask(v, 34u8); // class "\""
         let v5 = resolve_regions(v4, v3, v0, &mut carries[1]);
         let v6 = !v5;
-        let v7 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v7 = eq_mask(v, 10u8) | eq_mask(v, 44u8); // class "\n,"
         let v8 = v7 & v6;
         (v8, v8 & v0)
     }
@@ -1426,11 +1553,8 @@ mod avx512 {
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 
     #[target_feature(enable = "pclmulqdq")]

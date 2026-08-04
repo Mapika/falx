@@ -993,33 +993,25 @@ mod avx512 {
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 2]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        };
+        let v = unsafe { _mm512_loadu_si512(ptr as *const __m512i) };
         let v0 = 0x5555555555555555u64;
-        let v1 = eq_mask(lo, hi, 92u8); // class "\\"
+        let v1 = eq_mask(v, 92u8); // class "\\"
         let v2 = v0 ^ v1;
         let v3 = { let (partial, c1) = v0.overflowing_add(v2); let (sum, c2) = partial.overflowing_add(carries[0]); carries[0] = (c1 | c2) as u64; sum };
         let v4 = v0 ^ v3;
-        let v5 = eq_mask(lo, hi, 34u8); // class "\""
+        let v5 = eq_mask(v, 34u8); // class "\""
         let v6 = v5 & v4;
         let v7 = { let parity = prefix_xor(v6) ^ carries[1]; carries[1] = ((parity as i64) >> 63) as u64; parity };
         let v8 = !v7;
-        let v9 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 32u8) | eq_mask(lo, hi, 61u8); // class "\n ="
+        let v9 = eq_mask(v, 10u8) | eq_mask(v, 32u8) | eq_mask(v, 61u8); // class "\n ="
         let v10 = v9 & v8;
-        let v11 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v11 = eq_mask(v, 10u8); // class "\n"
         (v10, v10 & v11)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 
     #[target_feature(enable = "pclmulqdq")]

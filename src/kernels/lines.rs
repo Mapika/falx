@@ -991,22 +991,14 @@ mod avx512 {
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        };
-        let v0 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v = unsafe { _mm512_loadu_si512(ptr as *const __m512i) };
+        let v0 = eq_mask(v, 10u8); // class "\n"
         (v0, v0)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 
     /// Branchless bit decoding (simdjson flatten_bits): write indexes in

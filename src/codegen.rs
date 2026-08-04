@@ -809,15 +809,102 @@ fn emit_with(
             .replace("@LOAD@", load)
             .replace("@LOAD2@", load2)
     };
+    // `index_cells` twin for AVX-512 VBMI2 + BMI2 hosts: one `vpcompressb`
+    // over a byte iota extracts every structural position of the block at
+    // once and `pext` compacts the terminator flags, so the sink walks a
+    // counted loop of independent loads instead of a serial
+    // trailing-zero/clear-bit chain.
+    let cells_compress_tpl = r#"
+    /// [`index_cells`] twin for AVX-512 VBMI2 + BMI2 hosts: block structural
+    /// positions arrive via one `vpcompressb` over a byte iota and terminator
+    /// flags via `pext`, replacing the serial trailing-zero/clear-bit walk
+    /// with a counted loop of independent loads.@DOC@
+@ATTR@    pub(crate) fn index_cells_compress(@PARAMS@sink: &mut super::ColumnSink) {
+@INIT@@START@        let iota = byte_iota();
+        while offset + 64 <= data.len() {
+            @LOAD@
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            @LOAD2@
+            let mask = mask & live;
+            let term = term & live;
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+        }
+    }
+"#;
+    let cells_fill_compress = |load: &str, load2: &str| -> String {
+        let (doc, params, init, start) = if col_par {
+            (
+                " Scans 64-byte blocks from\n    /// `start` (block-aligned) onward, until end of data or until the\n    /// sink completes its record range.",
+                "data: &[u8], seed: u64, start: usize, ",
+                seed_init.as_str(),
+                "        let mut offset = start;\n",
+            )
+        } else {
+            (
+                "",
+                "data: &[u8], ",
+                carry_decl.as_str(),
+                "        let mut offset = 0usize;\n",
+            )
+        };
+        cells_compress_tpl
+            .replace("@DOC@", doc)
+            .replace(
+                "@ATTR@",
+                "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"avx512vbmi2\", enable = \"bmi2\", enable = \"pclmulqdq\")]\n",
+            )
+            .replace("@PARAMS@", params)
+            .replace("@INIT@", init)
+            .replace("@START@", start)
+            .replace("@LOAD@", load)
+            .replace("@LOAD2@", load2)
+    };
     let avx512_cells = if has_columns {
-        cells_fill(
-            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
-            &format!(
-                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+        format!(
+            "{}{}",
+            cells_fill(
+                "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
             ),
-            &format!(
-                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
-            ),
+            cells_fill_compress(
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
+            )
         )
     } else {
         String::new()
@@ -842,14 +929,25 @@ fn emit_with(
             .replace("column sink", "VCF stats sink")
     };
     let avx512_vcf_stats = if vcf_stats_mode {
-        vcf_stats_cells(cells_fill(
-            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
-            &format!(
-                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+        vcf_stats_cells(format!(
+            "{}{}",
+            cells_fill(
+                "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
             ),
-            &format!(
-                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
-            ),
+            cells_fill_compress(
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
+            )
         ))
     } else {
         String::new()
@@ -889,14 +987,25 @@ fn emit_with(
             .replace("column sink", csv_geo_stats_doc)
     };
     let avx512_csv_geo_stats = if csv_geo_stats_mode {
-        csv_geo_stats_cells(cells_fill(
-            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
-            &format!(
-                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+        csv_geo_stats_cells(format!(
+            "{}{}",
+            cells_fill(
+                "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
             ),
-            &format!(
-                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
-            ),
+            cells_fill_compress(
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
+            )
         ))
     } else {
         String::new()
@@ -921,14 +1030,25 @@ fn emit_with(
             .replace("column sink", "field-byte stats sink")
     };
     let avx512_field_byte_stats = if field_byte_stats_mode {
-        field_byte_stats_cells(cells_fill(
-            "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
-            &format!(
-                "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+        field_byte_stats_cells(format!(
+            "{}{}",
+            cells_fill(
+                "    #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n",
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
             ),
-            &format!(
-                "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
-            ),
+            cells_fill_compress(
+                &format!(
+                    "// SAFETY: offset + 64 <= data.len().\n            let (mask, term) = unsafe {{ step(data.as_ptr().add(offset){carry_arg}) }};"
+                ),
+                &format!(
+                    "// SAFETY: block is a readable 64-byte buffer. Pad bits masked.\n            let (mask, term) = unsafe {{ step(block.as_ptr(){carry_arg}) }};"
+                ),
+            )
         ))
     } else {
         String::new()
@@ -946,6 +1066,31 @@ fn emit_with(
     } else {
         String::new()
     };
+    // Shared byte-iota constant for the `vpcompressb` position extraction;
+    // emitted once per module however many compress drivers it hosts.
+    let avx512_compress_helper =
+        if has_columns || vcf_stats_mode || csv_geo_stats_mode || field_byte_stats_mode {
+            r#"
+    /// The bytes 0..64 in lane order: compressing this under a structural
+    /// mask yields the in-block byte offset of every set bit.
+    #[target_feature(enable = "avx512f")]
+    fn byte_iota() -> __m512i {
+        const IOTA: [u8; 64] = {
+            let mut a = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        };
+        // SAFETY: `IOTA` is a readable 64-byte buffer.
+        unsafe { _mm512_loadu_si512(IOTA.as_ptr() as *const __m512i) }
+    }
+"#
+        } else {
+            ""
+        };
     let carry_fwd = if carry_count > 0 { ", carries" } else { "" };
     // Streaming building block: index only the full blocks of a slice with
     // caller-owned carries; the sub-block remainder stays unconsumed.
@@ -1026,7 +1171,11 @@ fn emit_with(
             // `b0..b3` on NEON); the classification body in `block` consumes
             // whichever names this flavor produced.
             let (full_load, tail_load) = match flavor {
-                Flavor::Avx512 | Flavor::Avx2 => (
+                Flavor::Avx512 => (
+                    "            let v = unsafe { _mm512_loadu_si512(data.as_ptr().add(offset) as *const __m512i) };\n",
+                    "            let v = unsafe { _mm512_loadu_si512(blk.as_ptr() as *const __m512i) };\n",
+                ),
+                Flavor::Avx2 => (
                     "            let (lo, hi) = unsafe { (_mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i), _mm256_loadu_si256(data.as_ptr().add(offset + 32) as *const __m256i)) };\n",
                     "            let (lo, hi) = unsafe { (_mm256_loadu_si256(blk.as_ptr() as *const __m256i), _mm256_loadu_si256(blk.as_ptr().add(32) as *const __m256i)) };\n",
                 ),
@@ -1912,16 +2061,11 @@ mod avx512 {{
         }}
     }}
 
-{avx512_tape}{avx512_nested}{avx512_seeded}{avx512_tape_seeded}{avx512_quote_parity}{avx512_partial}{avx512_cells}{avx512_vcf_stats}{avx512_csv_geo_stats}{avx512_field_byte_stats}{avx512_fastq}{avx512_ndjson_lines}{avx512_logfmt}
+{avx512_tape}{avx512_nested}{avx512_seeded}{avx512_tape_seeded}{avx512_quote_parity}{avx512_partial}{avx512_cells}{avx512_vcf_stats}{avx512_csv_geo_stats}{avx512_field_byte_stats}{avx512_compress_helper}{avx512_fastq}{avx512_ndjson_lines}{avx512_logfmt}
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8{carry_param}) -> {step_ret_ty} {{
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {{
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        }};
+        let v = unsafe {{ _mm512_loadu_si512(ptr as *const __m512i) }};
 "#
     );
     emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx512, &step_roots);
@@ -1933,9 +2077,7 @@ mod avx512 {{
              #[target_feature(enable = \"avx512f\", enable = \"avx512bw\", enable = \"avx512vl\", enable = \"pclmulqdq\")]\n    \
              unsafe fn step_nested(ptr: *const u8{carry_param}) -> (u64, u64, u64) {{\n        \
              // SAFETY: caller guarantees 64 readable bytes at `ptr`.\n        \
-             let (lo, hi) = unsafe {{\n            (\n                \
-             _mm256_loadu_si256(ptr as *const __m256i),\n                \
-             _mm256_loadu_si256(ptr.add(32) as *const __m256i),\n            )\n        }};\n"
+             let v = unsafe {{ _mm512_loadu_si512(ptr as *const __m512i) }};\n"
         );
         emit_step_body(&mut code, graph, &carry_slot, Flavor::Avx512, &nested_roots);
         let _ = write!(
@@ -1952,11 +2094,8 @@ mod avx512 {{
         code.push_str(
             r#"
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 "#,
         );
@@ -4531,7 +4670,10 @@ fn push_columns_api(
             let _ = writeln!(
                 code,
                 "            {name}_offsets: {{ let mut v = Vec::with_capacity(rows + 1); v.push(0); v }},\n\
-                 \x20           {name}_data: Vec::new(),\n\
+                 \x20           // Seeded at 8 bytes/cell so steady-state fills skip the\n\
+                 \x20           // doubling-realloc memcpys; overshoot is only untouched\n\
+                 \x20           // virtual pages, undershoot just resumes doubling.\n\
+                 \x20           {name}_data: Vec::with_capacity(rows * 8),\n\
                  \x20           {name}_valid: Vec::with_capacity(rows / 64 + 1),"
             );
         } else {
@@ -4661,6 +4803,41 @@ fn push_columns_api(
          \x20           m &= m - 1;\n\
          \x20       }}\n\
          \x20   }}\n\n\
+         \x20   /// [`Self::drive`] twin fed pre-extracted block positions by the\n\
+         \x20   /// AVX-512 VBMI2 driver: identical per-position semantics, but the\n\
+         \x20   /// loop is counted and every position load is independent, so no\n\
+         \x20   /// serial trailing-zero/clear-bit chain forms. Bit j of `term`\n\
+         \x20   /// flags position j as a terminator (`pext`-compacted).\n\
+         \x20   #[cfg(target_arch = \"x86_64\")]\n\
+         \x20   #[inline]\n\
+         \x20   pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {{\n\
+         \x20       for &p8 in &pos[..count] {{\n\
+         \x20           let p = base + p8 as u32;\n\
+         \x20           if term & 1 != 0 {{\n\
+         \x20               if self.emitting {{\n\
+         \x20                   self.flush(p);\n\
+         \x20               }} else {{\n\
+         \x20                   self.emitting = true;\n\
+         \x20               }}\n\
+         \x20               self.record_start = p + 1;\n\
+         \x20               self.field_start = p + 1;\n\
+         \x20               self.ordinal = 0;\n\
+         \x20               self.found = 0;\n\
+         \x20               if p >= self.end {{\n\
+         \x20                   self.done = true;\n\
+         \x20                   return;\n\
+         \x20               }}\n\
+         \x20           }} else if self.emitting {{\n\
+         \x20               match self.ordinal {{\n\
+         {sep_arms}\
+         \x20               _ => {{}}\n\
+         \x20               }}\n\
+         \x20               self.ordinal += 1;\n\
+         \x20               self.field_start = p + 1;\n\
+         \x20           }}\n\
+         \x20           term >>= 1;\n\
+         \x20       }}\n\
+         \x20   }}\n\n\
          \x20   /// Emit the row terminated (exclusively) at `end`.\n\
          \x20   fn flush(&mut self, end: u32) {{\n\
          \x20       let data = self.cols.data;\n\
@@ -4729,7 +4906,7 @@ fn push_columns_api(
                 "        let (cfrom, cto) = self.pending[{k}];\n\
                  \x20       let ok = self.found & {found_bit} != 0;\n\
                  \x20       if ok {{\n\
-                 \x20           append_clean(&mut self.cols.{name}_data, &data[cfrom as usize..cto as usize]);\n\
+                 \x20           append_clean(&mut self.cols.{name}_data, data, cfrom as usize, cto as usize);\n\
                  \x20       }}\n\
                  \x20       assert!(\n\
                  \x20           self.cols.{name}_data.len() <= i32::MAX as usize,\n\
@@ -4889,6 +5066,18 @@ fn push_columns_api(
          \x20   if std::arch::is_x86_feature_detected!(\"avx512f\")\n\
          \x20       && std::arch::is_x86_feature_detected!(\"avx512bw\")\n\
          \x20       && std::arch::is_x86_feature_detected!(\"avx512vl\")\n\
+         \x20       && std::arch::is_x86_feature_detected!(\"avx512vbmi2\")\n\
+         \x20       && std::arch::is_x86_feature_detected!(\"bmi2\")\n\
+         \x20       && std::arch::is_x86_feature_detected!(\"pclmulqdq\")\n\
+         \x20   {{\n\
+         \x20       // SAFETY: the required target features were just detected.\n\
+         \x20       unsafe {{ avx512::index_cells_compress({seed_param}) }};\n\
+         \x20       return;\n\
+         \x20   }}\n\
+         \x20   #[cfg(target_arch = \"x86_64\")]\n\
+         \x20   if std::arch::is_x86_feature_detected!(\"avx512f\")\n\
+         \x20       && std::arch::is_x86_feature_detected!(\"avx512bw\")\n\
+         \x20       && std::arch::is_x86_feature_detected!(\"avx512vl\")\n\
          \x20       && std::arch::is_x86_feature_detected!(\"pclmulqdq\")\n\
          \x20   {{\n\
          \x20       // SAFETY: the required target features were just detected.\n\
@@ -4945,46 +5134,196 @@ fn push_columns_api(
              \x20       handles.into_iter().map(|h| h.join().expect(\"columns thread ok\")).collect()\n\
              \x20   }})\n\
              }}\n\n\
-             /// Parallel [`parse_columns`]: parses independent worker chunks,\n\
-             /// then concatenates them into the legacy single-`Columns` layout.\n\
+             /// Parallel [`parse_columns`]: parses independent worker chunks, then\n\
+             /// scatters them into the legacy single-`Columns` layout concurrently.\n\
+             /// Destination buffers are exact-sized up front and carved into one\n\
+             /// disjoint uninitialized slice per part, so every worker copies (and\n\
+             /// rebases string offsets) in parallel; only the validity bitmaps —\n\
+             /// rows/8 bytes, bit-shifted across each seam — join serially.\n\
              /// Use [`parse_columns_chunks_par`] when chunked table output is\n\
-             /// acceptable and the final copy would dominate runtime.\n\
+             /// acceptable and even the parallel copy would dominate runtime.\n\
              pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {{\n\
              \x20   let parts = parse_columns_chunks_par(data, threads);\n\
              \x20   if parts.len() == 1 {{\n\
              \x20       return parts.into_iter().next().expect(\"one columns chunk\");\n\
              \x20   }}\n\
-             \x20   let mut cols = Columns::with_capacity(data, parts.iter().map(|p| p.rows).sum::<usize>());\n\
-             \x20   for part in &parts {{\n"
+             \x20   let rows_total: usize = parts.iter().map(|p| p.rows).sum();\n\
+             \x20   let mut cols = Columns::with_capacity(data, rows_total);\n"
         );
         for column in columns {
             let name = column.field_name();
             if column.ty == ColumnType::Str {
-                // String chunks: data buffers concatenate, offsets rebase by
-                // the merged data length (skipping each part's leading 0).
                 let _ = writeln!(
                     code,
-                    "        let {name}_base = cols.{name}_data.len();\n\
-                     \x20       assert!(\n\
-                     \x20           {name}_base + part.{name}_data.len() <= i32::MAX as usize,\n\
-                     \x20           \"string column '{name}' exceeds the 2 GiB Arrow i32-offset limit\"\n\
-                     \x20       );\n\
-                     \x20       cols.{name}_data.extend_from_slice(&part.{name}_data);\n\
-                     \x20       cols.{name}_offsets\n\
-                     \x20           .extend(part.{name}_offsets[1..].iter().map(|&o| o + {name}_base as i32));\n\
-                     \x20       append_bitmap(&mut cols.{name}_valid, cols.rows, &part.{name}_valid, part.rows);"
+                    "    let {name}_total: usize = parts.iter().map(|p| p.{name}_data.len()).sum();\n\
+                     \x20   assert!(\n\
+                     \x20       {name}_total <= i32::MAX as usize,\n\
+                     \x20       \"string column '{name}' exceeds the 2 GiB Arrow i32-offset limit\"\n\
+                     \x20   );\n\
+                     \x20   cols.{name}_data.reserve({name}_total);\n\
+                     \x20   cols.{name}_offsets.reserve(rows_total);"
+                );
+            } else {
+                let _ = writeln!(code, "    cols.{name}.reserve(rows_total);");
+            }
+        }
+        code.push_str("    {\n");
+        for column in columns {
+            let name = column.field_name();
+            if column.ty == ColumnType::Str {
+                let _ = writeln!(
+                    code,
+                    "        let mut {name}_data_rest =\n\
+                     \x20           &mut cols.{name}_data.spare_capacity_mut()[..{name}_total];\n\
+                     \x20       let mut {name}_data_slots: Vec<&mut [std::mem::MaybeUninit<u8>]> =\n\
+                     \x20           Vec::with_capacity(parts.len());\n\
+                     \x20       let mut {name}_offsets_rest =\n\
+                     \x20           &mut cols.{name}_offsets.spare_capacity_mut()[..rows_total];\n\
+                     \x20       let mut {name}_offsets_slots: Vec<&mut [std::mem::MaybeUninit<i32>]> =\n\
+                     \x20           Vec::with_capacity(parts.len());"
+                );
+            } else {
+                let ty = column.rust_type();
+                let _ = writeln!(
+                    code,
+                    "        let mut {name}_rest = &mut cols.{name}.spare_capacity_mut()[..rows_total];\n\
+                     \x20       let mut {name}_slots: Vec<&mut [std::mem::MaybeUninit<{ty}>]> =\n\
+                     \x20           Vec::with_capacity(parts.len());"
+                );
+            }
+        }
+        code.push_str("        for part in &parts {\n");
+        for column in columns {
+            let name = column.field_name();
+            if column.ty == ColumnType::Str {
+                let _ = writeln!(
+                    code,
+                    "            assert_eq!(part.{name}_offsets.len(), part.rows + 1, \"one offset per row\");\n\
+                     \x20           let (head, tail) = {name}_data_rest.split_at_mut(part.{name}_data.len());\n\
+                     \x20           {name}_data_slots.push(head);\n\
+                     \x20           {name}_data_rest = tail;\n\
+                     \x20           let (head, tail) = {name}_offsets_rest.split_at_mut(part.rows);\n\
+                     \x20           {name}_offsets_slots.push(head);\n\
+                     \x20           {name}_offsets_rest = tail;"
                 );
             } else {
                 let _ = writeln!(
                     code,
-                    "        cols.{name}.extend_from_slice(&part.{name});\n\
-                     \x20       append_bitmap(&mut cols.{name}_valid, cols.rows, &part.{name}_valid, part.rows);"
+                    "            assert_eq!(part.{name}.len(), part.rows, \"one cell per row\");\n\
+                     \x20           let (head, tail) = {name}_rest.split_at_mut(part.rows);\n\
+                     \x20           {name}_slots.push(head);\n\
+                     \x20           {name}_rest = tail;"
+                );
+            }
+        }
+        code.push_str("        }\n        std::thread::scope(|s| {\n");
+        for column in columns {
+            let name = column.field_name();
+            if column.ty == ColumnType::Str {
+                let _ = writeln!(
+                    code,
+                    "            let mut {name}_data_slots = {name}_data_slots.into_iter();\n\
+                     \x20           let mut {name}_offsets_slots = {name}_offsets_slots.into_iter();\n\
+                     \x20           let mut {name}_base = 0usize;"
+                );
+            } else {
+                let _ = writeln!(
+                    code,
+                    "            let mut {name}_slots = {name}_slots.into_iter();"
+                );
+            }
+        }
+        code.push_str("            for part in &parts {\n");
+        for column in columns {
+            let name = column.field_name();
+            if column.ty == ColumnType::Str {
+                let _ = writeln!(
+                    code,
+                    "                let {name}_data_slot = {name}_data_slots.next().expect(\"slot per part\");\n\
+                     \x20               let {name}_offsets_slot = {name}_offsets_slots.next().expect(\"slot per part\");\n\
+                     \x20               let {name}_rebase = {name}_base as i32;\n\
+                     \x20               {name}_base += part.{name}_data.len();"
+                );
+            } else {
+                let _ = writeln!(
+                    code,
+                    "                let {name}_slot = {name}_slots.next().expect(\"slot per part\");"
+                );
+            }
+        }
+        code.push_str("                s.spawn(move || {\n");
+        for column in columns {
+            let name = column.field_name();
+            if column.ty == ColumnType::Str {
+                let _ = writeln!(
+                    code,
+                    "                    // SAFETY: the slot is this part's disjoint slice of spare\n\
+                     \x20                   // capacity, split to exactly the source length; the copy\n\
+                     \x20                   // initializes every element.\n\
+                     \x20                   unsafe {{\n\
+                     \x20                       std::ptr::copy_nonoverlapping(\n\
+                     \x20                           part.{name}_data.as_ptr(),\n\
+                     \x20                           {name}_data_slot.as_mut_ptr().cast::<u8>(),\n\
+                     \x20                           part.{name}_data.len(),\n\
+                     \x20                       );\n\
+                     \x20                   }}\n\
+                     \x20                   for (dst, &o) in {name}_offsets_slot.iter_mut().zip(&part.{name}_offsets[1..]) {{\n\
+                     \x20                       dst.write(o + {name}_rebase);\n\
+                     \x20                   }}"
+                );
+            } else {
+                let ty = column.rust_type();
+                let _ = writeln!(
+                    code,
+                    "                    // SAFETY: disjoint slot of spare capacity, exact length.\n\
+                     \x20                   unsafe {{\n\
+                     \x20                       std::ptr::copy_nonoverlapping(\n\
+                     \x20                           part.{name}.as_ptr(),\n\
+                     \x20                           {name}_slot.as_mut_ptr().cast::<{ty}>(),\n\
+                     \x20                           part.{name}.len(),\n\
+                     \x20                       );\n\
+                     \x20                   }}"
                 );
             }
         }
         code.push_str(
-            "        cols.rows += part.rows;\n\
+            "                });\n\
+             \x20           }\n\
+             \x20       });\n\
              \x20   }\n\
+             \x20   // SAFETY: the scatter initialized every element reserved above.\n\
+             \x20   unsafe {\n",
+        );
+        for column in columns {
+            let name = column.field_name();
+            if column.ty == ColumnType::Str {
+                let _ = writeln!(
+                    code,
+                    "        cols.{name}_data.set_len({name}_total);\n\
+                     \x20       cols.{name}_offsets.set_len(1 + rows_total);"
+                );
+            } else {
+                let _ = writeln!(code, "        cols.{name}.set_len(rows_total);");
+            }
+        }
+        code.push_str(
+            "    }\n\
+             \x20   // Validity bitmaps are rows/8 bytes; the serial bit-shift join\n\
+             \x20   // is noise next to the scattered column copies above.\n\
+             \x20   let mut rows_done = 0usize;\n\
+             \x20   for part in &parts {\n",
+        );
+        for column in columns {
+            let name = column.field_name();
+            let _ = writeln!(
+                code,
+                "        append_bitmap(&mut cols.{name}_valid, rows_done, &part.{name}_valid, part.rows);"
+            );
+        }
+        code.push_str(
+            "        rows_done += part.rows;\n\
+             \x20   }\n\
+             \x20   cols.rows = rows_total;\n\
              \x20   cols\n\
              }\n\n\
              /// Append `src_rows` bits of `src` onto a bitmap currently holding\n\
@@ -5416,6 +5755,18 @@ fn index_field_bytes_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut F
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
         && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_field_bytes_compress(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
@@ -5479,6 +5830,36 @@ impl<'a> FieldByteSink<'a> {
                 self.field_start = p + 1;
             }
             m &= m - 1;
+        }
+    }
+
+    /// [`Self::drive`] twin fed pre-extracted block positions by the
+    /// AVX-512 VBMI2 driver: identical per-position semantics, but the
+    /// loop is counted and every position load is independent, so no
+    /// serial trailing-zero/clear-bit chain forms. Bit j of `term`
+    /// flags position j as a terminator (`pext`-compacted).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {
+        for &p8 in &pos[..count] {
+            let p = base + p8 as u32;
+            if term & 1 != 0 {
+                if self.emitting {
+                    self.flush_field(p, true);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                self.flush_field(p, false);
+                self.field_start = p + 1;
+            }
+            term >>= 1;
         }
     }
 
@@ -5802,6 +6183,18 @@ fn @DISPATCH@(data: &[u8], seed: u64, start: usize, sink: &mut @SINK@) {
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
         && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::@INDEX@_compress(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
@@ -5884,6 +6277,49 @@ impl<'a> @SINK@<'a> {
                 self.field_start = p + 1;
             }
             m &= m - 1;
+        }
+    }
+
+    /// [`Self::drive`] twin fed pre-extracted block positions by the
+    /// AVX-512 VBMI2 driver: identical per-position semantics, but the
+    /// loop is counted and every position load is independent, so no
+    /// serial trailing-zero/clear-bit chain forms. Bit j of `term`
+    /// flags position j as a terminator (`pext`-compacted).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {
+        for &p8 in &pos[..count] {
+            let p = base + p8 as u32;
+            if term & 1 != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+@TEXT_DRIVE_ARM@                    5 => {
+                        self.pending[@LAT_IDX@] = (self.field_start, p);
+                        self.found |= @LAT_BIT@;
+                    }
+                    6 => {
+                        self.pending[@LON_IDX@] = (self.field_start, p);
+                        self.found |= @LON_BIT@;
+                    }
+                    _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            term >>= 1;
         }
     }
 
@@ -6034,6 +6470,18 @@ fn index_vcf_stats_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut Vcf
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
         && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_vcf_stats_compress(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
@@ -6124,6 +6572,57 @@ impl<'a> VcfStatsSink<'a> {
                 self.field_start = p + 1;
             }
             m &= m - 1;
+        }
+    }
+
+    /// [`Self::drive`] twin fed pre-extracted block positions by the
+    /// AVX-512 VBMI2 driver: identical per-position semantics, but the
+    /// loop is counted and every position load is independent, so no
+    /// serial trailing-zero/clear-bit chain forms. Bit j of `term`
+    /// flags position j as a terminator (`pext`-compacted).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {
+        for &p8 in &pos[..count] {
+            let p = base + p8 as u32;
+            if term & 1 != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+                    1 => {
+                        self.pending[0] = (self.field_start, p);
+                        self.found |= 1;
+                    }
+                    3 => {
+                        self.pending[1] = (self.field_start, p);
+                        self.found |= 2;
+                    }
+                    4 => {
+                        self.pending[2] = (self.field_start, p);
+                        self.found |= 4;
+                    }
+                    5 => {
+                        self.pending[3] = (self.field_start, p);
+                        self.found |= 8;
+                    }
+                    _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            term >>= 1;
         }
     }
 
@@ -6342,14 +6841,25 @@ const FLOAT_CELL_TPL: &str = r#"/// Parse a float cell with the exact semantics 
 /// std since Rust 1.55 -- the fallback is rarely taken, not slow.
 #[inline(always)]
 fn parse_f64_cell(s: &[u8]) -> Option<f64> {
+    if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s) {
+        // `value` is nonnegative, so OR-ing the sign bit is the exact
+        // branchless form of negation -- signs vary per cell, and a
+        // conditional negate mispredicts on random-sign data.
+        let value = mantissa as f64 / 1_000_000.0;
+        return Some(f64::from_bits(value.to_bits() | (neg as u64) << 63));
+    }
+    parse_f64_general(s)
+}
+
+/// The general Clinger scanner behind [`parse_f64_cell`], kept out of
+/// line so the fixed-shape fast path stays icache-dense; streams whose
+/// cells all match the fixed shape never execute this body.
+#[inline(never)]
+fn parse_f64_general(s: &[u8]) -> Option<f64> {
     const POW10: [f64; 23] = [
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
         1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
     ];
-    if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s) {
-        let value = mantissa as f64 / 1_000_000.0;
-        return Some(if neg { -value } else { value });
-    }
     let (neg, rest) = match s.split_first() {
         Some((&b'-', rest)) => (true, rest),
         Some((&b'+', rest)) => (false, rest),
@@ -6411,7 +6921,8 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
     } else {
         mantissa as f64 * POW10[exp10 as usize]
     };
-    Some(if neg { -value } else { value })
+    // Branchless sign application; `value` is nonnegative here.
+    Some(f64::from_bits(value.to_bits() | (neg as u64) << 63))
 }
 
 #[cold]
@@ -6419,71 +6930,78 @@ fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
     std::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
-#[inline]
+/// SWAR fast path for `[-]d{1,3}.d{6}` cells (total length 8-11). Every
+/// accepted shape ends in `d.dddddd`, so the final 8 bytes are parsed with
+/// one unaligned load, one all-digits SWAR test, and three multiplies. The
+/// 0-3 prefix bytes (sign plus up to two high whole digits) are handled
+/// without branching on the length: the first 4 bytes are loaded once,
+/// masked to the prefix, and the digits left-padded with ASCII zeros so a
+/// single 16-bit nibble test validates them. Cell length and sign vary
+/// per row, so every data-dependent decision here stays branch-free; the
+/// remaining branches are shape rejections that a fixed-format stream
+/// never takes. Accepts exactly the strings the shape describes.
+#[inline(always)]
 fn parse_fixed_6_decimal_signed(s: &[u8]) -> Option<(bool, u64)> {
-    match s.len() {
-        8 if s[1] == b'.' => {
-            let mantissa = parse_decimal_digit(s[0])? * 1_000_000 + parse_6_digits(&s[2..8])?;
-            Some((false, mantissa))
-        }
-        9 if s[2] == b'.' => {
-            let (neg, whole) = if s[0] == b'-' {
-                (true, parse_decimal_digit(s[1])?)
-            } else {
-                (
-                    false,
-                    parse_decimal_digit(s[0])? * 10 + parse_decimal_digit(s[1])?,
-                )
-            };
-            Some((neg, whole * 1_000_000 + parse_6_digits(&s[3..9])?))
-        }
-        10 if s[3] == b'.' => {
-            let (neg, whole) = if s[0] == b'-' {
-                (
-                    true,
-                    parse_decimal_digit(s[1])? * 10 + parse_decimal_digit(s[2])?,
-                )
-            } else {
-                (
-                    false,
-                    parse_decimal_digit(s[0])? * 100
-                        + parse_decimal_digit(s[1])? * 10
-                        + parse_decimal_digit(s[2])?,
-                )
-            };
-            Some((neg, whole * 1_000_000 + parse_6_digits(&s[4..10])?))
-        }
-        11 if s[0] == b'-' && s[4] == b'.' => {
-            let whole = parse_decimal_digit(s[1])? * 100
-                + parse_decimal_digit(s[2])? * 10
-                + parse_decimal_digit(s[3])?;
-            Some((true, whole * 1_000_000 + parse_6_digits(&s[5..11])?))
-        }
-        _ => None,
+    let len = s.len();
+    if !(8..=11).contains(&len) {
+        return None;
     }
+    // Little-endian tail: byte 0 = last whole digit, byte 1 = '.',
+    // bytes 2..8 = the six fraction digits in string order.
+    let tail = u64::from_le_bytes(s[len - 8..].try_into().unwrap());
+    if tail >> 8 & 0xFF != u64::from(b'.') {
+        return None;
+    }
+    // Overwrite the dot with '0' so one SWAR digit test covers all 8
+    // bytes; the phantom '0' lands in the 10^6 place and is removed by
+    // rescaling the whole digit below.
+    let block = (tail & !0xFF00) | (u64::from(b'0') << 8);
+    // Prefix = the len-8 bytes before the tail, kept from one 4-byte load.
+    let prefix_len = (len - 8) as u32;
+    let prefix = u32::from_le_bytes(s[..4].try_into().unwrap())
+        & ((1u32 << (8 * prefix_len)) - 1);
+    let neg = prefix & 0xFF == u32::from(b'-');
+    let digits = prefix >> (8 * neg as u32);
+    let count = prefix_len - neg as u32;
+    if count > 2 {
+        return None;
+    }
+    // Left-pad to exactly two ASCII digits ('0' fill on the significant
+    // side), so `aligned` always parses as d*10 + d.
+    let aligned = (digits << (8 * (2 - count))) | (0x3030u32 >> (8 * count));
+    let two_digits = ((aligned & 0xF0F0)
+        | ((aligned.wrapping_add(0x0606) & 0xF0F0) >> 4))
+        == 0x3333;
+    if !(two_digits && swar_all_digits(block)) {
+        return None;
+    }
+    let d0 = (block & 0xFF) - u64::from(b'0');
+    // parse = d0*1e7 + frac; the mantissa wants d0*1e6 + frac.
+    let tail_mantissa = swar_parse_8_digits(block) - d0 * 9_000_000;
+    let hi = u64::from(aligned & 0xF) * 10 + u64::from(aligned >> 8 & 0xF);
+    Some((neg, hi * 10_000_000 + tail_mantissa))
 }
 
+/// True iff every byte of `block` is ASCII `'0'..='9'`: each high nibble
+/// must be 3 and adding 6 to each low nibble must not carry into it. A
+/// cross-byte carry can only originate in a byte whose own test already
+/// fails, so the wrapping add never turns a non-digit into a digit.
 #[inline]
-fn parse_6_digits(s: &[u8]) -> Option<u64> {
-    debug_assert_eq!(s.len(), 6);
-    Some(
-        parse_decimal_digit(s[0])? * 100_000
-            + parse_decimal_digit(s[1])? * 10_000
-            + parse_decimal_digit(s[2])? * 1_000
-            + parse_decimal_digit(s[3])? * 100
-            + parse_decimal_digit(s[4])? * 10
-            + parse_decimal_digit(s[5])?,
-    )
+fn swar_all_digits(block: u64) -> bool {
+    ((block & 0xF0F0_F0F0_F0F0_F0F0)
+        | ((block.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
+        == 0x3333_3333_3333_3333
 }
 
+/// Value of 8 validated ASCII digits held little-endian in string order
+/// (low byte = most significant digit): three widening multiply-adds
+/// combine neighbors into pairs, quads, then the full 8-digit value.
 #[inline]
-fn parse_decimal_digit(b: u8) -> Option<u64> {
-    let digit = b.wrapping_sub(b'0');
-    if digit <= 9 {
-        Some(digit as u64)
-    } else {
-        None
-    }
+fn swar_parse_8_digits(block: u64) -> u64 {
+    let v = block & 0x0F0F_0F0F_0F0F_0F0F;
+    let v = v.wrapping_mul(2561) >> 8;
+    let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
 }
 
 "#;
@@ -6757,19 +7275,41 @@ fn index_tape_block_dispatch(block: &[u8; 64], live: u64, carries: &mut [u64; @K
 fn append_clean_fn(dialect: &crate::formats::Dialect) -> String {
     use crate::formats::Escape;
     match (dialect.quote, dialect.escape) {
-        (None, _) => r#"/// No quote convention in this dialect: cells append verbatim.
+        (None, _) => r#"/// No quote convention in this dialect: cells append verbatim. Cells of
+/// up to 16 bytes clear of the input tail take one unconditional 16-byte
+/// copy into reserved spare capacity instead of a length-dispatched
+/// memcpy — string cells are typically short and this path is branch-flat.
 #[inline]
-fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
-    out.extend_from_slice(raw);
+fn append_clean(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize) {
+    let n = to - from;
+    if n <= 16 && to + 16 <= data.len() {
+        out.reserve(16);
+        // SAFETY: 16 bytes are readable at `data[from..]` (checked above)
+        // and 16 spare bytes were just reserved; set_len exposes only the
+        // cell's `n` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(from),
+                out.as_mut_ptr().add(out.len()),
+                16,
+            );
+            out.set_len(out.len() + n);
+        }
+    } else {
+        out.extend_from_slice(&data[from..to]);
+    }
 }
 
 "#
         .to_string(),
         (Some(q), Escape::None) => format!(
-            r#"/// Append `raw` cleaned: outer quotes stripped, doubled quotes
-/// collapsed. Unquoted cells are one memcpy.
-fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
+            r#"/// Append the `data[from..to]` cell cleaned: outer quotes stripped,
+/// doubled quotes collapsed. Unquoted cells of up to 16 bytes clear of
+/// the input tail take one unconditional 16-byte copy into reserved
+/// spare capacity; longer unquoted cells are one memcpy.
+fn append_clean(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize) {{
     const Q: u8 = {q}u8;
+    let raw = &data[from..to];
     if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
         let inner = &raw[1..raw.len() - 1];
         let mut i = 0;
@@ -6781,6 +7321,19 @@ fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
                 i += 1;
             }}
         }}
+    }} else if raw.len() <= 16 && to + 16 <= data.len() {{
+        out.reserve(16);
+        // SAFETY: 16 bytes are readable at `data[from..]` (checked above)
+        // and 16 spare bytes were just reserved; set_len exposes only the
+        // cell's bytes.
+        unsafe {{
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(from),
+                out.as_mut_ptr().add(out.len()),
+                16,
+            );
+            out.set_len(out.len() + raw.len());
+        }}
     }} else {{
         out.extend_from_slice(raw);
     }}
@@ -6789,11 +7342,13 @@ fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
 "#
         ),
         (Some(q), Escape::Backslash(e)) => format!(
-            r#"/// Append `raw` cleaned: outer quotes stripped, backslash escapes
-/// resolved (`\x` -> `x`). Escape-free cells are one memcpy.
-fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {{
+            r#"/// Append the `data[from..to]` cell cleaned: outer quotes stripped,
+/// backslash escapes resolved (`\x` -> `x`). Escape-free cells are one
+/// memcpy.
+fn append_clean(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize) {{
     const Q: u8 = {q}u8;
     const E: u8 = {e}u8;
+    let raw = &data[from..to];
     let body = if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {{
         &raw[1..raw.len() - 1]
     }} else {{
@@ -6955,7 +7510,7 @@ fn emit_step_body(
 ) {
     let live = live_nodes(graph, roots);
     let class_args = match flavor {
-        Flavor::Avx512 => "lo, hi",
+        Flavor::Avx512 => "v",
         Flavor::Avx2 => "lo, hi",
         Flavor::Neon => "b0, b1, b2, b3",
     };

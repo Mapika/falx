@@ -991,6 +991,18 @@ fn index_field_bytes_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut F
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
         && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_field_bytes_compress(data, seed, start, sink) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
         && std::arch::is_x86_feature_detected!("pclmulqdq")
     {
         // SAFETY: the required target features were just detected.
@@ -1062,6 +1074,36 @@ impl<'a> FieldByteSink<'a> {
                 self.field_start = p + 1;
             }
             m &= m - 1;
+        }
+    }
+
+    /// [`Self::drive`] twin fed pre-extracted block positions by the
+    /// AVX-512 VBMI2 driver: identical per-position semantics, but the
+    /// loop is counted and every position load is independent, so no
+    /// serial trailing-zero/clear-bit chain forms. Bit j of `term`
+    /// flags position j as a terminator (`pext`-compacted).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {
+        for &p8 in &pos[..count] {
+            let p = base + p8 as u32;
+            if term & 1 != 0 {
+                if self.emitting {
+                    self.flush_field(p, true);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                self.flush_field(p, false);
+                self.field_start = p + 1;
+            }
+            term >>= 1;
         }
     }
 
@@ -1317,30 +1359,88 @@ mod avx512 {
         }
     }
 
+    /// [`index_field_bytes`] twin for AVX-512 VBMI2 + BMI2 hosts: block structural
+    /// positions arrive via one `vpcompressb` over a byte iota and terminator
+    /// flags via `pext`, replacing the serial trailing-zero/clear-bit walk
+    /// with a counted loop of independent loads. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "avx512vbmi2", enable = "bmi2", enable = "pclmulqdq")]
+    pub(crate) fn index_field_bytes_compress(data: &[u8], seed: u64, start: usize, sink: &mut super::FieldByteSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        let iota = byte_iota();
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            let mask = mask & live;
+            let term = term & live;
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+        }
+    }
+
+    /// The bytes 0..64 in lane order: compressing this under a structural
+    /// mask yields the in-block byte offset of every set bit.
+    #[target_feature(enable = "avx512f")]
+    fn byte_iota() -> __m512i {
+        const IOTA: [u8; 64] = {
+            let mut a = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        };
+        // SAFETY: `IOTA` is a readable 64-byte buffer.
+        unsafe { _mm512_loadu_si512(IOTA.as_ptr() as *const __m512i) }
+    }
+
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 1]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        };
-        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v = unsafe { _mm512_loadu_si512(ptr as *const __m512i) };
+        let v0 = eq_mask(v, 34u8); // class "\""
         let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v2 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v2 = eq_mask(v, 10u8) | eq_mask(v, 44u8); // class "\n,"
         let v3 = !v1;
         let v4 = v2 & v3;
-        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v5 = eq_mask(v, 10u8); // class "\n"
         (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 
     #[target_feature(enable = "pclmulqdq")]

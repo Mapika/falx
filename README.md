@@ -33,9 +33,9 @@ schema-aware aggregation, and BGZF block streaming. The claim is deliberately
 bounded: these are local, reproducible results on the datasets and libraries
 listed below, not a universal claim about every parser workload.
 
-Hardware for the latest runs: Xeon w7-3455, Sapphire Rapids, 24 physical cores,
-48 logical threads, AVX-512F/BW/VL + PCLMULQDQ. Parallel falx figures use 24
-threads unless noted. CSV and NDJSON files are 1 GiB.
+Hardware for the cross-library runs: Xeon w7-3455, Sapphire Rapids, 24 physical
+cores, 48 logical threads, AVX-512F/BW/VL + PCLMULQDQ. Parallel falx figures use
+24 threads unless noted. CSV and NDJSON files are 1 GiB.
 
 | Lane | falx | Fastest external baseline | Result |
 |---|---:|---:|---:|
@@ -44,6 +44,55 @@ threads unless noted. CSV and NDJSON files are 1 GiB.
 | CSV count/sum(Latitude)/sum(Longitude), fused | 9.80 GiB/s | Polars 1.41.2: 2.04 GiB/s | 4.8x |
 | NDJSON `sum(id + nested.score)` | 38.19 GiB/s | simdjson C++: 2.76 GiB/s | 13.9x |
 | BGZF block streaming, 1 GiB raw VCF | 0.074 s median | htslib bgzip: 0.10-0.12 s | ~1.4x |
+
+The falx column above predates the 2026-08 optimization pass below and is
+conservative for the CSV lanes: the same falx lanes have since improved by
++23-34% serial and up to 3.1x on parallel materialization (measured on a
+different machine — see the next section). The external baselines have not been
+re-run since, so the table keeps the older, matched-hardware falx numbers until
+the full matrix is repeated on the reference box.
+
+## 2026-08 Optimization Pass
+
+falx-before vs falx-after on one machine (dual EPYC 9575F, Zen 5, 128 physical
+cores, AVX-512 incl. VBMI2; 1 GiB generated datasets; parallel figures use 24
+threads unless noted; `bench_columns` materialization rows use the example's
+default thread count). Both builds ran the same lanes on the same box, so these
+ratios are hardware-independent falx improvements:
+
+| Lane | falx before | falx after | Delta |
+|---|---:|---:|---:|
+| CSV City + Latitude/Longitude materialization, parallel | 5.13 GiB/s | 16.03 GiB/s | 3.1x |
+| CSV Latitude/Longitude materialization, parallel | 9.36 GiB/s | 17.57 GiB/s | 1.9x |
+| CSV City + Latitude/Longitude materialization, serial | 0.99 GiB/s | 1.32 GiB/s | +34% |
+| CSV count/sum(lat,lon) fused, 1 thread | 1.24 GiB/s | 1.63 GiB/s | +31% |
+| CSV Latitude/Longitude materialization, serial | 1.17 GiB/s | 1.43 GiB/s | +23% |
+| CSV count/sum(lat,lon) fused, 24 threads | 27.44 GiB/s | 32.38 GiB/s | +18% |
+| NDJSON `sum(id + nested.score)`, 24 threads | 114.5 GiB/s | 114.4 GiB/s | held |
+
+Same-box context: the `csv` crate materializes the same columns at 0.42 GiB/s
+and `arrow-csv` at 0.53 GiB/s, checksum-identical to falx on every lane.
+
+What changed (all in the code generator; kernels regenerated):
+
+- fixed-shape decimal cells (`[-]d{1,3}.d{6}`) parse via one unaligned load and
+  a SWAR all-digits test instead of digit-at-a-time branching, with the sign
+  applied by ORing the sign bit (nonnegative mantissa) — random-sign data was
+  costing ~2 branch mispredicts per row
+- the general float scanner is outlined so the fixed-shape fast path stays
+  icache-dense
+- `parse_columns_par` scatters worker chunks into exact-sized disjoint slices
+  concurrently instead of a single-threaded concat (the prior parallel-scaling
+  ceiling for string columns)
+- string arenas are seeded at 8 bytes/cell instead of growing from empty
+- the AVX-512 structural step uses one 512-bit load and one `vpcmpb` per byte
+  class instead of paired 256-bit halves
+- hosts with AVX-512 VBMI2 + BMI2 (Ice Lake+, Zen 4+) get a compress-based
+  drive tier: `vpcompressb` over a byte iota extracts every structural position
+  of a block at once and `pext` compacts terminator flags, replacing the serial
+  trailing-zero/clear-bit walk; older AVX-512 hosts keep the prior path
+- short unquoted string cells append as one unconditional 16-byte copy into
+  reserved spare capacity
 
 Important benchmark boundaries:
 
@@ -106,7 +155,8 @@ for chunk in &chunks {
 ```
 
 `parse_columns_par` remains available and returns the legacy single `Columns`
-layout by concatenating the worker chunks.
+layout; worker chunks are scattered into the exact-sized destination buffers
+concurrently, so the flatten no longer serializes on one thread.
 
 String columns are cleaned into Arrow varbinary-style buffers. Byte columns are
 zero-copy raw spans into the source.

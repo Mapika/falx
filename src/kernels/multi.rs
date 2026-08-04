@@ -1035,27 +1035,19 @@ mod avx512 {
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 1]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        };
-        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v = unsafe { _mm512_loadu_si512(ptr as *const __m512i) };
+        let v0 = eq_mask(v, 34u8); // class "\""
         let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v2 = eq_mask(lo, hi, 9u8) | eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 32u8) | eq_mask(lo, hi, 38u8) | eq_mask(lo, hi, 44u8) | eq_mask(lo, hi, 47u8) | eq_mask(lo, hi, 58u8) | eq_mask(lo, hi, 59u8) | eq_mask(lo, hi, 61u8) | eq_mask(lo, hi, 124u8); // class "\t\n &,/:;=|"
+        let v2 = eq_mask(v, 9u8) | eq_mask(v, 10u8) | eq_mask(v, 32u8) | eq_mask(v, 38u8) | eq_mask(v, 44u8) | eq_mask(v, 47u8) | eq_mask(v, 58u8) | eq_mask(v, 59u8) | eq_mask(v, 61u8) | eq_mask(v, 124u8); // class "\t\n &,/:;=|"
         let v3 = !v1;
         let v4 = v2 & v3;
-        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v5 = eq_mask(v, 10u8); // class "\n"
         (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 
     #[target_feature(enable = "pclmulqdq")]

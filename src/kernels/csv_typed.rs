@@ -952,7 +952,10 @@ impl<'a> Columns<'a> {
             id: Vec::with_capacity(rows),
             id_valid: Vec::with_capacity(rows / 64 + 1),
             title_offsets: { let mut v = Vec::with_capacity(rows + 1); v.push(0); v },
-            title_data: Vec::new(),
+            // Seeded at 8 bytes/cell so steady-state fills skip the
+            // doubling-realloc memcpys; overshoot is only untouched
+            // virtual pages, undershoot just resumes doubling.
+            title_data: Vec::with_capacity(rows * 8),
             title_valid: Vec::with_capacity(rows / 64 + 1),
             value: Vec::with_capacity(rows),
             value_valid: Vec::with_capacity(rows / 64 + 1),
@@ -1037,6 +1040,45 @@ impl<'a> ColumnSink<'a> {
         }
     }
 
+    /// [`Self::drive`] twin fed pre-extracted block positions by the
+    /// AVX-512 VBMI2 driver: identical per-position semantics, but the
+    /// loop is counted and every position load is independent, so no
+    /// serial trailing-zero/clear-bit chain forms. Bit j of `term`
+    /// flags position j as a terminator (`pext`-compacted).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(crate) fn drive_positions(&mut self, pos: &[u8; 64], count: usize, mut term: u64, base: u32) {
+        for &p8 in &pos[..count] {
+            let p = base + p8 as u32;
+            if term & 1 != 0 {
+                if self.emitting {
+                    self.flush(p);
+                } else {
+                    self.emitting = true;
+                }
+                self.record_start = p + 1;
+                self.field_start = p + 1;
+                self.ordinal = 0;
+                self.found = 0;
+                if p >= self.end {
+                    self.done = true;
+                    return;
+                }
+            } else if self.emitting {
+                match self.ordinal {
+            0 => { self.pending[0] = (self.field_start, p); self.found |= 1; }
+            1 => { self.pending[1] = (self.field_start, p); self.found |= 2; }
+            2 => { self.pending[2] = (self.field_start, p); self.found |= 4; }
+            4 => { self.pending[3] = (self.field_start, p); self.found |= 8; }
+                _ => {}
+                }
+                self.ordinal += 1;
+                self.field_start = p + 1;
+            }
+            term >>= 1;
+        }
+    }
+
     /// Emit the row terminated (exclusively) at `end`.
     fn flush(&mut self, end: u32) {
         let data = self.cols.data;
@@ -1071,7 +1113,7 @@ impl<'a> ColumnSink<'a> {
         let (cfrom, cto) = self.pending[1];
         let ok = self.found & 2 != 0;
         if ok {
-            append_clean(&mut self.cols.title_data, &data[cfrom as usize..cto as usize]);
+            append_clean(&mut self.cols.title_data, data, cfrom as usize, cto as usize);
         }
         assert!(
             self.cols.title_data.len() <= i32::MAX as usize,
@@ -1130,6 +1172,18 @@ pub fn parse_columns(data: &[u8]) -> Columns<'_> {
 }
 
 fn index_cells_dispatch(data: &[u8], seed: u64, start: usize, sink: &mut ColumnSink) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        // SAFETY: the required target features were just detected.
+        unsafe { avx512::index_cells_compress(data, seed, start, sink) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
@@ -1207,34 +1261,146 @@ pub fn parse_columns_chunks_par(data: &[u8], threads: usize) -> Vec<Columns<'_>>
     })
 }
 
-/// Parallel [`parse_columns`]: parses independent worker chunks,
-/// then concatenates them into the legacy single-`Columns` layout.
+/// Parallel [`parse_columns`]: parses independent worker chunks, then
+/// scatters them into the legacy single-`Columns` layout concurrently.
+/// Destination buffers are exact-sized up front and carved into one
+/// disjoint uninitialized slice per part, so every worker copies (and
+/// rebases string offsets) in parallel; only the validity bitmaps —
+/// rows/8 bytes, bit-shifted across each seam — join serially.
 /// Use [`parse_columns_chunks_par`] when chunked table output is
-/// acceptable and the final copy would dominate runtime.
+/// acceptable and even the parallel copy would dominate runtime.
 pub fn parse_columns_par(data: &[u8], threads: usize) -> Columns<'_> {
     let parts = parse_columns_chunks_par(data, threads);
     if parts.len() == 1 {
         return parts.into_iter().next().expect("one columns chunk");
     }
-    let mut cols = Columns::with_capacity(data, parts.iter().map(|p| p.rows).sum::<usize>());
-    for part in &parts {
-        cols.id.extend_from_slice(&part.id);
-        append_bitmap(&mut cols.id_valid, cols.rows, &part.id_valid, part.rows);
-        let title_base = cols.title_data.len();
-        assert!(
-            title_base + part.title_data.len() <= i32::MAX as usize,
-            "string column 'title' exceeds the 2 GiB Arrow i32-offset limit"
-        );
-        cols.title_data.extend_from_slice(&part.title_data);
-        cols.title_offsets
-            .extend(part.title_offsets[1..].iter().map(|&o| o + title_base as i32));
-        append_bitmap(&mut cols.title_valid, cols.rows, &part.title_valid, part.rows);
-        cols.value.extend_from_slice(&part.value);
-        append_bitmap(&mut cols.value_valid, cols.rows, &part.value_valid, part.rows);
-        cols.label.extend_from_slice(&part.label);
-        append_bitmap(&mut cols.label_valid, cols.rows, &part.label_valid, part.rows);
-        cols.rows += part.rows;
+    let rows_total: usize = parts.iter().map(|p| p.rows).sum();
+    let mut cols = Columns::with_capacity(data, rows_total);
+    cols.id.reserve(rows_total);
+    let title_total: usize = parts.iter().map(|p| p.title_data.len()).sum();
+    assert!(
+        title_total <= i32::MAX as usize,
+        "string column 'title' exceeds the 2 GiB Arrow i32-offset limit"
+    );
+    cols.title_data.reserve(title_total);
+    cols.title_offsets.reserve(rows_total);
+    cols.value.reserve(rows_total);
+    cols.label.reserve(rows_total);
+    {
+        let mut id_rest = &mut cols.id.spare_capacity_mut()[..rows_total];
+        let mut id_slots: Vec<&mut [std::mem::MaybeUninit<i64>]> =
+            Vec::with_capacity(parts.len());
+        let mut title_data_rest =
+            &mut cols.title_data.spare_capacity_mut()[..title_total];
+        let mut title_data_slots: Vec<&mut [std::mem::MaybeUninit<u8>]> =
+            Vec::with_capacity(parts.len());
+        let mut title_offsets_rest =
+            &mut cols.title_offsets.spare_capacity_mut()[..rows_total];
+        let mut title_offsets_slots: Vec<&mut [std::mem::MaybeUninit<i32>]> =
+            Vec::with_capacity(parts.len());
+        let mut value_rest = &mut cols.value.spare_capacity_mut()[..rows_total];
+        let mut value_slots: Vec<&mut [std::mem::MaybeUninit<f64>]> =
+            Vec::with_capacity(parts.len());
+        let mut label_rest = &mut cols.label.spare_capacity_mut()[..rows_total];
+        let mut label_slots: Vec<&mut [std::mem::MaybeUninit<(u32, u32)>]> =
+            Vec::with_capacity(parts.len());
+        for part in &parts {
+            assert_eq!(part.id.len(), part.rows, "one cell per row");
+            let (head, tail) = id_rest.split_at_mut(part.rows);
+            id_slots.push(head);
+            id_rest = tail;
+            assert_eq!(part.title_offsets.len(), part.rows + 1, "one offset per row");
+            let (head, tail) = title_data_rest.split_at_mut(part.title_data.len());
+            title_data_slots.push(head);
+            title_data_rest = tail;
+            let (head, tail) = title_offsets_rest.split_at_mut(part.rows);
+            title_offsets_slots.push(head);
+            title_offsets_rest = tail;
+            assert_eq!(part.value.len(), part.rows, "one cell per row");
+            let (head, tail) = value_rest.split_at_mut(part.rows);
+            value_slots.push(head);
+            value_rest = tail;
+            assert_eq!(part.label.len(), part.rows, "one cell per row");
+            let (head, tail) = label_rest.split_at_mut(part.rows);
+            label_slots.push(head);
+            label_rest = tail;
+        }
+        std::thread::scope(|s| {
+            let mut id_slots = id_slots.into_iter();
+            let mut title_data_slots = title_data_slots.into_iter();
+            let mut title_offsets_slots = title_offsets_slots.into_iter();
+            let mut title_base = 0usize;
+            let mut value_slots = value_slots.into_iter();
+            let mut label_slots = label_slots.into_iter();
+            for part in &parts {
+                let id_slot = id_slots.next().expect("slot per part");
+                let title_data_slot = title_data_slots.next().expect("slot per part");
+                let title_offsets_slot = title_offsets_slots.next().expect("slot per part");
+                let title_rebase = title_base as i32;
+                title_base += part.title_data.len();
+                let value_slot = value_slots.next().expect("slot per part");
+                let label_slot = label_slots.next().expect("slot per part");
+                s.spawn(move || {
+                    // SAFETY: disjoint slot of spare capacity, exact length.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.id.as_ptr(),
+                            id_slot.as_mut_ptr().cast::<i64>(),
+                            part.id.len(),
+                        );
+                    }
+                    // SAFETY: the slot is this part's disjoint slice of spare
+                    // capacity, split to exactly the source length; the copy
+                    // initializes every element.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.title_data.as_ptr(),
+                            title_data_slot.as_mut_ptr().cast::<u8>(),
+                            part.title_data.len(),
+                        );
+                    }
+                    for (dst, &o) in title_offsets_slot.iter_mut().zip(&part.title_offsets[1..]) {
+                        dst.write(o + title_rebase);
+                    }
+                    // SAFETY: disjoint slot of spare capacity, exact length.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.value.as_ptr(),
+                            value_slot.as_mut_ptr().cast::<f64>(),
+                            part.value.len(),
+                        );
+                    }
+                    // SAFETY: disjoint slot of spare capacity, exact length.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            part.label.as_ptr(),
+                            label_slot.as_mut_ptr().cast::<(u32, u32)>(),
+                            part.label.len(),
+                        );
+                    }
+                });
+            }
+        });
     }
+    // SAFETY: the scatter initialized every element reserved above.
+    unsafe {
+        cols.id.set_len(rows_total);
+        cols.title_data.set_len(title_total);
+        cols.title_offsets.set_len(1 + rows_total);
+        cols.value.set_len(rows_total);
+        cols.label.set_len(rows_total);
+    }
+    // Validity bitmaps are rows/8 bytes; the serial bit-shift join
+    // is noise next to the scattered column copies above.
+    let mut rows_done = 0usize;
+    for part in &parts {
+        append_bitmap(&mut cols.id_valid, rows_done, &part.id_valid, part.rows);
+        append_bitmap(&mut cols.title_valid, rows_done, &part.title_valid, part.rows);
+        append_bitmap(&mut cols.value_valid, rows_done, &part.value_valid, part.rows);
+        append_bitmap(&mut cols.label_valid, rows_done, &part.label_valid, part.rows);
+        rows_done += part.rows;
+    }
+    cols.rows = rows_total;
     cols
 }
 
@@ -1329,14 +1495,25 @@ fn parse_8_digits(v: u64) -> u64 {
 /// std since Rust 1.55 -- the fallback is rarely taken, not slow.
 #[inline(always)]
 fn parse_f64_cell(s: &[u8]) -> Option<f64> {
+    if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s) {
+        // `value` is nonnegative, so OR-ing the sign bit is the exact
+        // branchless form of negation -- signs vary per cell, and a
+        // conditional negate mispredicts on random-sign data.
+        let value = mantissa as f64 / 1_000_000.0;
+        return Some(f64::from_bits(value.to_bits() | (neg as u64) << 63));
+    }
+    parse_f64_general(s)
+}
+
+/// The general Clinger scanner behind [`parse_f64_cell`], kept out of
+/// line so the fixed-shape fast path stays icache-dense; streams whose
+/// cells all match the fixed shape never execute this body.
+#[inline(never)]
+fn parse_f64_general(s: &[u8]) -> Option<f64> {
     const POW10: [f64; 23] = [
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
         1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
     ];
-    if let Some((neg, mantissa)) = parse_fixed_6_decimal_signed(s) {
-        let value = mantissa as f64 / 1_000_000.0;
-        return Some(if neg { -value } else { value });
-    }
     let (neg, rest) = match s.split_first() {
         Some((&b'-', rest)) => (true, rest),
         Some((&b'+', rest)) => (false, rest),
@@ -1398,7 +1575,8 @@ fn parse_f64_cell(s: &[u8]) -> Option<f64> {
     } else {
         mantissa as f64 * POW10[exp10 as usize]
     };
-    Some(if neg { -value } else { value })
+    // Branchless sign application; `value` is nonnegative here.
+    Some(f64::from_bits(value.to_bits() | (neg as u64) << 63))
 }
 
 #[cold]
@@ -1406,77 +1584,87 @@ fn parse_f64_fallback(s: &[u8]) -> Option<f64> {
     std::str::from_utf8(s).ok()?.parse::<f64>().ok()
 }
 
-#[inline]
+/// SWAR fast path for `[-]d{1,3}.d{6}` cells (total length 8-11). Every
+/// accepted shape ends in `d.dddddd`, so the final 8 bytes are parsed with
+/// one unaligned load, one all-digits SWAR test, and three multiplies. The
+/// 0-3 prefix bytes (sign plus up to two high whole digits) are handled
+/// without branching on the length: the first 4 bytes are loaded once,
+/// masked to the prefix, and the digits left-padded with ASCII zeros so a
+/// single 16-bit nibble test validates them. Cell length and sign vary
+/// per row, so every data-dependent decision here stays branch-free; the
+/// remaining branches are shape rejections that a fixed-format stream
+/// never takes. Accepts exactly the strings the shape describes.
+#[inline(always)]
 fn parse_fixed_6_decimal_signed(s: &[u8]) -> Option<(bool, u64)> {
-    match s.len() {
-        8 if s[1] == b'.' => {
-            let mantissa = parse_decimal_digit(s[0])? * 1_000_000 + parse_6_digits(&s[2..8])?;
-            Some((false, mantissa))
-        }
-        9 if s[2] == b'.' => {
-            let (neg, whole) = if s[0] == b'-' {
-                (true, parse_decimal_digit(s[1])?)
-            } else {
-                (
-                    false,
-                    parse_decimal_digit(s[0])? * 10 + parse_decimal_digit(s[1])?,
-                )
-            };
-            Some((neg, whole * 1_000_000 + parse_6_digits(&s[3..9])?))
-        }
-        10 if s[3] == b'.' => {
-            let (neg, whole) = if s[0] == b'-' {
-                (
-                    true,
-                    parse_decimal_digit(s[1])? * 10 + parse_decimal_digit(s[2])?,
-                )
-            } else {
-                (
-                    false,
-                    parse_decimal_digit(s[0])? * 100
-                        + parse_decimal_digit(s[1])? * 10
-                        + parse_decimal_digit(s[2])?,
-                )
-            };
-            Some((neg, whole * 1_000_000 + parse_6_digits(&s[4..10])?))
-        }
-        11 if s[0] == b'-' && s[4] == b'.' => {
-            let whole = parse_decimal_digit(s[1])? * 100
-                + parse_decimal_digit(s[2])? * 10
-                + parse_decimal_digit(s[3])?;
-            Some((true, whole * 1_000_000 + parse_6_digits(&s[5..11])?))
-        }
-        _ => None,
+    let len = s.len();
+    if !(8..=11).contains(&len) {
+        return None;
     }
-}
-
-#[inline]
-fn parse_6_digits(s: &[u8]) -> Option<u64> {
-    debug_assert_eq!(s.len(), 6);
-    Some(
-        parse_decimal_digit(s[0])? * 100_000
-            + parse_decimal_digit(s[1])? * 10_000
-            + parse_decimal_digit(s[2])? * 1_000
-            + parse_decimal_digit(s[3])? * 100
-            + parse_decimal_digit(s[4])? * 10
-            + parse_decimal_digit(s[5])?,
-    )
-}
-
-#[inline]
-fn parse_decimal_digit(b: u8) -> Option<u64> {
-    let digit = b.wrapping_sub(b'0');
-    if digit <= 9 {
-        Some(digit as u64)
-    } else {
-        None
+    // Little-endian tail: byte 0 = last whole digit, byte 1 = '.',
+    // bytes 2..8 = the six fraction digits in string order.
+    let tail = u64::from_le_bytes(s[len - 8..].try_into().unwrap());
+    if tail >> 8 & 0xFF != u64::from(b'.') {
+        return None;
     }
+    // Overwrite the dot with '0' so one SWAR digit test covers all 8
+    // bytes; the phantom '0' lands in the 10^6 place and is removed by
+    // rescaling the whole digit below.
+    let block = (tail & !0xFF00) | (u64::from(b'0') << 8);
+    // Prefix = the len-8 bytes before the tail, kept from one 4-byte load.
+    let prefix_len = (len - 8) as u32;
+    let prefix = u32::from_le_bytes(s[..4].try_into().unwrap())
+        & ((1u32 << (8 * prefix_len)) - 1);
+    let neg = prefix & 0xFF == u32::from(b'-');
+    let digits = prefix >> (8 * neg as u32);
+    let count = prefix_len - neg as u32;
+    if count > 2 {
+        return None;
+    }
+    // Left-pad to exactly two ASCII digits ('0' fill on the significant
+    // side), so `aligned` always parses as d*10 + d.
+    let aligned = (digits << (8 * (2 - count))) | (0x3030u32 >> (8 * count));
+    let two_digits = ((aligned & 0xF0F0)
+        | ((aligned.wrapping_add(0x0606) & 0xF0F0) >> 4))
+        == 0x3333;
+    if !(two_digits && swar_all_digits(block)) {
+        return None;
+    }
+    let d0 = (block & 0xFF) - u64::from(b'0');
+    // parse = d0*1e7 + frac; the mantissa wants d0*1e6 + frac.
+    let tail_mantissa = swar_parse_8_digits(block) - d0 * 9_000_000;
+    let hi = u64::from(aligned & 0xF) * 10 + u64::from(aligned >> 8 & 0xF);
+    Some((neg, hi * 10_000_000 + tail_mantissa))
 }
 
-/// Append `raw` cleaned: outer quotes stripped, doubled quotes
-/// collapsed. Unquoted cells are one memcpy.
-fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
+/// True iff every byte of `block` is ASCII `'0'..='9'`: each high nibble
+/// must be 3 and adding 6 to each low nibble must not carry into it. A
+/// cross-byte carry can only originate in a byte whose own test already
+/// fails, so the wrapping add never turns a non-digit into a digit.
+#[inline]
+fn swar_all_digits(block: u64) -> bool {
+    ((block & 0xF0F0_F0F0_F0F0_F0F0)
+        | ((block.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
+        == 0x3333_3333_3333_3333
+}
+
+/// Value of 8 validated ASCII digits held little-endian in string order
+/// (low byte = most significant digit): three widening multiply-adds
+/// combine neighbors into pairs, quads, then the full 8-digit value.
+#[inline]
+fn swar_parse_8_digits(block: u64) -> u64 {
+    let v = block & 0x0F0F_0F0F_0F0F_0F0F;
+    let v = v.wrapping_mul(2561) >> 8;
+    let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
+}
+
+/// Append the `data[from..to]` cell cleaned: outer quotes stripped,
+/// doubled quotes collapsed. Unquoted cells of up to 16 bytes clear of
+/// the input tail take one unconditional 16-byte copy into reserved
+/// spare capacity; longer unquoted cells are one memcpy.
+fn append_clean(out: &mut Vec<u8>, data: &[u8], from: usize, to: usize) {
     const Q: u8 = 34u8;
+    let raw = &data[from..to];
     if raw.len() >= 2 && raw[0] == Q && raw[raw.len() - 1] == Q {
         let inner = &raw[1..raw.len() - 1];
         let mut i = 0;
@@ -1487,6 +1675,19 @@ fn append_clean(out: &mut Vec<u8>, raw: &[u8]) {
             } else {
                 i += 1;
             }
+        }
+    } else if raw.len() <= 16 && to + 16 <= data.len() {
+        out.reserve(16);
+        // SAFETY: 16 bytes are readable at `data[from..]` (checked above)
+        // and 16 spare bytes were just reserved; set_len exposes only the
+        // cell's bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(from),
+                out.as_mut_ptr().add(out.len()),
+                16,
+            );
+            out.set_len(out.len() + raw.len());
         }
     } else {
         out.extend_from_slice(raw);
@@ -1716,30 +1917,88 @@ mod avx512 {
         }
     }
 
+    /// [`index_cells`] twin for AVX-512 VBMI2 + BMI2 hosts: block structural
+    /// positions arrive via one `vpcompressb` over a byte iota and terminator
+    /// flags via `pext`, replacing the serial trailing-zero/clear-bit walk
+    /// with a counted loop of independent loads. Scans 64-byte blocks from
+    /// `start` (block-aligned) onward, until end of data or until the
+    /// sink completes its record range.
+    #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "avx512vbmi2", enable = "bmi2", enable = "pclmulqdq")]
+    pub(crate) fn index_cells_compress(data: &[u8], seed: u64, start: usize, sink: &mut super::ColumnSink) {
+        let mut carries = [seed];
+        let mut offset = start;
+        let iota = byte_iota();
+        while offset + 64 <= data.len() {
+            // SAFETY: offset + 64 <= data.len().
+            let (mask, term) = unsafe { step(data.as_ptr().add(offset), &mut carries) };
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+            if sink.done {
+                return;
+            }
+            offset += 64;
+        }
+        let rem = data.len() - offset;
+        if rem > 0 {
+            let mut block = [0u8; 64];
+            block[..rem].copy_from_slice(&data[offset..]);
+            let live = (1u64 << rem) - 1;
+            // SAFETY: block is a readable 64-byte buffer. Pad bits masked.
+            let (mask, term) = unsafe { step(block.as_ptr(), &mut carries) };
+            let mask = mask & live;
+            let term = term & live;
+            let mut pos = [0u8; 64];
+            // SAFETY: `pos` is a writable 64-byte buffer.
+            unsafe {
+                _mm512_storeu_si512(
+                    pos.as_mut_ptr() as *mut __m512i,
+                    _mm512_maskz_compress_epi8(mask, iota),
+                )
+            };
+            sink.drive_positions(&pos, mask.count_ones() as usize, _pext_u64(term, mask), offset as u32);
+        }
+    }
+
+    /// The bytes 0..64 in lane order: compressing this under a structural
+    /// mask yields the in-block byte offset of every set bit.
+    #[target_feature(enable = "avx512f")]
+    fn byte_iota() -> __m512i {
+        const IOTA: [u8; 64] = {
+            let mut a = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        };
+        // SAFETY: `IOTA` is a readable 64-byte buffer.
+        unsafe { _mm512_loadu_si512(IOTA.as_ptr() as *const __m512i) }
+    }
+
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl", enable = "pclmulqdq")]
     unsafe fn step(ptr: *const u8, carries: &mut [u64; 1]) -> (u64, u64) {
         // SAFETY: caller guarantees 64 readable bytes at `ptr`.
-        let (lo, hi) = unsafe {
-            (
-                _mm256_loadu_si256(ptr as *const __m256i),
-                _mm256_loadu_si256(ptr.add(32) as *const __m256i),
-            )
-        };
-        let v0 = eq_mask(lo, hi, 34u8); // class "\""
+        let v = unsafe { _mm512_loadu_si512(ptr as *const __m512i) };
+        let v0 = eq_mask(v, 34u8); // class "\""
         let v1 = { let parity = prefix_xor(v0) ^ carries[0]; carries[0] = ((parity as i64) >> 63) as u64; parity };
-        let v2 = eq_mask(lo, hi, 10u8) | eq_mask(lo, hi, 44u8); // class "\n,"
+        let v2 = eq_mask(v, 10u8) | eq_mask(v, 44u8); // class "\n,"
         let v3 = !v1;
         let v4 = v2 & v3;
-        let v5 = eq_mask(lo, hi, 10u8); // class "\n"
+        let v5 = eq_mask(v, 10u8); // class "\n"
         (v4, v4 & v5)
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
-    fn eq_mask(lo: __m256i, hi: __m256i, byte: u8) -> u64 {
-        let needle = _mm256_set1_epi8(byte as i8);
-        let lo_bits = _mm256_cmpeq_epi8_mask(lo, needle) as u64;
-        let hi_bits = _mm256_cmpeq_epi8_mask(hi, needle) as u64;
-        lo_bits | (hi_bits << 32)
+    fn eq_mask(v: __m512i, byte: u8) -> u64 {
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8))
     }
 
     #[target_feature(enable = "pclmulqdq")]
