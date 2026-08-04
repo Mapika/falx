@@ -327,6 +327,35 @@ byte-identical, with round-trip coverage of every opcode so an operation cannot
 enter the IR without a textual form. Printing is deterministic and idempotent,
 so checked-in IR diffs cleanly.
 
+### Length-prefixed and block-compressed containers
+
+The bitstream graph can only express framing decided by byte identity. A
+length-prefixed format is the opposite: where the next frame starts is a value
+decoded out of this one, a sequential chain no SIMD removes — that is a property
+of the format, not a gap in the implementation.
+
+The exploitable part is the two-level structure. The chain is cheap (bounded
+work per frame, header bytes only) and the frames it finds are independent, so
+everything downstream is parallel. One `frame` directive declares the container
+while the graph keeps describing the payload:
+
+```
+frame header=18 length-at=16 width=u16 endian=le counts=total adjust=1 trailer=8 magic=0:1f,8b
+```
+
+That line is a bgzf block. Widths are `u8`/`u16`/`u32`/`u64` or `varint`
+(protobuf-style LEB128). A framed module additionally generates `scan_frames`,
+`frame_at`, and `frames_par`, which hands contiguous frame runs to workers —
+the shape `falx::bgzf` reaches ~10 GiB/s with by hand.
+
+The model is validated against that hand-written code: `tests/framing.rs`
+asserts the generalized scanner finds exactly the block boundaries and payload
+ranges `falx::bgzf::scan` does, and that frames tile the input with no gap or
+overlap.
+
+falx locates frames; it does not decode entropy-coded payloads. A compressed
+container is `scan_frames` → your decompressor → the generated payload parser.
+
 Reference: [`docs/ir.md`](docs/ir.md) for the IR, [`docs/spec.md`](docs/spec.md)
 for the spec format.
 

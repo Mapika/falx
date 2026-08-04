@@ -15,6 +15,7 @@ pub mod egraph;
 /// Experimental typed-AST code emitter (multi-backend), alongside `codegen`.
 pub mod emit;
 pub mod formats;
+pub mod framing;
 pub mod graph_opt;
 pub mod interp;
 /// Memory-mapped file input for the parallel kernels (`mmap` feature).

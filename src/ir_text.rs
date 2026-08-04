@@ -38,6 +38,7 @@ use std::fmt::Write as _;
 
 use crate::codegen::{Column, ColumnType};
 use crate::formats::{Dialect, Escape};
+use crate::framing::{Counts, Endian, Framing, Width};
 use crate::ir::{CharClass, Graph, NodeId, Op};
 
 /// Version of the textual IR this build reads and writes.
@@ -63,6 +64,9 @@ pub struct Module {
     pub terminators: NodeId,
     /// Live open/close bracket streams for nesting dialects.
     pub nest: Option<(NodeId, NodeId)>,
+    /// Outer length-prefixed container, when the format has one. The graph
+    /// describes the payload grammar; this describes how payloads are found.
+    pub framing: Option<Framing>,
 }
 
 /// A textual-IR read error, with the offending line number where known.
@@ -119,6 +123,32 @@ pub fn print(module: &Module) -> String {
     }
     if module.dialect.lines_per_record != 1 {
         let _ = writeln!(out, "lines-per-record {}", module.dialect.lines_per_record);
+    }
+    if let Some(f) = &module.framing {
+        let _ = write!(
+            out,
+            "frame header={} length-at={} width={} endian={} counts={} adjust={} trailer={}",
+            f.header,
+            f.length_at,
+            f.width.as_str(),
+            match f.endian {
+                Endian::Le => "le",
+                Endian::Be => "be",
+            },
+            match f.counts {
+                Counts::Total => "total",
+                Counts::Payload => "payload",
+            },
+            f.adjust,
+            f.trailer,
+        );
+        if let Some((offset, bytes)) = &f.magic {
+            let _ = write!(out, " magic={offset}:{}", print_bytes(bytes));
+        }
+        if f.skip_empty {
+            let _ = write!(out, " skip-empty=true");
+        }
+        out.push('\n');
     }
     for column in &module.columns {
         let ty = match column.ty {
@@ -222,6 +252,7 @@ pub fn parse(text: &str) -> Result<Module, IrError> {
     let mut terminators: Option<NodeId> = None;
     let mut nest_open: Option<NodeId> = None;
     let mut nest_close: Option<NodeId> = None;
+    let mut framing: Option<Framing> = None;
     let mut version_seen = false;
     let mut next_node = 0usize;
 
@@ -377,6 +408,100 @@ pub fn parse(text: &str) -> Result<Module, IrError> {
                     info_key,
                 });
             }
+            "frame" => {
+                let mut header = 0usize;
+                let mut length_at = 0usize;
+                let mut width = Width::U32;
+                let mut endian = Endian::Le;
+                let mut counts = Counts::Total;
+                let mut adjust = 0i64;
+                let mut trailer = 0usize;
+                let mut magic = None;
+                let mut skip_empty = false;
+                for field in words {
+                    let (key, value) = field.split_once('=').ok_or_else(|| {
+                        err(lineno, format!("`frame` field `{field}` needs key=value"))
+                    })?;
+                    let num = |what: &str| -> Result<usize, IrError> {
+                        value
+                            .parse()
+                            .map_err(|_| err(lineno, format!("`{what}` must be a number")))
+                    };
+                    match key {
+                        "header" => header = num("header")?,
+                        "length-at" => length_at = num("length-at")?,
+                        "trailer" => trailer = num("trailer")?,
+                        "adjust" => {
+                            adjust = value
+                                .parse()
+                                .map_err(|_| err(lineno, "`adjust` must be a signed integer"))?
+                        }
+                        "width" => {
+                            width = match value {
+                                "u8" => Width::U8,
+                                "u16" => Width::U16,
+                                "u32" => Width::U32,
+                                "u64" => Width::U64,
+                                "varint" => Width::Varint,
+                                other => {
+                                    return Err(err(
+                                        lineno,
+                                        format!("unknown frame width `{other}`"),
+                                    ));
+                                }
+                            }
+                        }
+                        "endian" => {
+                            endian = match value {
+                                "le" => Endian::Le,
+                                "be" => Endian::Be,
+                                other => {
+                                    return Err(err(
+                                        lineno,
+                                        format!("unknown endianness `{other}`"),
+                                    ));
+                                }
+                            }
+                        }
+                        "counts" => {
+                            counts = match value {
+                                "total" => Counts::Total,
+                                "payload" => Counts::Payload,
+                                other => {
+                                    return Err(err(
+                                        lineno,
+                                        format!("`counts` must be total or payload, got `{other}`"),
+                                    ));
+                                }
+                            }
+                        }
+                        "magic" => {
+                            let (offset, bytes) = value.split_once(':').ok_or_else(|| {
+                                err(lineno, "`magic` looks like <offset>:<hex bytes>")
+                            })?;
+                            let offset: usize = offset
+                                .parse()
+                                .map_err(|_| err(lineno, "`magic` offset must be a number"))?;
+                            magic = Some((offset, parse_byte_list(bytes, lineno)?));
+                        }
+                        "skip-empty" => skip_empty = value == "true",
+                        other => {
+                            return Err(err(lineno, format!("unknown `frame` field `{other}`")));
+                        }
+                    }
+                }
+                framing = Some(Framing {
+                    header,
+                    length_at,
+                    width,
+                    endian,
+                    counts,
+                    adjust,
+                    trailer,
+                    magic,
+                    skip_empty,
+                });
+            }
             "output" => output = Some(parse_ref(words.next(), next_node, lineno)?),
             "terminators" => terminators = Some(parse_ref(words.next(), next_node, lineno)?),
             "nest-open" => nest_open = Some(parse_ref(words.next(), next_node, lineno)?),
@@ -420,6 +545,7 @@ pub fn parse(text: &str) -> Result<Module, IrError> {
         graph,
         terminators,
         nest,
+        framing,
     })
 }
 

@@ -117,6 +117,56 @@ Bytes are two hex digits. Byte lists are comma-separated; classes also accept
 | `add` | 2 | 64-bit addition with carry into the next block. Makes a set bit ripple through a run — the primitive behind odd/even-run detection for backslash escapes. |
 | `regions` | 3 | `regions <quotes> <comment-starts> <terminators>`. Three-state (normal/quote/comment) resolution: quote bits are inert inside comments and comment bits inert inside quotes, the interleaving no bit-parallel parity can express. Carries the region state. |
 
+### Framing (optional)
+
+The bitstream graph can only express framing determined by **byte identity** —
+"this byte is a comma". A length-prefixed format is the opposite: where frame
+N+1 starts is a value decoded out of frame N. That is a sequential dependency
+chain, and no amount of SIMD removes it; it is a property of the format.
+
+What *is* exploitable is the two-level structure such formats share. The chain
+is cheap — bounded work per frame, touching only header bytes — while the
+frames it produces are independent, so everything downstream is parallel. One
+`frame` directive declares the outer container; the graph continues to describe
+the payload grammar.
+
+```
+frame header=18 length-at=16 width=u16 endian=le counts=total adjust=1 trailer=8 magic=0:1f,8b
+```
+
+| Field | Meaning |
+|---|---|
+| `header` | Offset where the payload begins. With `width=varint` the payload begins right after the varint, and this is any extra header bytes after it (usually 0). |
+| `length-at` | Offset of the length field within the frame. |
+| `width` | `u8`, `u16`, `u32`, `u64`, or `varint` (unsigned LEB128, protobuf-style). |
+| `endian` | `le` or `be`. Ignored for `varint`. |
+| `counts` | `total` (the length counts the whole frame) or `payload` (frame = header + payload + trailer). |
+| `adjust` | Signed value added to the decoded length. bgzf stores "total minus one", so it needs `adjust=1`. |
+| `trailer` | Bytes at the end of the frame that are not payload (bgzf's CRC32 + ISIZE). |
+| `magic` | `<offset>:<hex bytes>` that must match, else the frame is rejected. |
+| `skip-empty` | `true` drops frames whose payload is empty. |
+
+A module with framing additionally generates:
+
+```rust
+pub struct Frame { pub start: usize, pub len: usize, pub payload: Range<usize> }
+pub fn frame_at(data: &[u8], pos: usize) -> Result<Frame, FrameError>;
+pub fn scan_frames(data: &[u8]) -> Result<Vec<Frame>, FrameError>;
+pub fn frames_par<S, Init, F>(data, frames, threads, init, process) -> Vec<S>;
+```
+
+`scan_frames` is the sequential pass; `frames_par` hands contiguous frame runs
+to workers and returns their states in stream order. This is the shape
+`falx::bgzf` reaches ~10 GiB/s with by hand, and the model is checked against
+it: `tests/framing.rs` asserts the generalized scanner finds exactly the block
+boundaries and payload ranges the hand-written bgzf scanner does.
+
+**What this does not do.** falx locates frames; it does not decode entropy-coded
+payloads. For a block-compressed container the flow is: `scan_frames` →
+your decompressor → the generated payload parser. Formats whose *payload*
+grammar is not a structural byte stream (Parquet's encoded column chunks, say)
+are framed by this layer but not parsed by the bitstream graph.
+
 ### Roles
 
 Three directives give streams their meaning to the backend.
@@ -164,8 +214,23 @@ points — from ten lines of IR.
 
 ## Limits
 
-The IR describes **structural byte streams**: which byte positions matter, and
-what state carries between blocks. Formats whose framing is length-prefixed
-(protobuf), block-compressed (Parquet), or otherwise not determined by byte
-identity are outside what these operations can express. BGZF is handled as a
-separate decompression stage feeding a delimited parser, not as IR.
+The IR has two layers, and they have different reach.
+
+The **bitstream graph** describes structural byte streams: which byte positions
+matter, and what state carries between blocks. Everything in it is data-parallel
+over bytes, which is why it reaches GB/s.
+
+The **framing layer** describes length-prefixed containers, whose boundaries
+cannot be data-parallel by construction. It makes them expressible and
+parallel-*after*-scan, which is the most any implementation can do.
+
+Still outside the model:
+
+- **Entropy-coded payloads.** falx locates frames; it does not implement
+  DEFLATE, dictionary decoding, or bit-packing. Compressed containers work by
+  pairing the framing layer with a decompressor.
+- **Payload grammars that are not structural byte streams.** Parquet's encoded
+  column chunks are framed by the framing layer but not parsed by the graph.
+- **Framing that depends on out-of-band state** — a schema, a footer read
+  first, or a dictionary — since a frame's extent must be decidable from the
+  frame itself.

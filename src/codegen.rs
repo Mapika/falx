@@ -443,6 +443,9 @@ pub fn lower(
         graph: parts.graph,
         terminators: parts.terminators,
         nest: parts.nest,
+        // Specs describe delimited dialects; a framed container is declared
+        // in IR (or set on the module) rather than derived from a dialect.
+        framing: None,
     })
 }
 
@@ -477,6 +480,7 @@ pub fn optimize_module(
         graph: parts.graph,
         terminators: parts.terminators,
         nest: parts.nest,
+        framing: module.framing.clone(),
     }
 }
 
@@ -491,12 +495,275 @@ pub fn optimize_module(
 pub fn emit_module(module: &crate::ir_text::Module) -> Result<String, CodegenError> {
     validate_columns(&module.columns)?;
     validate_nesting(&module.dialect)?;
-    emit_with(
+    let mut code = emit_with(
         &module.graph,
         &module.name,
         Some((&module.dialect, module.terminators, module.nest)),
         &module.columns,
-    )
+    )?;
+    if let Some(framing) = &module.framing {
+        code.push_str(&emit_framing(framing)?);
+    }
+    Ok(code)
+}
+
+/// Emit the outer container layer: a specialized frame scanner plus a
+/// parallel driver over the frames it finds.
+///
+/// The scan is sequential because it must be — the next frame's offset is a
+/// value decoded from this one — but it is bounded work per frame and touches
+/// no payload bytes, so the parallel driver that follows is where the time
+/// goes. See [`crate::framing`].
+fn emit_framing(framing: &crate::framing::Framing) -> Result<String, CodegenError> {
+    use crate::framing::{Counts, Endian, Width};
+
+    if let Some(size) = framing.width.fixed_size() {
+        if framing.length_at + size > framing.header {
+            return Err(CodegenError(format!(
+                "frame length field at {}..{} lies outside the {}-byte header",
+                framing.length_at,
+                framing.length_at + size,
+                framing.header
+            )));
+        }
+    }
+
+    let mut code = String::new();
+    code.push_str(
+        "\n// --- outer framing -------------------------------------------------\n\
+         // Length-prefixed container. Frame boundaries form a sequential chain\n\
+         // (each frame's length says where the next begins), so `scan_frames`\n\
+         // is a single cheap pass that touches only header bytes; the frames it\n\
+         // returns are independent, which is what `frames_par` exploits.\n\n\
+         /// One located frame: its extent in the input, and its payload within.\n\
+         #[derive(Clone, PartialEq, Eq, Debug)]\n\
+         pub struct Frame {\n\
+         \x20   pub start: usize,\n\
+         \x20   pub len: usize,\n\
+         \x20   pub payload: std::ops::Range<usize>,\n\
+         }\n\n\
+         /// A malformed frame, with the offset it was found at.\n\
+         #[derive(Clone, PartialEq, Eq, Debug)]\n\
+         pub struct FrameError(pub String);\n\n\
+         impl std::fmt::Display for FrameError {\n\
+         \x20   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n\
+         \x20       f.write_str(&self.0)\n\
+         \x20   }\n\
+         }\n\n\
+         impl std::error::Error for FrameError {}\n\n",
+    );
+
+    // Length decode, specialized to the declared width and endianness.
+    let decode = match framing.width {
+        Width::Varint => "\
+    // Unsigned LEB128: its own size is data-dependent, so it also moves
+    // where the payload starts.
+    let (decoded, varint_len) = {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        let mut used = 0usize;
+        loop {
+            let byte = match data.get(pos + LENGTH_AT + used) {
+                Some(&b) => b,
+                None => return Err(FrameError(format!(\"truncated varint at offset {pos}\"))),
+            };
+            if shift >= 64 {
+                return Err(FrameError(format!(\"varint at offset {pos} overflows u64\")));
+            }
+            value |= ((byte & 0x7f) as u64) << shift;
+            used += 1;
+            if byte & 0x80 == 0 {
+                break (value, used);
+            }
+            shift += 7;
+        }
+    };
+    let payload_start = LENGTH_AT + varint_len + HEADER;
+"
+        .to_string(),
+        fixed => {
+            let size = fixed.fixed_size().expect("non-varint width is fixed");
+            let from_bytes = match framing.endian {
+                Endian::Le => "u64::from_le_bytes(buf)",
+                Endian::Be => "u64::from_be_bytes(buf)",
+            };
+            // Little-endian fills the low bytes, big-endian the high ones.
+            let fill = match framing.endian {
+                Endian::Le => format!("buf[..{size}].copy_from_slice(&data[from..to]);"),
+                Endian::Be => format!("buf[8 - {size}..].copy_from_slice(&data[from..to]);"),
+            };
+            format!(
+                "\
+    let decoded = {{
+        let from = pos + LENGTH_AT;
+        let to = from + {size};
+        if to > data.len() {{
+            return Err(FrameError(format!(\"truncated length field at offset {{pos}}\")));
+        }}
+        let mut buf = [0u8; 8];
+        {fill}
+        {from_bytes}
+    }};
+    let payload_start = HEADER;
+"
+            )
+        }
+    };
+
+    let total_len = match framing.counts {
+        Counts::Total => "adjusted",
+        Counts::Payload => "adjusted + payload_start as i128 + TRAILER as i128",
+    };
+
+    let magic_check = match &framing.magic {
+        Some((offset, bytes)) => {
+            let literal = bytes
+                .iter()
+                .map(|b| format!("0x{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\
+    const MAGIC: [u8; {}] = [{literal}];\n\
+    const MAGIC_AT: usize = {offset};\n\
+    {{\n\
+        let from = pos + MAGIC_AT;\n\
+        let to = from + MAGIC.len();\n\
+        if to > data.len() {{\n\
+            return Err(FrameError(format!(\"truncated frame header at offset {{pos}}\")));\n\
+        }}\n\
+        if data[from..to] != MAGIC {{\n\
+            return Err(FrameError(format!(\n\
+                \"frame at offset {{pos}} does not start with the declared magic\"\n\
+            )));\n\
+        }}\n\
+    }}\n",
+                bytes.len()
+            )
+        }
+        None => String::new(),
+    };
+
+    let _ = write!(
+        code,
+        "\
+/// Decode the single frame beginning at `pos`.
+pub fn frame_at(data: &[u8], pos: usize) -> Result<Frame, FrameError> {{
+    const HEADER: usize = {header};
+    const LENGTH_AT: usize = {length_at};
+    const TRAILER: usize = {trailer};
+    const ADJUST: i64 = {adjust};
+{magic_check}{decode}\
+    let adjusted = decoded as i128 + ADJUST as i128;
+    if adjusted < 0 {{
+        return Err(FrameError(format!(
+            \"frame at offset {{pos}} has a negative length after adjustment\"
+        )));
+    }}
+    let len = {total_len};
+    let len = match usize::try_from(len) {{
+        Ok(len) => len,
+        Err(_) => {{
+            return Err(FrameError(format!(\"frame at offset {{pos}} is impossibly large\")));
+        }}
+    }};
+    // A frame must hold its own header and trailer, and must fit in the input.
+    // Both also guarantee the scan advances, so it cannot loop.
+    if len < payload_start + TRAILER || len == 0 {{
+        return Err(FrameError(format!(
+            \"frame at offset {{pos}} declares length {{len}}, too small for its header and trailer\"
+        )));
+    }}
+    if pos + len > data.len() {{
+        return Err(FrameError(format!(
+            \"frame at offset {{pos}} declares length {{len}} but only {{}} bytes remain\",
+            data.len() - pos
+        )));
+    }}
+    Ok(Frame {{
+        start: pos,
+        len,
+        payload: pos + payload_start..pos + len - TRAILER,
+    }})
+}}
+
+/// Locate every frame in `data`, in stream order.
+///
+/// One bounded step per frame, reading only header bytes — the payload is
+/// never touched, so this stays fast even when the payloads are large.
+pub fn scan_frames(data: &[u8]) -> Result<Vec<Frame>, FrameError> {{
+    let mut frames = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {{
+        let frame = frame_at(data, pos)?;
+        pos = frame.start + frame.len;
+{skip_empty}\
+        frames.push(frame);
+    }}
+    Ok(frames)
+}}
+
+/// Process located frames across `threads` workers.
+///
+/// Frames are independent, so each worker takes a contiguous run and folds it
+/// into its own state; the states come back in stream order for the caller to
+/// concatenate or reduce. This is where the parallelism a length-prefixed
+/// format still permits actually lives.
+pub fn frames_par<S, Init, F>(
+    data: &[u8],
+    frames: &[Frame],
+    threads: usize,
+    init: Init,
+    process: F,
+) -> Vec<S>
+where
+    S: Send,
+    Init: Fn() -> S + Sync,
+    F: Fn(&mut S, &Frame, &[u8]) + Sync,
+{{
+    let threads = threads.max(1).min(frames.len().max(1));
+    if threads == 1 || frames.len() <= 1 {{
+        let mut state = init();
+        for frame in frames {{
+            process(&mut state, frame, data);
+        }}
+        return vec![state];
+    }}
+    let per = frames.len().div_ceil(threads);
+    let groups: Vec<&[Frame]> = frames.chunks(per).collect();
+    std::thread::scope(|s| {{
+        let handles: Vec<_> = groups
+            .into_iter()
+            .map(|group| {{
+                let init = &init;
+                let process = &process;
+                s.spawn(move || {{
+                    let mut state = init();
+                    for frame in group {{
+                        process(&mut state, frame, data);
+                    }}
+                    state
+                }})
+            }})
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect(\"frame worker panicked\"))
+            .collect()
+    }})
+}}
+",
+        header = framing.header,
+        length_at = framing.length_at,
+        trailer = framing.trailer,
+        adjust = framing.adjust,
+        skip_empty = if framing.skip_empty {
+            "        if frame.payload.is_empty() {\n            continue;\n        }\n"
+        } else {
+            ""
+        },
+    );
+    Ok(code)
 }
 
 /// Parser-mode emission inputs: the dialect, its record-terminator node,
